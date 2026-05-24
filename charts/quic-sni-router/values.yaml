@@ -1,0 +1,170 @@
+# quic-sni-router values
+#
+# Required: at least one entry under `config.routes`. The chart will render an
+# empty routes map otherwise and the router will drop every Initial.
+
+image:
+  repository: harbor.peinser.com/library/quic-sni-router
+  # If empty, defaults to .Chart.appVersion (set by the publish pipeline to a
+  # pinned <version>-<sha> for reproducibility).
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Names of image-pull secrets in this namespace.
+  pullSecrets: []
+
+# Replica count for the Deployment. Multiple replicas share the listening
+# port via SO_REUSEPORT (set by the router automatically on Linux).
+replicaCount: 2
+
+# Routing configuration. Mirrors src/config.c schema 1:1.
+config:
+  listen:
+    # The router binds this UDP port inside the pod. Default is 8443 (an
+    # unprivileged port) so the container does NOT need CAP_NET_BIND_SERVICE
+    # — important because containerSecurityContext drops ALL capabilities.
+    # The Service below exposes 443 externally and translates to this port,
+    # so clients still connect to UDP/443. Only change this if you also know
+    # to add NET_BIND_SERVICE or set net.ipv4.ip_unprivileged_port_start.
+    udp: ":8443"
+  sessions:
+    idleTimeout: 60s         # 1..86400; CLOCK_MONOTONIC-based expiry.
+    maxSessions: 100000      # 1..1000000; oldest-by-last-seen evicted on full.
+  # routes is a map of <SNI>: { host, port }. Empty is valid but useless.
+  # Example:
+  #   rvr-a.flightdeck.tower.peinser.com:
+  #     host: flightdeck-rvr-a.tower-system.svc.cluster.local
+  #     port: 8443
+  routes: {}
+
+configMap:
+  # If false, supply your own ConfigMap with key router.yaml and set name below.
+  create: true
+  name: ""
+  # OPT-IN: forces pod restart on ConfigMap content change. Off by default
+  # because the router does in-process hot reload via inotify — leaving this
+  # off means a `helm upgrade` to routes lands without dropping live QUIC
+  # sessions whose backends were preserved.
+  checksumAnnotation: false
+
+service:
+  # type: how the router is exposed.
+  #   LoadBalancer  — typical WAN edge; cloud / metallb provisions an external IP
+  #   NodePort      — bare-metal without an LB; nodes expose a port directly
+  #   ClusterIP     — internal-only (e.g., for an upstream ingress controller)
+  type: LoadBalancer
+  # port: the EXTERNAL UDP port clients connect to (i.e. the LB / NodePort port).
+  # The Service forwards this port to the pod's bound port (8443 by default,
+  # see config.listen.udp), so changing this here does NOT require changing
+  # the in-pod listener.
+  port: 443
+  # externalTrafficPolicy:
+  #   Cluster (default) — kube-proxy SNATs; router sees node IPs.
+  #   Local             — preserves real client source IP; only nodes with a
+  #                       router pod receive traffic (interacts with PDB).
+  externalTrafficPolicy: Cluster
+  # nodePort: required when service.type=NodePort and you want a fixed port.
+  # Leave null to let kube-controller-manager assign one from the NodePort range.
+  nodePort: null
+  loadBalancerClass: ""
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  annotations: {}
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+  # Router needs no API access; minimise blast radius if a pod is compromised.
+  automount: false
+
+# Pod-level security context.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context. Hardened defaults for a network daemon
+# that takes untrusted WAN input.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+    # Add NET_BIND_SERVICE only if the router needs to bind a privileged port
+    # *inside* the pod. With a LoadBalancer/NodePort Service mapping :443 to a
+    # high pod-side port, you don't need this.
+    # add: [NET_BIND_SERVICE]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    # Intentionally no CPU limit — CFS throttling on a latency-sensitive UDP
+    # dataplane causes nasty p99 spikes. Use requests + a LimitRange or
+    # ResourceQuota at the namespace level if you need a cap.
+    memory: 256Mi
+
+# UDP has no kubelet-native probe (no httpGet, no tcpSocket for UDP).
+# Defaults below are no-ops. If your image has `ss` (iproute2), uncomment the
+# exec probe to verify the listening socket is up.
+startupProbe: {}
+# startupProbe:
+#   exec:
+#     command: ["sh", "-c", "ss -lnu sport = :443 | grep -q :443"]
+#   periodSeconds: 1
+#   failureThreshold: 30
+livenessProbe: {}
+readinessProbe: {}
+
+# Graceful shutdown: SIGTERM tells the router to drain its in-flight send
+# batch and close sockets. 30s is plenty.
+terminationGracePeriodSeconds: 30
+
+priorityClassName: ""
+
+# Scheduling.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# Spread replicas across nodes; ScheduleAnyway so a single-node cluster still
+# works for dev.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: quic-sni-router
+
+podDisruptionBudget:
+  # Only rendered when replicaCount > 1; setting both fields on a single-pod
+  # Deployment would block all voluntary disruptions including node drains.
+  enabled: true
+  minAvailable: 1
+  maxUnavailable: null
+
+# Optional NetworkPolicy. Off by default because realistic rules depend on
+# your cluster's CNI and namespace model.
+networkPolicy:
+  enabled: false
+  # If empty, ingress allows UDP/443 from anywhere in the cluster — typically
+  # too permissive. Set this to restrict to the LB / ingress namespace.
+  ingress: []
+  # If empty, the chart renders egress rules for kube-dns + a permissive
+  # backend egress. Override per environment.
+  egress: []
+
+# Extras — namespace-specific overrides without forking the chart.
+podAnnotations: {}
+podLabels: {}
+commonLabels: {}
+nameOverride: ""
+fullnameOverride: ""
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []

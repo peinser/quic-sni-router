@@ -1,0 +1,12 @@
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 60s
+  maxSessions: 10000
+routes:
+  rvr-a.flightdeck.test:
+    host: rvr-a
+    port: 8443
+  rvr-b.flightdeck.test:
+    host: rvr-b
+    port: 8444

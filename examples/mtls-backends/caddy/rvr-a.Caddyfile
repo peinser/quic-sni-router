@@ -1,0 +1,15 @@
+{
+  servers {
+    protocols h1 h2 h3
+  }
+}
+
+rvr-a.flightdeck.example.test:8443 {
+  tls /certs/rvr-a.crt /certs/rvr-a.key {
+    client_auth {
+      mode require_and_verify
+      trust_pool file /certs/ca.crt
+    }
+  }
+  respond "hello from rvr-a\n"
+}

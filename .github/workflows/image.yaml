@@ -1,0 +1,171 @@
+name: Image
+run-name: ${{ github.actor }} is building a new quic-sni-router image
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - main
+    - development
+    paths:
+    - docker/**
+    - .dockerignore
+    - .github/workflows/image.yaml
+    - CMakeLists.txt
+    - Makefile
+    - include/**
+    - src/**
+    - tests/**
+
+env:
+  IMAGE: ${{ vars.OCI_REGISTRY }}/library/quic-sni-router
+
+jobs:
+  prepare:
+    runs-on:
+      group: on-prem
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+    - name: Determine image version
+      id: version
+      run: |
+        version="$(awk '/VERSION/ && /quic-sni-router/ { print $3; exit }' CMakeLists.txt)"
+        short_sha="$(git rev-parse --short HEAD)"
+        echo "tag=${version}-${short_sha}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - platform: linux/amd64
+          arch: amd64
+        - platform: linux/arm64
+          arch: arm64
+    # Both legs run on the same on-prem group (amd64 hardware). The arm64
+    # leg cross-builds under QEMU; legs run in parallel on separate runners,
+    # so wall-clock is max(amd64, arm64) instead of sum.
+    runs-on:
+      group: on-prem
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+
+    - name: Authenticate with the remote Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ${{ vars.OCI_REGISTRY }}
+        username: ${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}
+        password: ${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+      with:
+        driver-opts: |
+          image=harbor.peinser.com/dockerhub/moby/buildkit:buildx-stable-1
+
+    - name: Build and push by digest
+      id: build
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: docker/Dockerfile
+        target: production
+        platforms: ${{ matrix.platform }}
+        push: true
+        provenance: false
+        build-args: |
+          VERSION=${{ needs.prepare.outputs.tag }}
+          REVISION=${{ github.sha }}
+          CREATED=${{ github.event.repository.updated_at }}
+          QSR_CPU_TARGET=${{ vars.QSR_CPU_TARGET }}
+          QSR_ENABLE_LTO=${{ vars.QSR_ENABLE_LTO || 'OFF' }}
+        # push-by-digest: emit a single-platform image keyed only by content
+        # hash; the merge job below stitches per-arch digests into the tagged
+        # multi-arch manifest. name-canonical=true keeps each per-arch image
+        # discoverable in Harbor under the canonical name.
+        outputs: |
+          type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+        # Per-platform cache refs avoid the two legs trampling each other and
+        # keep each arch's cache focused (arm64 cache otherwise stays cold
+        # because amd64 layers don't apply).
+        cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+        cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
+
+    - name: Export digest
+      run: |
+        mkdir -p /tmp/digests
+        # Strip the "sha256:" prefix; the file name is the bare hex digest.
+        digest="${{ steps.build.outputs.digest }}"
+        echo "${digest}" > "/tmp/digests/${digest#sha256:}"
+
+    - name: Upload digest artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: digest-${{ matrix.arch }}
+        path: /tmp/digests/*
+        if-no-files-found: error
+        retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on:
+      group: on-prem
+    steps:
+    - name: Download all digests
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/digests
+        pattern: digest-*
+        merge-multiple: true
+
+    - name: Authenticate with the remote Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ${{ vars.OCI_REGISTRY }}
+        username: ${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}
+        password: ${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+      with:
+        driver-opts: |
+          image=harbor.peinser.com/dockerhub/moby/buildkit:buildx-stable-1
+
+    - name: Extract image metadata
+      id: meta
+      uses: docker/metadata-action@v6
+      with:
+        images: ${{ env.IMAGE }}
+        tags: |
+          type=raw,value=${{ needs.prepare.outputs.tag }}
+
+    - name: Create multi-arch manifest
+      working-directory: /tmp/digests
+      run: |
+        # imagetools create accepts a list of per-arch refs of the form
+        # <image>@sha256:<digest> and produces a single multi-arch manifest at
+        # each -t tag.
+        tags=()
+        for tag in $(jq -r '.tags | .[]' <<< "${DOCKER_METADATA_OUTPUT_JSON}"); do
+          tags+=("-t" "${tag}")
+        done
+        sources=()
+        for f in *; do
+          sources+=("${{ env.IMAGE }}@sha256:${f}")
+        done
+        docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+
+    - name: Inspect resulting manifest
+      run: |
+        docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}"

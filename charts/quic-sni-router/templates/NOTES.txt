@@ -1,0 +1,44 @@
+quic-sni-router {{ .Chart.AppVersion }} installed as {{ include "quic-sni-router.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+The router is listening on UDP {{ .Values.service.port }} via a {{ .Values.service.type }} Service:
+
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "quic-sni-router.fullname" . }}
+
+{{- if .Values.config.routes }}
+
+Configured routes ({{ len .Values.config.routes }}):
+{{- range $sni, $route := .Values.config.routes }}
+  - {{ $sni }} -> {{ $route.host }}:{{ $route.port }}
+{{- end }}
+{{- else }}
+
+WARNING: config.routes is empty. The router will drop every incoming Initial
+because no SNI matches. Set at least one route in values.yaml and re-upgrade.
+{{- end }}
+
+CHECK BACKEND RESOLUTION (DNS happens at startup AND on every hot reload):
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "quic-sni-router.fullname" . }}
+
+HOT RELOAD:
+
+This chart's ConfigMap is rendered from .Values.config — `helm upgrade` writes
+a new ConfigMap, kubelet propagates it into each pod (typically <60s), and the
+router's inotify watch atomically swaps in the new routes. No pod restart, no
+in-flight session loss for routes whose backend was preserved (hard cutover
+only for routes whose backend disappeared).
+
+To force a pod rollout instead of in-place reload (drops live sessions):
+
+  helm upgrade {{ .Release.Name }} ... --set configMap.checksumAnnotation=true
+
+QUIC versions accepted: v1 (RFC 9000) and v2 (RFC 9369). Other versions are
+silently dropped at the version check; the client will fall back via version
+negotiation.
+
+WAN-FACING DEPLOYMENT CHECKLIST (see docs/threat-model.md):
+
+  - Backends should be on a non-routable / cluster-internal network.
+  - Add upstream BCP 38 / uRPF + per-source rate limiting at the LB.
+  - service.externalTrafficPolicy=Local (the chart default) preserves the
+    client source IP, which the router uses for session pinning.

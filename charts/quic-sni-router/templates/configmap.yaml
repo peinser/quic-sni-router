@@ -1,0 +1,29 @@
+{{- if .Values.configMap.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "quic-sni-router.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quic-sni-router.labels" . | nindent 4 }}
+data:
+  # router.yaml — consumed by the router via inotify on this file's directory.
+  # Changes propagate without a pod restart unless configMap.checksumAnnotation
+  # is on, in which case the Deployment template carries a content hash and
+  # Helm will roll the pods on upgrade.
+  router.yaml: |
+    listen:
+      udp: {{ .Values.config.listen.udp | quote }}
+    sessions:
+      idleTimeout: {{ .Values.config.sessions.idleTimeout | quote }}
+      maxSessions: {{ .Values.config.sessions.maxSessions }}
+    routes:
+      {{- if .Values.config.routes }}
+      {{- range $sni, $route := .Values.config.routes }}
+      {{ $sni }}:
+        host: {{ required (printf "config.routes.%s.host is required" $sni) $route.host | quote }}
+        port: {{ required (printf "config.routes.%s.port is required" $sni) $route.port }}
+      {{- end }}
+      {{- else }} {}
+      {{- end }}
+{{- end }}

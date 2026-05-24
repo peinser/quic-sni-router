@@ -1,0 +1,45 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "quic-sni-router.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "quic-sni-router.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "quic-sni-router.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if .Values.networkPolicy.ingress }}
+    {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
+    {{- else }}
+    # Default: allow UDP on the pod's bound port (8443 by default) from
+    # anywhere. Tighten via networkPolicy.ingress in production (typically
+    # restrict to the LB / ingress namespace).
+    - ports:
+        - protocol: UDP
+          port: {{ include "quic-sni-router.containerPort" . | int }}
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.egress }}
+    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+    {{- else }}
+    # DNS — needed at startup AND on every hot reload (DNS re-resolve).
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Backends — operator should constrain per environment.
+    - {}
+    {{- end }}
+{{- end }}

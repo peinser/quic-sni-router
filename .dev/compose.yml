@@ -1,0 +1,49 @@
+name: quic-sni-router
+
+services:
+  devcontainer:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    command: sleep infinity
+    volumes:
+      - ..:/workspace:cached
+    environment:
+      - QSR_CONFIG=/workspace/.dev/config/router.yaml
+    expose:
+      - "443/udp"
+      - "9091"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - dev
+
+  flightdeck-rvr-a:
+    build:
+      context: backend
+      dockerfile: Dockerfile
+    command: ["rvr-a", "8443"]
+    expose:
+      - "8443/udp"
+    ports:
+      - "8443:8443/udp"
+    networks:
+      - dev
+    restart: unless-stopped
+
+  flightdeck-rvr-b:
+    build:
+      context: backend
+      dockerfile: Dockerfile
+    command: ["rvr-b", "8444"]
+    expose:
+      - "8444/udp"
+    ports:
+      - "8444:8444/udp"
+    networks:
+      - dev
+    restart: unless-stopped
+
+networks:
+  dev:
+    driver: bridge

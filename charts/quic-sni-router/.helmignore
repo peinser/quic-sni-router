@@ -1,0 +1,23 @@
+# Patterns to ignore when packaging the chart
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# IDE
+.idea/
+.vscode/
+# OS
+.directory
+Thumbs.db
+# CI / chart development scratch
+ci/
+__tests__/

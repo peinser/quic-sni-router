@@ -1,0 +1,32 @@
+apiVersion: v2
+name: quic-sni-router
+description: |
+  A QUIC SNI router for pod-terminated mTLS and HTTP/3 services. Accepts QUIC
+  v1 (RFC 9000) and v2 (RFC 9369), reads the TLS ClientHello SNI out of the
+  client Initial packet, and forwards original datagrams unchanged to a
+  configured backend. Backends keep terminating TLS/mTLS; the router does not
+  hold private keys.
+type: application
+# version is the chart version; appVersion is the router binary version.
+# The publish pipeline overwrites both with <CMakeLists VERSION>-<short-sha>
+# so every push produces a unique immutable artifact.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/Peinser/quic-sni-router
+sources:
+  - https://github.com/Peinser/quic-sni-router
+maintainers:
+  - name: Peinser BV
+    url: https://peinser.com
+keywords:
+  - quic
+  - quic-v2
+  - http3
+  - sni
+  - router
+  - reverse-proxy
+  - mtls
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: networking

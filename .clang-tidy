@@ -1,0 +1,11 @@
+Checks: >
+  clang-analyzer-*,bugprone-*,cert-*,performance-*,portability-*,readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-magic-numbers
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'

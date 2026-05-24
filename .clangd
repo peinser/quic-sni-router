@@ -1,0 +1,31 @@
+# Language-server configuration for clangd.
+#
+# Clang 18+ is required for the C23 features used in this codebase (nullptr,
+# [[nodiscard]] attribute, typed enums). The devcontainer installs clangd-18
+# explicitly; ensure your IDE's clangd extension points at /usr/bin/clangd-18
+# if it does not auto-discover.
+
+CompileFlags:
+  # Use CMake's exported compile database when available.
+  CompilationDatabase: build
+  # Forced flags applied to every TU, in case the database is stale or absent
+  # (e.g., a fresh checkout before the first `make build`). gnu23 lets us stay
+  # on the GNU dialect (matches CMAKE_C_EXTENSIONS=OFF semantics for clang).
+  Add:
+    - -std=gnu23
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+  # Drop flags that confuse older clangds.
+  Remove:
+    - -W*conversion
+
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Add: [bugprone-*, performance-*, portability-*]
+    Remove: [bugprone-easily-swappable-parameters]
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes

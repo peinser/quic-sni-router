@@ -1,0 +1,95 @@
+name: Helm
+run-name: ${{ github.actor }} is publishing the quic-sni-router Helm chart
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/helm.yaml
+      - charts/quic-sni-router/**
+      - CMakeLists.txt
+
+jobs:
+
+  publish:
+    runs-on:
+      group: on-prem
+
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+
+    - name: Install Helm
+      uses: azure/setup-helm@v5
+      with:
+        version: "3.17.3"
+
+    - name: Authenticate with the remote Container Registry
+      run: |
+        echo '${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}' | helm registry login \
+          -u '${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}' \
+          --password-stdin ${{ vars.OCI_REGISTRY }}
+        echo '${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}' | crane auth login \
+          -u '${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}' \
+          --password-stdin ${{ vars.OCI_REGISTRY }}
+
+    - name: Determine chart version
+      id: version
+      run: |
+        # SemVer base from CMakeLists.txt, suffixed with the short commit SHA
+        # so every push produces a unique, immutable chart artifact.
+        BASE="$(awk '/VERSION/ && /quic-sni-router/ { print $3; exit }' CMakeLists.txt)"
+        echo "value=${BASE}-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+    - name: Set chart version and appVersion
+      run: |
+        sed -i "s/^version:.*/version: ${{ steps.version.outputs.value }}/" \
+          charts/quic-sni-router/Chart.yaml
+        sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.value }}\"/" \
+          charts/quic-sni-router/Chart.yaml
+
+    - name: Lint chart
+      run: helm lint charts/quic-sni-router
+
+    - name: Render templates (smoke validation)
+      # Render with a minimal route so the ConfigMap isn't a no-op, and grep
+      # for the resources we expect — catches templating regressions before
+      # publish. Also flips serviceAccount.create=true and
+      # networkPolicy.enabled=true so the opt-in resources get exercised even
+      # though they're off by default.
+      run: |
+        helm template release charts/quic-sni-router \
+          --set 'config.routes.example\.test.host=127.0.0.1' \
+          --set 'config.routes.example\.test.port=8443' \
+          --set serviceAccount.create=true \
+          --set networkPolicy.enabled=true \
+          > /tmp/manifest.yaml
+        grep -q '^kind: Deployment$'           /tmp/manifest.yaml
+        grep -q '^kind: Service$'              /tmp/manifest.yaml
+        grep -q '^kind: ConfigMap$'            /tmp/manifest.yaml
+        grep -q '^kind: ServiceAccount$'       /tmp/manifest.yaml
+        grep -q '^kind: PodDisruptionBudget$'  /tmp/manifest.yaml
+        grep -q '^kind: NetworkPolicy$'        /tmp/manifest.yaml
+
+    - name: Package chart
+      run: helm package charts/quic-sni-router --destination /tmp/helm-package
+
+    - name: Push chart to on-prem OCI registry
+      run: |
+        helm push \
+          /tmp/helm-package/quic-sni-router-${{ steps.version.outputs.value }}.tgz \
+          oci://${{ vars.OCI_REGISTRY }}/library/charts
+
+    - name: Retag chart as latest
+      # crane retag (vs `helm push :latest`) is cheap and only updates the
+      # manifest reference — the artifact bytes are uploaded exactly once
+      # under the immutable version tag.
+      run: |
+        crane tag \
+          ${{ vars.OCI_REGISTRY }}/library/charts/quic-sni-router:${{ steps.version.outputs.value }} \
+          0.0.0-latest

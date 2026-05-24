@@ -1,0 +1,39 @@
+name: qsr-mtls-example
+
+services:
+  router:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    command: ["/config/router.yaml"]
+    volumes:
+      - ./router.yaml:/config/router.yaml:ro
+    ports:
+      - "4433:443/udp"
+    depends_on:
+      - rvr-a
+      - rvr-b
+    networks:
+      - demo
+
+  rvr-a:
+    image: docker.io/caddy:2.8-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
+    volumes:
+      - ./caddy/rvr-a.Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+    networks:
+      - demo
+
+  rvr-b:
+    image: docker.io/caddy:2.8-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]
+    volumes:
+      - ./caddy/rvr-b.Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+    networks:
+      - demo
+
+networks:
+  demo:
+    driver: bridge

@@ -1,0 +1,13 @@
+quic-sni-router
+Copyright 2026 Peinser BV
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE for the full text).
+
+This product includes software developed by third parties:
+
+  - OpenSSL libcrypto — Apache License 2.0
+    https://www.openssl.org/
+
+  - libyaml — MIT License
+    https://github.com/yaml/libyaml

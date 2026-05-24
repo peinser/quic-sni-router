@@ -1,0 +1,60 @@
+{
+  "name": "quic-sni-router",
+  "dockerComposeFile": "../.dev/compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "latest",
+      "moby": true,
+      "installDockerBuildx": true,
+      "dockerDashComposeVersion": "v2"
+    }
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig.host,type=bind,readonly",
+    "source=${localEnv:HOME}/.ssh,target=/root/.ssh,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.local/share/opencode,target=/root/.local/share/opencode,type=bind,consistency=cached"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "github.vscode-github-actions",
+        "github.vscode-pull-request-github",
+        "ms-azuretools.vscode-docker",
+        "sst-dev.opencode"
+      ],
+      "settings": {
+        "C_Cpp.default.configurationProvider": "llvm-vs-code-extensions.vscode-clangd",
+        "C_Cpp.intelliSenseEngine": "disabled",
+        "clangd.path": "/usr/bin/clangd-18",
+        "clangd.arguments": [
+          "--background-index",
+          "--header-insertion=never",
+          "--clang-tidy",
+          "--compile-commands-dir=${workspaceFolder}/build"
+        ],
+        "cmake.generator": "Ninja",
+        "cmake.configureOnOpen": true
+      }
+    }
+  },
+  "postStartCommand": "./.devcontainer/startup.sh",
+  "forwardPorts": [8443, 8444, 9091],
+  "portsAttributes": {
+    "8443": {
+      "label": "flightdeck-rvr-a-udp"
+    },
+    "8444": {
+      "label": "flightdeck-rvr-b-udp"
+    },
+    "9091": {
+      "label": "router-metrics"
+    }
+  }
+}

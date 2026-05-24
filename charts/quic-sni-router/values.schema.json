@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "quic-sni-router values",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag":        { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] },
+        "pullSecrets": {
+          "type": "array",
+          "items": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }
+        }
+      }
+    },
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "config": {
+      "type": "object",
+      "required": ["listen", "sessions", "routes"],
+      "properties": {
+        "listen": {
+          "type": "object",
+          "required": ["udp"],
+          "properties": { "udp": { "type": "string", "pattern": "^[^:]*:[0-9]+$" } }
+        },
+        "sessions": {
+          "type": "object",
+          "required": ["idleTimeout", "maxSessions"],
+          "properties": {
+            "idleTimeout": { "type": "string", "pattern": "^[0-9]+s?$" },
+            "maxSessions": { "type": "integer", "minimum": 1, "maximum": 1000000 }
+          }
+        },
+        "routes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["host", "port"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1, "maxLength": 255 },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            }
+          }
+        }
+      }
+    },
+    "configMap": {
+      "type": "object",
+      "properties": {
+        "create":              { "type": "boolean" },
+        "name":                { "type": "string" },
+        "checksumAnnotation":  { "type": "boolean" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["type", "port"],
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "externalTrafficPolicy": { "enum": ["Cluster", "Local"] },
+        "nodePort":                { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "loadBalancerClass":       { "type": "string" },
+        "loadBalancerIP":          { "type": "string" },
+        "loadBalancerSourceRanges":{ "type": "array", "items": { "type": "string" } },
+        "annotations":             { "type": "object" }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create":      { "type": "boolean" },
+        "name":        { "type": "string" },
+        "annotations": { "type": "object" },
+        "automount":   { "type": "boolean" }
+      }
+    },
+    "podSecurityContext":       { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "resources":                { "type": "object" },
+    "startupProbe":             { "type": "object" },
+    "livenessProbe":            { "type": "object" },
+    "readinessProbe":           { "type": "object" },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "priorityClassName": { "type": "string" },
+    "nodeSelector":      { "type": "object" },
+    "tolerations":       { "type": "array" },
+    "affinity":          { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled":        { "type": "boolean" },
+        "minAvailable":   { "type": ["integer", "string", "null"] },
+        "maxUnavailable": { "type": ["integer", "string", "null"] }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingress": { "type": "array" },
+        "egress":  { "type": "array" }
+      }
+    },
+    "podAnnotations":   { "type": "object" },
+    "podLabels":        { "type": "object" },
+    "commonLabels":     { "type": "object" },
+    "nameOverride":     { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "extraEnv":         { "type": "array" },
+    "extraVolumes":     { "type": "array" },
+    "extraVolumeMounts":{ "type": "array" }
+  }
+}

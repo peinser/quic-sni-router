@@ -1,0 +1,50 @@
+name: qsr-http3-e2e
+
+services:
+  router:
+    build:
+      context: ../../..
+      dockerfile: docker/Dockerfile
+      target: e2e
+    command: ["/config/router.yaml"]
+    depends_on:
+      rvr-a:
+        condition: service_started
+      rvr-b:
+        condition: service_started
+    networks:
+      e2e:
+        aliases:
+          - rvr-a.flightdeck.test
+          - rvr-b.flightdeck.test
+
+  rvr-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "/app/http3_backend.py", "--name", "rvr-a", "--hostname", "rvr-a.flightdeck.test", "--port", "8443"]
+    networks:
+      - e2e
+
+  rvr-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "/app/http3_backend.py", "--name", "rvr-b", "--hostname", "rvr-b.flightdeck.test", "--port", "8444"]
+    networks:
+      - e2e
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "/app/http3_client.py", "--router-port", "443"]
+    depends_on:
+      router:
+        condition: service_started
+    networks:
+      - e2e
+
+networks:
+  e2e:
+    driver: bridge

@@ -1,0 +1,41 @@
+name: Setup build dependencies
+description: >
+  Install the apt packages every CI job needs (cmake, ninja, libssl-dev,
+  libyaml-dev, pkg-config) plus any per-job extras, with an actions/cache
+  layer on /var/cache/apt/archives so repeat runs skip the .deb download.
+
+inputs:
+  extras:
+    description: Space-separated additional apt packages this job needs.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+  # Self-hosted runners can hold the apt archive across runs, but ephemeral
+  # runners benefit a lot from this cache. The key includes runner.os so we
+  # don't cross-pollinate macOS/Linux caches if the pool ever mixes them.
+  - name: Cache apt archives
+    uses: actions/cache@v4
+    with:
+      path: |
+        /var/cache/apt/archives
+        /var/lib/apt/lists
+      # Bump the suffix below to invalidate the cache after a deb-base upgrade.
+      key: apt-${{ runner.os }}-${{ inputs.extras }}-v1
+      restore-keys: |
+        apt-${{ runner.os }}-
+
+  - name: Install build dependencies
+    shell: bash
+    run: |
+      # Keep apt from deleting the cached .debs on next install.
+      sudo rm -f /etc/apt/apt.conf.d/docker-clean
+      printf 'Binary::apt::APT::Keep-Downloaded-Packages "true";\n' \
+        | sudo tee /etc/apt/apt.conf.d/keep-cache >/dev/null
+
+      sudo apt-get update
+      # `base` is what every job needs to configure + build the C core.
+      base="cmake ninja-build libssl-dev libyaml-dev pkg-config"
+      sudo apt-get install -y --no-install-recommends ${base} ${{ inputs.extras }}

@@ -1,0 +1,14 @@
+build*/
+.cache/
+.git/
+.github/
+.dev/
+.devcontainer/
+*.profraw
+*.profdata
+*.dSYM/
+examples/**/certs/
+tests/**/certs/
+tests/e2e/**/__pycache__/
+tests/e2e/**/.pytest_cache/
+tests/e2e/**/qlog/

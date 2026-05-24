@@ -1,0 +1,12 @@
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 60s
+  maxSessions: 100000
+routes:
+  rvr-a.flightdeck.tower.peinser.com:
+    host: flightdeck-rvr-a
+    port: 8443
+  rvr-b.flightdeck.tower.peinser.com:
+    host: flightdeck-rvr-b
+    port: 8444
