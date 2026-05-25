@@ -35,6 +35,7 @@ endif()
 
 add_library(qsr_core
   src/config.c
+  src/hash.c
   src/metrics.c
   src/quic_crypto.c
   src/quic_frames.c
@@ -74,6 +75,7 @@ enable_testing()
 
 add_executable(qsr_unit_tests
   tests/unit/test_config.c
+  tests/unit/test_hash.c
   tests/unit/test_quic_crypto.c
   tests/unit/test_quic_frames.c
   tests/unit/test_quic_initial.c

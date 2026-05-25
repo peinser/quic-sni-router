@@ -27,6 +27,21 @@
 #define QSR_MAX_ADDR_LEN 255U
 #define QSR_MAX_LISTEN_ADDR_LEN 64U
 #define QSR_MAX_QUIC_CID_LEN 20U
+
+/*
+ * Minimum CID length we will store as a single-CID alias for short-header
+ * lookup. Short-header packets do not self-describe DCID length, so the
+ * router has to guess by iterating lengths against the session table; a
+ * stored 1- or 2-byte CID would let a packet from anywhere false-match at
+ * non-trivial rates (≈ N_sessions / 256^len per try). 8 is the value
+ * RFC 9000 §17.2 says servers SHOULD use, and per-try probability at len=8
+ * with a 100K-session table is ~5e-15.
+ *
+ * Short CIDs from the long header (used for pair-key rebinding lookup,
+ * which compares full-length keys, no iteration) are unaffected by this
+ * floor.
+ */
+#define QSR_MIN_LEARNED_CID_LEN 8U
 #define QSR_QUIC_V1 0x00000001U
 /* RFC 9369 (QUIC v2). Uses a different Initial salt, different HKDF labels
  * ("quicv2 key/iv/hp"), and rotates the long-header type bits (Initial=0b01,

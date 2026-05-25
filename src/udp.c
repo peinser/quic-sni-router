@@ -204,6 +204,16 @@ static void put_alias(qsr_session_table_t *sessions, const qsr_session_key_t *ke
 static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t *packet, size_t packet_len,
                                    const struct sockaddr_storage *source, socklen_t source_len,
                                    const struct sockaddr_storage *dest, socklen_t dest_len, time_t now) {
+  /*
+   * Hot-path short-circuit: this is called for every packet of every
+   * established session, and the vast majority are short-header 1-RTT
+   * packets which can never contain learnable CIDs anyway. Peek the
+   * long-header bit (and the fixed bit, which qsr_quic_parse_initial would
+   * also check) before paying the full parser invocation cost.
+   */
+  if (packet_len == 0U || (packet[0] & 0x80U) == 0U || (packet[0] & 0x40U) == 0U) {
+    return;
+  }
   qsr_quic_initial_t initial;
   if (qsr_quic_parse_initial(packet, packet_len, &initial) != QSR_OK) {
     return;
@@ -219,11 +229,19 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
 
 [[nodiscard]] static qsr_session_t *lookup_short_header_cid(const qsr_session_table_t *sessions, const uint8_t *packet,
                                                             size_t packet_len) {
-  if (packet_len < 2U || (packet[0] & 0x80U) != 0U || (packet[0] & 0x40U) == 0U) {
+  if (packet_len < 1U + QSR_MIN_LEARNED_CID_LEN || (packet[0] & 0x80U) != 0U || (packet[0] & 0x40U) == 0U) {
     return nullptr;
   }
+  /*
+   * Iterate from longest to shortest. The lower bound is QSR_MIN_LEARNED_CID_LEN
+   * because qsr_session_single_cid_key rejects anything below that floor at
+   * insertion time, so iterating shorter lengths can only false-match against
+   * stale or attacker-planted aliases — both of which we close by refusing
+   * the insert in the first place. Upper bound is the packet's available
+   * bytes after the header byte, capped at 20 (QUIC v1 max).
+   */
   const size_t max_cid_len = packet_len - 1U < QSR_MAX_QUIC_CID_LEN ? packet_len - 1U : QSR_MAX_QUIC_CID_LEN;
-  for (size_t cid_len = max_cid_len; cid_len > 0U; cid_len--) {
+  for (size_t cid_len = max_cid_len; cid_len >= QSR_MIN_LEARNED_CID_LEN; cid_len--) {
     qsr_session_key_t key = qsr_session_single_cid_key(packet + 1U, cid_len);
     qsr_session_t *session = qsr_session_table_get(sessions, &key);
     if (session != nullptr) {
@@ -235,6 +253,12 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
 
 [[nodiscard]] static qsr_session_t *lookup_rebound_initial(const qsr_session_table_t *sessions, const uint8_t *packet,
                                                            size_t packet_len, qsr_session_key_t *cid_key) {
+  /* Same short-circuit as learn_long_header_cids: only long-header packets
+   * can be Initials. Saves the parser invocation for the common case where a
+   * source without a tuple match is sending a 1-RTT short-header packet. */
+  if (packet_len == 0U || (packet[0] & 0x80U) == 0U || (packet[0] & 0x40U) == 0U) {
+    return nullptr;
+  }
   qsr_quic_initial_t initial;
   if (qsr_quic_parse_initial(packet, packet_len, &initial) != QSR_OK) {
     return nullptr;
@@ -252,8 +276,7 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
   return QSR_OK;
 }
 
-[[nodiscard]] static qsr_status_t wait_readable(int fd, int epoll_fd) {
-  (void)fd;
+[[nodiscard]] static qsr_status_t wait_readable(int epoll_fd) {
   struct epoll_event event = {0};
   for (;;) {
     if (g_stop) {
@@ -517,7 +540,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         continue;
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        if (wait_readable(fd, epoll_fd) != QSR_OK) {
+        if (wait_readable(epoll_fd) != QSR_OK) {
           break;
         }
         const time_t sweep_now = monotonic_now();

@@ -91,6 +91,15 @@ void qsr_config_default(qsr_config_t *config) {
   if (len + 1U > out_max) {
     return QSR_ERR_INVALID;
   }
+  /*
+   * Reject scalars containing an embedded NUL — every consumer here uses
+   * strcmp/strncmp, which would treat the NUL as a string terminator and
+   * silently accept the prefix. Operator config is trusted but the check
+   * is one line and closes a category of footguns.
+   */
+  if (memchr(node->data.scalar.value, 0, len) != nullptr) {
+    return QSR_ERR_INVALID;
+  }
   memcpy(out, node->data.scalar.value, len);
   out[len] = '\0';
   return QSR_OK;
