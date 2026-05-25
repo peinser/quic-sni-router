@@ -9,7 +9,7 @@ QSR_ENABLE_LTO ?= OFF
 DOCKER ?= docker
 CLANG ?= clang
 
-.PHONY: help configure build format lint test test-e2e test-e2e-reload fuzz-smoke sanitize benchmark benchmark-native docker-build clean
+.PHONY: help configure build format lint test test-e2e test-e2e-reload test-loadtest fuzz-smoke sanitize benchmark benchmark-native docker-build clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -49,6 +49,9 @@ test-e2e: ## Run Docker HTTP/3 end-to-end test
 
 test-e2e-reload: ## Run Docker hot-reload end-to-end test
 	tests/e2e/reload/run.sh
+
+test-loadtest: ## Run Docker loadtest (10 backends, sustained concurrent QUIC)
+	tests/e2e/loadtest/run.sh
 
 fuzz-smoke: ## Build fuzzers and run a short smoke test
 	@if ! printf '%s\n' 'int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { (void)data; (void)size; return 0; }' | $(CLANG) -fsanitize=fuzzer -x c - -o /tmp/qsr-fuzzer-check >/dev/null 2>&1; then \

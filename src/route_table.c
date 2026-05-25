@@ -17,6 +17,18 @@ static uint64_t hash_string(const char *value) {
   return qsr_hash_bytes(value, strlen(value));
 }
 
+static uint64_t hash_backend(const struct sockaddr_storage *addr, socklen_t addr_len) {
+  uint8_t buf[1U + sizeof(*addr)];
+  buf[0] = (uint8_t)addr_len;
+  memcpy(buf + 1U, addr, addr_len);
+  return qsr_hash_bytes(buf, 1U + addr_len);
+}
+
+static bool backend_equals(const qsr_route_t *route, const struct sockaddr_storage *addr, socklen_t addr_len) {
+  return route->backend_resolved && route->backend_addr_len == addr_len &&
+         memcmp(&route->backend_addr, addr, addr_len) == 0;
+}
+
 static bool normalize_hostname(const char *input, char *out, size_t out_len) {
   const size_t len = input == NULL ? 0U : strlen(input);
   if (len == 0U || len >= out_len || input[0] == '.' || input[len - 1U] == '.') {
@@ -56,7 +68,29 @@ void qsr_route_table_init(qsr_route_table_t *table) {
   memset(table, 0, sizeof(*table));
   for (size_t i = 0U; i < QSR_ROUTE_BUCKETS; i++) {
     table->buckets[i] = SIZE_MAX;
+    table->backend_buckets[i] = SIZE_MAX;
   }
+}
+
+static qsr_status_t backend_index_put(qsr_route_table_t *table, size_t route_index) {
+  const qsr_route_t *route = &table->routes[route_index];
+  if (!route->backend_resolved || route->backend_addr_len == 0U) {
+    return QSR_ERR_INVALID;
+  }
+  size_t bucket = (size_t)(hash_backend(&route->backend_addr, route->backend_addr_len) % QSR_ROUTE_BUCKETS);
+  for (size_t probes = 0U; probes < QSR_ROUTE_BUCKETS; probes++) {
+    const size_t existing = table->backend_buckets[bucket];
+    if (existing == SIZE_MAX) {
+      table->backend_buckets[bucket] = route_index;
+      return QSR_OK;
+    }
+    if (existing < table->count && backend_equals(&table->routes[existing], &route->backend_addr,
+                                                  route->backend_addr_len)) {
+      return QSR_OK;
+    }
+    bucket = (bucket + 1U) % QSR_ROUTE_BUCKETS;
+  }
+  return QSR_ERR_FULL;
 }
 
 qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, const char *host, uint16_t port) {
@@ -119,15 +153,19 @@ const qsr_route_t *qsr_route_table_lookup(const qsr_route_table_t *table, const 
 
 bool qsr_route_table_has_backend(const qsr_route_table_t *table, const struct sockaddr_storage *addr,
                                  socklen_t addr_len) {
-  if (table == nullptr || addr == nullptr || addr_len == 0U) {
+  if (table == nullptr || addr == nullptr || addr_len == 0U || addr_len > sizeof(*addr)) {
     return false;
   }
-  for (size_t i = 0U; i < table->count; i++) {
-    const qsr_route_t *route = &table->routes[i];
-    if (route->backend_resolved && route->backend_addr_len == addr_len &&
-        memcmp(&route->backend_addr, addr, addr_len) == 0) {
+  size_t bucket = (size_t)(hash_backend(addr, addr_len) % QSR_ROUTE_BUCKETS);
+  for (size_t probes = 0U; probes < QSR_ROUTE_BUCKETS; probes++) {
+    const size_t route_index = table->backend_buckets[bucket];
+    if (route_index == SIZE_MAX) {
+      return false;
+    }
+    if (route_index < table->count && backend_equals(&table->routes[route_index], addr, addr_len)) {
       return true;
     }
+    bucket = (bucket + 1U) % QSR_ROUTE_BUCKETS;
   }
   return false;
 }
@@ -135,6 +173,9 @@ bool qsr_route_table_has_backend(const qsr_route_table_t *table, const struct so
 qsr_status_t qsr_route_table_resolve(qsr_route_table_t *table) {
   if (table == nullptr) {
     return QSR_ERR_INVALID;
+  }
+  for (size_t i = 0U; i < QSR_ROUTE_BUCKETS; i++) {
+    table->backend_buckets[i] = SIZE_MAX;
   }
   for (size_t i = 0U; i < table->count; i++) {
     qsr_route_t *route = &table->routes[i];
@@ -173,6 +214,12 @@ qsr_status_t qsr_route_table_resolve(qsr_route_table_t *table) {
     route->backend_addr_len = res->ai_addrlen;
     route->backend_resolved = true;
     freeaddrinfo(res);
+  }
+  for (size_t i = 0U; i < table->count; i++) {
+    const qsr_status_t status = backend_index_put(table, i);
+    if (status != QSR_OK) {
+      return status;
+    }
   }
   return QSR_OK;
 }

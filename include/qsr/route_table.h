@@ -6,9 +6,8 @@
  * Backend hostnames are resolved once via getaddrinfo at startup and again
  * on every hot reload — the dataplane never blocks on DNS.
  *
- * qsr_route_table_has_backend is used by the hot-reload eviction predicate
- * (see src/runtime.c) to distinguish forward aliases from reverse aliases
- * in the session table.
+ * Resolved backend addresses are also indexed, so qsr_route_table_has_backend
+ * can be used on the dataplane hot path without scanning every route.
  */
 #ifndef QSR_ROUTE_TABLE_H
 #define QSR_ROUTE_TABLE_H
@@ -29,6 +28,7 @@ typedef struct qsr_route {
 typedef struct qsr_route_table {
   qsr_route_t routes[QSR_MAX_ROUTES];
   size_t buckets[QSR_ROUTE_BUCKETS];
+  size_t backend_buckets[QSR_ROUTE_BUCKETS];
   size_t count;
 } qsr_route_table_t;
 
@@ -40,8 +40,9 @@ void qsr_route_table_init(qsr_route_table_t *table);
 
 /*
  * Returns true iff `addr` (of length `addr_len`) is a resolved backend of
- * some route in `table`. Used at hot-reload time to decide whether a session's
- * pinned backend is still part of the configured set.
+ * some route in `table`. Used on the dataplane path to classify packet
+ * direction and at hot-reload time to decide whether a session's pinned
+ * backend is still part of the configured set.
  */
 [[nodiscard]] bool qsr_route_table_has_backend(const qsr_route_table_t *table,
                                                const struct sockaddr_storage *addr, socklen_t addr_len);

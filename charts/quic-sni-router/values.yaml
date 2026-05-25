@@ -28,6 +28,11 @@ config:
     udp: ":8443"
   sessions:
     idleTimeout: 60s         # 1..86400; CLOCK_MONOTONIC-based expiry.
+    # Provision for: expected conn/s × idleTimeout × ~5 (each new connection
+    # creates ~5 table entries: forward + reverse tuple + DCID alias + SCID
+    # alias + DCID+SCID pair). 100000 sustains ~333 conn/s at default
+    # idleTimeout. Under-provisioning breaks active connections mid-flight
+    # when the LRU eviction kicks in.
     maxSessions: 100000      # 1..1000000; oldest-by-last-seen evicted on full.
   # routes is a map of <SNI>: { host, port }. Empty is valid but useless.
   # Example:

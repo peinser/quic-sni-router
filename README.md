@@ -28,7 +28,7 @@ Read this before exposing the router to the public internet:
 - **Backend isolation.** Backends should be on a non-routable / cluster-internal network. The router learns a `backend_ip:port` reverse mapping; if an attacker can spoof packets *with that source address* to UDP/443, the router will forward them toward the associated client. QUIC's own AEAD makes this an annoyance rather than a takeover, but the safer posture is to make backends unreachable from the WAN.
 - **Anti-amplification.** The router drops Initial datagrams shorter than 1200 bytes from unknown sources (RFC 9000 §14.1), so it cannot be turned into a UDP amplifier. Add upstream BCP 38 / uRPF to block spoofed sources entirely.
 - **CPU DoS.** There is no in-process per-source rate limit. Combine with eBPF/nftables/cloud LB rate limiting before exposing to untrusted networks.
-- **Session table.** When `maxSessions` is reached, the oldest session by `last_seen` is evicted to make room. Size `maxSessions` for at least 10x your expected concurrent connection count.
+- **Session table.** Provision `maxSessions` for `expected_connections_per_second × idleTimeout_seconds × ~5` — each new QUIC connection creates roughly 5 table entries (forward tuple, reverse tuple, DCID alias, SCID alias, DCID+SCID pair). At 1000 conn/s with the default 60s `idleTimeout`, that's ~300k. When the cap is hit, the oldest entry by `last_seen` is evicted; if you're under-provisioned you'll see active connections break mid-flight.
 - **Single-threaded.** Each router process pins to one core. Run multiple processes; `SO_REUSEPORT` is set automatically so the kernel hashes flows across them.
 - **DNS is one-shot.** Backends are resolved at startup AND on every hot reload (see below). To pick up a backend IP change without a config edit, restart the process.
 - **Hot reload.** The directory containing `config.yaml` is watched via `inotify`. Editing the file or having Kubernetes swap the ConfigMap symlink triggers re-parse + DNS re-resolve + atomic swap, with no packet loss. Sessions whose backend disappeared from the new config are evicted (hard cutover); sessions to surviving backends keep going. `listen.udp` and `sessions.maxSessions` changes are logged and ignored until restart.
@@ -222,6 +222,7 @@ See `examples/mtls-backends/` for a Docker Compose demo with two HTTP/3 mTLS bac
 - `make fuzz-smoke`: short libFuzzer smoke tests where libFuzzer is available.
 - `make test-e2e`: Docker HTTP/3 SNI routing test using aioquic mock backends (covers v1 and v2).
 - `make test-e2e-reload`: Docker hot-reload test — start with one route, `docker cp` a new config in, assert inotify drove a reload and the new route works.
+- `make test-loadtest`: Docker correctness-under-load test using many fresh QUIC handshakes. Set `QSR_LOADTEST_DIRECT=1` to bypass the router for baseline comparison, or `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.
 - `make benchmark`: synthetic CPU benchmarks for route lookup, session lookup, and CRYPTO frame extraction.
 
 ## References

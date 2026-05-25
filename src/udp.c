@@ -267,6 +267,38 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
   return qsr_session_table_get(sessions, cid_key);
 }
 
+[[nodiscard]] static qsr_session_t *lookup_long_header_dcid(const qsr_session_table_t *sessions, const uint8_t *packet,
+                                                            size_t packet_len) {
+  if (packet_len < 7U || (packet[0] & 0x80U) == 0U || (packet[0] & 0x40U) == 0U) {
+    return nullptr;
+  }
+  const uint32_t version = ((uint32_t)packet[1] << 24U) | ((uint32_t)packet[2] << 16U) | ((uint32_t)packet[3] << 8U) |
+                           (uint32_t)packet[4];
+  if (version != QSR_QUIC_V1 && version != QSR_QUIC_V2) {
+    return nullptr;
+  }
+  const uint8_t dcid_len = packet[5];
+  if (dcid_len < QSR_MIN_LEARNED_CID_LEN || dcid_len > QSR_MAX_QUIC_CID_LEN || 6U + (size_t)dcid_len >= packet_len) {
+    return nullptr;
+  }
+  qsr_session_key_t dcid_key = qsr_session_single_cid_key(packet + 6U, dcid_len);
+  return qsr_session_table_get(sessions, &dcid_key);
+}
+
+[[nodiscard]] static qsr_session_t *lookup_backend_dcid(const qsr_config_t *runtime_config,
+                                                        const qsr_session_table_t *sessions, const uint8_t *packet,
+                                                        size_t packet_len) {
+  qsr_session_t *session = lookup_long_header_dcid(sessions, packet, packet_len);
+  if (session == nullptr) {
+    session = lookup_short_header_cid(sessions, packet, packet_len);
+  }
+  if (session != nullptr && !qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
+                                                         session->backend_addr_len)) {
+    return session;
+  }
+  return nullptr;
+}
+
 #ifdef __linux__
 [[nodiscard]] static qsr_status_t set_nonblocking(int fd) {
   const int flags = fcntl(fd, F_GETFL, 0);
@@ -306,7 +338,80 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
                           int fd, const uint8_t *packet, size_t packet_len, const struct sockaddr_storage *source,
                           socklen_t source_len, time_t now) {
   qsr_session_key_t key = qsr_session_tuple_key(source, source_len);
-  qsr_session_t *session = qsr_session_table_get(sessions, &key);
+  qsr_session_t *session = nullptr;
+  const bool source_is_backend = qsr_route_table_has_backend(&runtime_config->routes, source, source_len);
+
+  /*
+   * Initial packets need careful handling. There are three sub-cases:
+   *
+   *  1. Client Initial, fresh connection:
+   *       - pair-CID miss, no tuple alias (or stale tuple alias from a
+   *         reused source port) — route fresh by SNI.
+   *  2. Client Initial, retransmission of an already-routed connection:
+   *       - pair-CID match — use that session.
+   *  3. Server Initial response (during handshake, backend -> client):
+   *       - pair-CID miss (server-chosen CIDs not yet learned), tuple
+   *         match against a REVERSE alias (backend tuple -> client) —
+   *         use the tuple match.
+   *
+   * The trap is case 1 with a kernel-reused source port: the stale tuple
+   * alias from a closed previous connection still maps to a backend, so a
+   * bare tuple match misroutes the fresh Initial. The fix is to
+   * distinguish (1) from (3) — a tuple match whose destination is a
+   * configured backend is the port-reuse case; a tuple match whose
+   * destination is NOT a configured backend is a reverse alias for a
+   * backend->client response. qsr_route_table_has_backend answers exactly
+   * that, in O(N_routes) — only paid on Initials, which are rare.
+   */
+  bool is_initial = false;
+  {
+    qsr_quic_initial_t initial;
+    if (qsr_quic_parse_initial(packet, packet_len, &initial) == QSR_OK) {
+      is_initial = true;
+      qsr_session_key_t pair_key =
+          qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
+      session = qsr_session_table_get(sessions, &pair_key);
+      /* Backend Initial responses use DCID = the client's SCID. The client
+       * Initial taught us that single-CID alias, and it is per connection;
+       * the backend tuple alias is shared by all concurrent handshakes to the
+       * same backend and is therefore only a fallback. */
+      if (session == nullptr && source_is_backend) {
+        qsr_session_key_t dcid_key = qsr_session_single_cid_key(initial.dcid, initial.dcid_len);
+        qsr_session_t *dcid_session = qsr_session_table_get(sessions, &dcid_key);
+        if (dcid_session != nullptr &&
+            !qsr_route_table_has_backend(&runtime_config->routes, &dcid_session->backend_addr,
+                                         dcid_session->backend_addr_len)) {
+          session = dcid_session;
+        }
+      }
+    }
+  }
+  if (session == nullptr && source_is_backend) {
+    session = lookup_backend_dcid(runtime_config, sessions, packet, packet_len);
+  }
+  if (session == nullptr) {
+    qsr_session_t *tuple_session = qsr_session_table_get(sessions, &key);
+    /*
+     * Honour a tuple match in two cases:
+     *   - non-Initial packet (tuple is authoritative within one ephemeral
+     *     port's lifetime), or
+     *   - Initial whose tuple-matched destination is NOT a configured
+     *     backend, which means the destination is a client tuple — i.e., a
+     *     REVERSE alias for a backend's Initial response during handshake.
+     *
+     * The dropped case is the opposite: an Initial whose tuple-matched
+     * destination IS a configured backend. That's the source-port-reuse
+     * scenario — a fresh client Initial inheriting a stale forward alias
+     * from a closed previous connection. Drop the tuple match and let
+     * route_initial_datagram below route fresh by SNI.
+     */
+    if (tuple_session != nullptr &&
+        (!is_initial ||
+         !qsr_route_table_has_backend(&runtime_config->routes, &tuple_session->backend_addr,
+                                      tuple_session->backend_addr_len))) {
+      session = tuple_session;
+    }
+  }
   if (session == nullptr) {
     const qsr_session_t *cid_session = lookup_short_header_cid(sessions, packet, packet_len);
     if (cid_session != nullptr) {
@@ -321,7 +426,12 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       session = qsr_session_table_get(sessions, &key);
     }
   }
-  if (session == nullptr) {
+  /*
+   * lookup_rebound_initial is the long-header-DCID+SCID-pair lookup we
+   * already did above when is_initial is true. Skip the duplicate lookup
+   * in that case; the previous tuple-first ordering called it unconditionally.
+   */
+  if (session == nullptr && !is_initial) {
     qsr_session_key_t cid_key;
     const qsr_session_t *cid_session = lookup_rebound_initial(sessions, packet, packet_len, &cid_key);
     if (cid_session != nullptr) {
@@ -379,6 +489,9 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
   if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
     return QSR_ERR_INVALID;
   }
+  const int buffer_size = 4 * 1024 * 1024;
+  (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+  (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
   /*
    * SO_REUSEPORT lets an operator scale by launching multiple router processes
    * bound to the same UDP port; the kernel hashes incoming flows across them.

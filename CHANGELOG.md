@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- **Source-port-reuse misrouting**: when the kernel quickly reassigned an ephemeral UDP source port to a fresh `connect()`, the new QUIC Initial arrived on a tuple that matched a stale forward-alias from the previous connection in our session table, and was misrouted to the previous backend. The wrong backend's AEAD then rejected the packet, the client retransmitted, was still misrouted, and the connection eventually timed out. `handle_packet` now routes long-header Initial packets by their (DCID, SCID) pair-key first; tuple match is only honoured for non-Initial packets, or for Initials whose tuple-matched destination is NOT a configured backend (i.e., a reverse alias for a server's Initial response). Bug discovered by the new loadtest e2e, which is the regression net going forward (zero-tolerance misroute assertion).
+- **Backend reverse-tuple ambiguity**: backend return traffic was previously allowed to route through a single reverse tuple alias (`backend_ip:port -> client`). That is ambiguous because one backend UDP socket serves many concurrent QUIC connections; the alias could be overwritten by another connection, sending backend packets to the wrong client and producing AEAD rejection/timeouts. Packets from configured backends now prefer learned long-header/short-header DCID aliases before backend tuple fallback.
+- **Backward-shift deletion in `table_delete_at`** had a stop-condition that fired only when `distance == 0`; the move is also invalid in the wrap-around case where the entry's natural slot is between cursor and next. Latent under FNV-1a's distribution; SipHash's better one made it observable. Replaced with the correct two-distance comparison.
+
+### Added (testing)
+
+- **Loadtest e2e** at `tests/e2e/loadtest/`: 10 aioquic HTTP/3 backends behind the router, a Python concurrent client (`loadtest_client.py`) that opens fresh QUIC handshakes through the router at the configured concurrency for the configured duration, verifies each response body matches the routed-to backend (catches misrouting at runtime), and reports throughput + p50/p95/p99 latency. Pass criteria: zero misrouted responses AND success rate ≥ threshold (default 95%). New `make test-loadtest` target, new `loadtest` CI job. Surfaces routing bugs that the small-scale http3 e2e (2 backends, 4 connections) can't trigger — found the source-port-reuse misrouting bug on first run.
+- **Persistent loadtest mode**: `QSR_LOADTEST_PERSISTENT=1 make test-loadtest` keeps one QUIC/HTTP/3 session open per worker and sends repeated requests on new streams. `QSR_LOADTEST_DIRECT=1` bypasses the router for baseline comparison.
+
 ### Security
 
 - Replaced FNV-1a with SipHash-2-4 in the session and route tables. A 16-byte hash key is seeded from `getrandom(2)` at process startup; an attacker controlling QUIC DCIDs or SNIs can no longer force open-addressed-table probe walks via collision crafting. RFC test vectors pinned in `tests/unit/test_hash.c`.
@@ -18,6 +29,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Performance
 
+- `qsr_route_table_has_backend` now uses a resolved backend-address hash index instead of scanning all routes. This removes an O(routes) check from backend-source detection on the dataplane path and from hot-reload session classification.
 - `learn_long_header_cids` and `lookup_rebound_initial` peek the long-header bit before invoking the QUIC Initial parser. These are called on every packet of every established session, and the overwhelming majority are short-header 1-RTT packets that the parser would fast-fail anyway — peek shaves ~10ns/packet off the steady-state hot path.
 - Combined `qsr_session_table_put`'s lookup + insertion-slot probe into a single open-addressing walk. The previous shape hashed and probed twice per insert; new shape walks the table once and only re-walks after eviction (bounded at exactly 2 walks per put).
 - Removed a 1500-byte stack-array zero-init from `qsr_quic_decrypt_initial`; the buffer is immediately fully overwritten by a `memcpy` of the packet, so the zero-init was pure waste on every new-session decrypt.

@@ -77,6 +77,28 @@ jobs:
     - name: Docker hot-reload e2e
       run: make test-e2e-reload
 
+  loadtest:
+    runs-on:
+      group: on-prem
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+    - name: Authenticate with the remote Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ${{ vars.OCI_REGISTRY }}
+        username: ${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}
+        password: ${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}
+    - name: Docker loadtest (10 backends, sustained concurrent QUIC)
+      # Correctness-under-load: 10 aioquic backends, 10 concurrent workers
+      # for 30s of fresh handshakes each. Pass requires zero misrouted
+      # responses AND success rate >= 95%. Tune via env vars.
+      run: make test-loadtest
+    - name: Docker persistent-session loadtest
+      # Established-session forwarding: each worker keeps one QUIC/HTTP/3
+      # connection open and sends repeated requests on new streams.
+      run: QSR_LOADTEST_PERSISTENT=1 make test-loadtest
+
   static-analysis:
     runs-on:
       group: on-prem
