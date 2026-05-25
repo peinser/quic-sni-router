@@ -10,7 +10,6 @@ What's planned, why it's worth doing, and what would block someone from picking 
 - **Per-source rate limit**. CPU-DoS shield independent of upstream BCP 38. Token bucket per `/24` (or `/64` for v6), bounded LRU map. Drop Initials over budget before HKDF/AES. Default: very generous (e.g., 1000 Initials/s per /24).
 - **Wildcard / suffix SNI routes**. `*.example.com` → backend. Compile-time: change route lookup from exact `strcmp` to a two-pass (exact, then longest suffix). Bounded cost since route count is ≤ 1024.
 - **Fallback / catch-all route**. Today, no-route SNIs are dropped. An optional `default:` route would let operators front a generic backend or a "you've reached an unknown service" responder.
-- **Connection draining on SIGTERM**. Right now SIGTERM stops accepting new packets and exits within `terminationGracePeriodSeconds`. A draining mode (stop NEW sessions, keep forwarding for existing ones until idle) makes rolling updates lossless for in-flight QUIC connections. Needs a session-classifier (existing vs. new) on the recv path.
 
 ## Mid term
 
