@@ -1,4 +1,5 @@
 #include "qsr/config.h"
+#include "qsr/hash.h"
 #include "qsr/udp.h"
 
 #include <stdio.h>
@@ -23,6 +24,17 @@ static const char *status_name(qsr_status_t status) {
 }
 
 int main(int argc, char **argv) {
+  /*
+   * Seed the SipHash key from getrandom before anything else hashes anything.
+   * The route and session tables use this; without it they'd lazy-init on
+   * first use, which is fine for tests but worth doing eagerly at startup
+   * so a getrandom failure surfaces before we start serving traffic.
+   */
+  if (qsr_hash_init() != QSR_OK) {
+    (void)fprintf(stderr, "failed to seed hash key\n");
+    return 1;
+  }
+
   qsr_config_t config;
   qsr_status_t status = QSR_OK;
   if (argc > 2) {

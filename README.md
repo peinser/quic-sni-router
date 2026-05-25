@@ -32,7 +32,7 @@ Read this before exposing the router to the public internet:
 - **Single-threaded.** Each router process pins to one core. Run multiple processes; `SO_REUSEPORT` is set automatically so the kernel hashes flows across them.
 - **DNS is one-shot.** Backends are resolved at startup AND on every hot reload (see below). To pick up a backend IP change without a config edit, restart the process.
 - **Hot reload.** The directory containing `config.yaml` is watched via `inotify`. Editing the file or having Kubernetes swap the ConfigMap symlink triggers re-parse + DNS re-resolve + atomic swap, with no packet loss. Sessions whose backend disappeared from the new config are evicted (hard cutover); sessions to surviving backends keep going. `listen.udp` and `sessions.maxSessions` changes are logged and ignored until restart.
-- **No ECH.** Encrypted ClientHello hides the SNI by design and breaks routing. ECH-using clients will fail.
+- **ECH-aware behaviour.** With Encrypted ClientHello, the router sees the OUTER ClientHello's cover hostname (e.g. `cloudflare-ech.com`) — not the real inner hostname, which is encrypted. We route by whatever's in the outer SNI, so ECH-using clients work iff the cover hostname is a configured route; otherwise their packets drop like any other unrouted SNI. The router can never see the inner hostname without terminating TLS (we don't).
 - **QUIC versions.** v1 (RFC 9000) and v2 (RFC 9369) are accepted. Any other version returns `UNSUPPORTED` at the parser and the packet is dropped (clients will fall back via version negotiation).
 
 See [docs/threat-model.md](docs/threat-model.md) for the full threat model.

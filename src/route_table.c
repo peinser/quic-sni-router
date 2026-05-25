@@ -1,16 +1,20 @@
 #include "qsr/route_table.h"
 
+#include "qsr/hash.h"
+
 #include <netdb.h>
 #include <stdio.h>
 #include <string.h>
 
-static uint64_t fnv1a_string(const char *value) {
-  uint64_t hash = 1469598103934665603ULL;
-  for (const unsigned char *p = (const unsigned char *)value; *p != '\0'; p++) {
-    hash ^= *p;
-    hash *= 1099511628211ULL;
-  }
-  return hash;
+static uint64_t hash_string(const char *value) {
+  /*
+   * Route lookups happen once per Initial. Inputs are config-controlled
+   * (operator only) so the keyed-hash defense is less critical than for the
+   * session table, but using the same hash everywhere keeps the codebase
+   * to a single implementation and side-steps any future "what if an
+   * attacker can influence a route name" concern.
+   */
+  return qsr_hash_bytes(value, strlen(value));
 }
 
 static bool normalize_hostname(const char *input, char *out, size_t out_len) {
@@ -71,7 +75,7 @@ qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, cons
     return QSR_ERR_INVALID;
   }
 
-  size_t bucket = (size_t)(fnv1a_string(normalized) % QSR_ROUTE_BUCKETS);
+  size_t bucket = (size_t)(hash_string(normalized) % QSR_ROUTE_BUCKETS);
   for (size_t probes = 0U; probes < QSR_ROUTE_BUCKETS; probes++) {
     if (table->buckets[bucket] == SIZE_MAX) {
       qsr_route_t *route = &table->routes[table->count];
@@ -99,7 +103,7 @@ const qsr_route_t *qsr_route_table_lookup(const qsr_route_table_t *table, const 
   if (!normalize_hostname(sni, normalized, sizeof(normalized))) {
     return nullptr;
   }
-  size_t bucket = (size_t)(fnv1a_string(normalized) % QSR_ROUTE_BUCKETS);
+  size_t bucket = (size_t)(hash_string(normalized) % QSR_ROUTE_BUCKETS);
   for (size_t probes = 0U; probes < QSR_ROUTE_BUCKETS; probes++) {
     const size_t route_index = table->buckets[bucket];
     if (route_index == SIZE_MAX) {

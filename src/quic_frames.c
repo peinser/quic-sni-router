@@ -57,7 +57,15 @@ qsr_status_t qsr_quic_extract_crypto(const uint8_t *plaintext, size_t plaintext_
         return s;
       }
       offset += c;
-      if (range_count > plaintext_len) {
+      /*
+       * Each ACK range is at least 2 varint bytes (1 byte minimum each for
+       * gap + length). A range_count that can't possibly fit in the
+       * remaining plaintext is an attempt to make us spin in the loop
+       * below — bound it tightly. Only a client with a valid AEAD-decrypted
+       * Initial can trigger this, so it's a self-DoS at worst, but cheap
+       * to short-circuit.
+       */
+      if (range_count > (plaintext_len - offset) / 2U) {
         return QSR_ERR_INVALID;
       }
       for (uint64_t i = 0U; i < range_count; i++) {

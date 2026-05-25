@@ -182,7 +182,10 @@ qsr_status_t qsr_quic_decrypt_initial(const uint8_t *packet, size_t packet_len, 
     return status;
   }
 
-  uint8_t header[QSR_MAX_DATAGRAM_SIZE] = {0};
+  /* No zero-init: we memcpy the entire packet over `header` immediately
+   * below, and only access bytes < packet_len afterwards. Zero-init would
+   * touch 1500 bytes of stack on every Initial-decrypt for no benefit. */
+  uint8_t header[QSR_MAX_DATAGRAM_SIZE];
   if (packet_len > sizeof(header)) {
     return QSR_ERR_INVALID;
   }

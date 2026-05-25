@@ -55,7 +55,7 @@ Anything else returns `QSR_ERR_UNSUPPORTED` and the datagram is dropped. The rea
 
 - Version negotiation: only v1 and v2 are accepted; any other version is dropped at the parser. (We do not send Version Negotiation packets in response — clients drive the fallback on the timeout.)
 - Retry: the router does not issue Retry tokens, so the backend is responsible for QUIC anti-amplification (every modern QUIC stack does this by default).
-- Encrypted ClientHello (ECH): ECH hides the SNI by design and prevents SNI-based routing.
+- Encrypted ClientHello (ECH) inner-hostname routing: ECH encrypts the real SNI in an inner ClientHello, leaving only an outer cover hostname visible. The router routes by whatever SNI is in the outer ClientHello — so ECH-using clients reach whichever backend the cover hostname points at, never the real inner hostname. Recovering the inner SNI requires TLS termination, which we do not do. Detecting ECH presence and emitting an observability counter is in [ROADMAP.md](../ROADMAP.md).
 - 0-RTT, Handshake, 1-RTT decryption: the router never derives anything beyond client Initial keys.
 - Backend address re-resolution: hostnames are resolved once at startup. To pick up a backend IP change, restart the process (or roll the pods).
 

@@ -132,6 +132,7 @@ void test_quic_crypto(void);
 void test_tls_client_hello(void);
 void test_route_table(void);
 void test_session_table(void);
+void test_hash(void);
 
 void test_config(void) {
   test_defaults();
@@ -148,6 +149,7 @@ void test_config(void) {
 }
 
 int main(void) {
+  test_hash();
   test_config();
   test_quic_initial();
   test_quic_frames();

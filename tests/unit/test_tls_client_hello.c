@@ -27,9 +27,25 @@ static void test_rejects_oversize(void) {
 }
 
 static void test_rejects_truncated(void) {
+  /* Handshake type byte present + start of uint24 length, no body — the
+   * reader should detect this as truncated rather than invalid. */
   const uint8_t truncated[] = {0x01, 0x00, 0x00};
   qsr_sni_t sni;
-  ASSERT_TRUE(qsr_tls_client_hello_sni(truncated, sizeof(truncated), &sni) == QSR_ERR_INVALID);
+  ASSERT_TRUE(qsr_tls_client_hello_sni(truncated, sizeof(truncated), &sni) == QSR_ERR_TRUNCATED);
+}
+
+/*
+ * The wrong handshake message type (0x02 server_hello here) is INVALID,
+ * not TRUNCATED — the bytes are present, they just don't say "client_hello".
+ * This is the test the previous flat parser implicitly covered by the
+ * upfront `42U > len - offset` check; the restructured reader separates
+ * the two failure modes cleanly.
+ */
+static void test_rejects_wrong_handshake_type(void) {
+  uint8_t buf[80] = {0};
+  buf[0] = 0x02;  /* server_hello, not client_hello */
+  qsr_sni_t sni;
+  ASSERT_TRUE(qsr_tls_client_hello_sni(buf, sizeof(buf), &sni) == QSR_ERR_INVALID);
 }
 
 static void test_rejects_invalid_hostname(void) {
@@ -56,5 +72,6 @@ void test_tls_client_hello(void) {
   test_extracts_sni();
   test_rejects_oversize();
   test_rejects_truncated();
+  test_rejects_wrong_handshake_type();
   test_rejects_invalid_hostname();
 }

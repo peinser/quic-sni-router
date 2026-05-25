@@ -1,16 +1,9 @@
 #include "qsr/session_table.h"
 
+#include "qsr/hash.h"
+
 #include <stdlib.h>
 #include <string.h>
-
-static uint64_t fnv1a(const void *data, size_t len, uint64_t hash) {
-  const uint8_t *bytes = data;
-  for (size_t i = 0U; i < len; i++) {
-    hash ^= bytes[i];
-    hash *= 1099511628211ULL;
-  }
-  return hash;
-}
 
 static bool key_valid(const qsr_session_key_t *key) {
   if (key == nullptr || (!key->has_tuple && !key->has_cids) || key->dcid_len > sizeof(key->dcid) ||
@@ -31,18 +24,38 @@ static bool backend_valid(const struct sockaddr_storage *backend_addr, socklen_t
   return backend_addr->ss_family == AF_INET || backend_addr->ss_family == AF_INET6;
 }
 
+/*
+ * Serialize the key into a contiguous buffer and hash in a single SipHash
+ * pass (rather than chained calls per field). Chained-call hashing of
+ * variable-length fields can leak structure that's exploitable for
+ * collision attacks; one-pass over a length-prefixed serialization avoids
+ * it. The serialization includes lengths so two keys that pack to the same
+ * bytes for different reasons (e.g., empty tuple + N-byte cid vs. N-byte
+ * tuple + empty cid) hash differently.
+ *
+ * Max sizes: 2 flag bytes + 128-byte sockaddr_storage + 4-byte len-prefix
+ * + 20-byte dcid + 4 + 20-byte scid = under 192 bytes. Fixed stack buffer.
+ */
 static size_t key_hash(const qsr_session_key_t *key, size_t capacity) {
-  uint64_t hash = 1469598103934665603ULL;
-  hash = fnv1a(&key->has_tuple, sizeof(key->has_tuple), hash);
-  hash = fnv1a(&key->has_cids, sizeof(key->has_cids), hash);
+  uint8_t buf[192];
+  size_t n = 0U;
+  buf[n++] = key->has_tuple ? 1U : 0U;
+  buf[n++] = key->has_cids ? 1U : 0U;
   if (key->has_tuple) {
-    hash = fnv1a(&key->client_addr, key->client_addr_len, hash);
+    /* length prefix prevents tuple/cid boundary ambiguity */
+    buf[n++] = (uint8_t)key->client_addr_len;
+    memcpy(buf + n, &key->client_addr, key->client_addr_len);
+    n += key->client_addr_len;
   }
   if (key->has_cids) {
-    hash = fnv1a(key->dcid, key->dcid_len, hash);
-    hash = fnv1a(key->scid, key->scid_len, hash);
+    buf[n++] = (uint8_t)key->dcid_len;
+    memcpy(buf + n, key->dcid, key->dcid_len);
+    n += key->dcid_len;
+    buf[n++] = (uint8_t)key->scid_len;
+    memcpy(buf + n, key->scid, key->scid_len);
+    n += key->scid_len;
   }
-  return (size_t)(hash % capacity);
+  return (size_t)(qsr_hash_bytes(buf, n) % capacity);
 }
 
 static bool key_equals(const qsr_session_key_t *a, const qsr_session_key_t *b) {
@@ -87,6 +100,16 @@ qsr_session_key_t qsr_session_cid_key(const uint8_t *dcid, size_t dcid_len, cons
 }
 
 qsr_session_key_t qsr_session_single_cid_key(const uint8_t *cid, size_t cid_len) {
+  /*
+   * Reject CIDs below the minimum: storing a single-CID alias shorter than
+   * QSR_MIN_LEARNED_CID_LEN enables a short-header false-match attack
+   * (see common.h for the math). Returns an all-zero (invalid) key so the
+   * caller's put/get fails with QSR_ERR_INVALID rather than silently
+   * inserting an exploitable short alias.
+   */
+  if (cid_len < QSR_MIN_LEARNED_CID_LEN) {
+    return (qsr_session_key_t){0};
+  }
   return qsr_session_cid_key(cid, cid_len, nullptr, 0U);
 }
 
@@ -144,15 +167,25 @@ qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr
 static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
   size_t cursor = index;
   for (;;) {
-    size_t next = (cursor + 1U) % table->capacity;
+    const size_t next = (cursor + 1U) % table->capacity;
     if (!table->sessions[next].used) {
       memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
       break;
     }
+    /*
+     * Backward-shift validity: we can move the entry at `next` to `cursor`
+     * only if `cursor` is still on its forward probe walk from its natural
+     * slot. Concretely: cursor must be strictly closer to `natural` than
+     * `next` is, measured by forward distance modulo capacity. If `cursor`
+     * is at-or-past `next` (which includes the case where `next` is at its
+     * own home, distance==0), moving would put the entry on the wrong side
+     * of its natural slot — future lookups starting from natural would
+     * walk forward and never reach it.
+     */
     const size_t natural = key_hash(&table->sessions[next].key, table->capacity);
-    /* distance to next's natural slot — if it's 0 the chain ends here */
-    const size_t distance = (next + table->capacity - natural) % table->capacity;
-    if (distance == 0U) {
+    const size_t cursor_dist = (cursor + table->capacity - natural) % table->capacity;
+    const size_t next_dist = (next + table->capacity - natural) % table->capacity;
+    if (cursor_dist >= next_dist) {
       memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
       break;
     }
@@ -193,32 +226,42 @@ qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session
       !backend_valid(backend_addr, backend_addr_len)) {
     return QSR_ERR_INVALID;
   }
-  qsr_session_t *existing = qsr_session_table_get(table, key);
-  if (existing != nullptr) {
-    memcpy(&existing->backend_addr, backend_addr, sizeof(*backend_addr));
-    existing->backend_addr_len = backend_addr_len;
-    existing->last_seen = now;
-    return QSR_OK;
-  }
-  if (table->count >= table->capacity) {
-    evict_oldest(table);
-    if (table->count >= table->capacity) {
-      return QSR_ERR_FULL;
+  /*
+   * Single combined walk: looks for an existing key (update in place) and
+   * the first empty slot (insert) in one pass. Previously this function
+   * called qsr_session_table_get first and then did its own probe walk —
+   * two hash computations and two probe walks per put.
+   *
+   * If the walk completes without finding either (table fully occupied and
+   * no key match), we evict the oldest and walk once more. Bounded at
+   * exactly two walks; the second is guaranteed to find an empty slot
+   * because eviction freed at least one.
+   */
+  for (int attempt = 0; attempt < 2; attempt++) {
+    size_t index = key_hash(key, table->capacity);
+    for (size_t probes = 0U; probes < table->capacity; probes++) {
+      qsr_session_t *session = &table->sessions[index];
+      if (!session->used) {
+        session->used = true;
+        session->key = *key;
+        memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
+        session->backend_addr_len = backend_addr_len;
+        session->last_seen = now;
+        table->count++;
+        return QSR_OK;
+      }
+      if (key_equals(&session->key, key)) {
+        memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
+        session->backend_addr_len = backend_addr_len;
+        session->last_seen = now;
+        return QSR_OK;
+      }
+      index = (index + 1U) % table->capacity;
     }
-  }
-  size_t index = key_hash(key, table->capacity);
-  for (size_t probes = 0U; probes < table->capacity; probes++) {
-    qsr_session_t *session = &table->sessions[index];
-    if (!session->used) {
-      session->used = true;
-      session->key = *key;
-      memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
-      session->backend_addr_len = backend_addr_len;
-      session->last_seen = now;
-      table->count++;
-      return QSR_OK;
+    /* Walked every slot: no match, no empty. Evict and retry once. */
+    if (attempt == 0) {
+      evict_oldest(table);
     }
-    index = (index + 1U) % table->capacity;
   }
   return QSR_ERR_FULL;
 }
