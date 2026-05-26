@@ -165,32 +165,28 @@ qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr
  * a sweeping caller should not advance past it on this iteration.
  */
 static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
+  size_t hole = index;
   size_t cursor = index;
   for (;;) {
-    const size_t next = (cursor + 1U) % table->capacity;
-    if (!table->sessions[next].used) {
-      memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
+    cursor = (cursor + 1U) % table->capacity;
+    if (!table->sessions[cursor].used) {
+      memset(&table->sessions[hole], 0, sizeof(table->sessions[hole]));
       break;
     }
     /*
-     * Backward-shift validity: we can move the entry at `next` to `cursor`
-     * only if `cursor` is still on its forward probe walk from its natural
-     * slot. Concretely: cursor must be strictly closer to `natural` than
-     * `next` is, measured by forward distance modulo capacity. If `cursor`
-     * is at-or-past `next` (which includes the case where `next` is at its
-     * own home, distance==0), moving would put the entry on the wrong side
-     * of its natural slot — future lookups starting from natural would
-     * walk forward and never reach it.
+     * Move an entry only if the hole lies on that entry's probe walk from its
+     * natural slot to its current slot. If the current entry cannot move, keep
+     * scanning: a later wrapped/colliding entry may still depend on this hole
+     * being filled. Stopping at the first non-movable entry orphans those later
+     * keys under some hash seeds.
      */
-    const size_t natural = key_hash(&table->sessions[next].key, table->capacity);
+    const size_t natural = key_hash(&table->sessions[cursor].key, table->capacity);
+    const size_t hole_dist = (hole + table->capacity - natural) % table->capacity;
     const size_t cursor_dist = (cursor + table->capacity - natural) % table->capacity;
-    const size_t next_dist = (next + table->capacity - natural) % table->capacity;
-    if (cursor_dist >= next_dist) {
-      memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
-      break;
+    if (hole_dist < cursor_dist) {
+      table->sessions[hole] = table->sessions[cursor];
+      hole = cursor;
     }
-    table->sessions[cursor] = table->sessions[next];
-    cursor = next;
   }
   table->count--;
   return index;
