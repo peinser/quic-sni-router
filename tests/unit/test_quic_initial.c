@@ -43,6 +43,40 @@ static void test_parse_v2_initial_happy_path(void) {
   ASSERT_TRUE(initial.payload_len == 60U);
 }
 
+static void test_parse_long_header_retry_cids(void) {
+  const uint8_t packet[] = {
+      0xf0, 0x00, 0x00, 0x00, 0x01,             /* long+fixed+Retry(v1), version */
+      0x08, 1, 2, 3, 4, 5, 6, 7, 8,             /* dcid_len + dcid */
+      0x08, 9, 10, 11, 12, 13, 14, 15, 16,      /* scid_len + scid */
+      0xaa, 0xbb, 0xcc,                         /* token / integrity bytes */
+  };
+  qsr_quic_long_header_t header;
+  ASSERT_TRUE(qsr_quic_parse_long_header(packet, sizeof(packet), &header) == QSR_OK);
+  ASSERT_TRUE(header.version == QSR_QUIC_V1);
+  ASSERT_TRUE(header.type_bits == 0x30U);
+  ASSERT_TRUE(header.dcid_len == 8U);
+  ASSERT_TRUE(header.scid_len == 8U);
+  ASSERT_TRUE(header.remainder_offset == 23U);
+  ASSERT_TRUE(memcmp(header.dcid, packet + 6U, 8U) == 0);
+  ASSERT_TRUE(memcmp(header.scid, packet + 15U, 8U) == 0);
+
+  qsr_quic_initial_t initial;
+  ASSERT_TRUE(qsr_quic_parse_initial(packet, sizeof(packet), &initial) == QSR_ERR_INVALID);
+}
+
+static void test_parse_long_header_allows_short_retry_dcid(void) {
+  const uint8_t packet[] = {
+      0xf0, 0x00, 0x00, 0x00, 0x01,
+      0x00,
+      0x08, 9, 10, 11, 12, 13, 14, 15, 16,
+      0xaa,
+  };
+  qsr_quic_long_header_t header;
+  ASSERT_TRUE(qsr_quic_parse_long_header(packet, sizeof(packet), &header) == QSR_OK);
+  ASSERT_TRUE(header.dcid_len == 0U);
+  ASSERT_TRUE(header.scid_len == 8U);
+}
+
 static void test_parse_rejects_v2_packet_with_v1_type_bits(void) {
   /*
    * Defense in depth: a packet that announces version v2 but uses v1's Initial
@@ -138,6 +172,8 @@ static void test_parse_varint_widths(void) {
 void test_quic_initial(void) {
   test_parse_initial_happy_path();
   test_parse_v2_initial_happy_path();
+  test_parse_long_header_retry_cids();
+  test_parse_long_header_allows_short_retry_dcid();
   test_parse_rejects_v2_packet_with_v1_type_bits();
   test_parse_rejects_v1_packet_with_v2_type_bits();
   test_parse_initial_rejects_invalid_fixed_bit();

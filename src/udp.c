@@ -208,23 +208,35 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
    * Hot-path short-circuit: this is called for every packet of every
    * established session, and the vast majority are short-header 1-RTT
    * packets which can never contain learnable CIDs anyway. Peek the
-   * long-header bit (and the fixed bit, which qsr_quic_parse_initial would
+   * long-header bit (and the fixed bit, which qsr_quic_parse_long_header would
    * also check) before paying the full parser invocation cost.
    */
   if (packet_len == 0U || (packet[0] & 0x80U) == 0U || (packet[0] & 0x40U) == 0U) {
     return;
   }
-  qsr_quic_initial_t initial;
-  if (qsr_quic_parse_initial(packet, packet_len, &initial) != QSR_OK) {
+  qsr_quic_long_header_t header;
+  if (qsr_quic_parse_long_header(packet, packet_len, &header) != QSR_OK) {
     return;
   }
 
-  qsr_session_key_t dcid_key = qsr_session_single_cid_key(initial.dcid, initial.dcid_len);
-  qsr_session_key_t scid_key = qsr_session_single_cid_key(initial.scid, initial.scid_len);
-  qsr_session_key_t pair_key = qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
+  qsr_session_key_t dcid_key = qsr_session_single_cid_key(header.dcid, header.dcid_len);
+  qsr_session_key_t scid_key = qsr_session_single_cid_key(header.scid, header.scid_len);
+  qsr_session_key_t pair_key = qsr_session_cid_key(header.dcid, header.dcid_len, header.scid, header.scid_len);
   put_alias(sessions, &dcid_key, dest, dest_len, now);
   put_alias(sessions, &scid_key, source, source_len, now);
   put_alias(sessions, &pair_key, dest, dest_len, now);
+}
+
+[[nodiscard]] static qsr_session_t *lookup_long_header_request_dcid(const qsr_config_t *runtime_config,
+                                                                    const qsr_session_table_t *sessions,
+                                                                    const qsr_quic_initial_t *initial) {
+  qsr_session_key_t dcid_key = qsr_session_single_cid_key(initial->dcid, initial->dcid_len);
+  qsr_session_t *session = qsr_session_table_get(sessions, &dcid_key);
+  if (session != nullptr && qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
+                                                        session->backend_addr_len)) {
+    return session;
+  }
+  return nullptr;
 }
 
 [[nodiscard]] static qsr_session_t *lookup_short_header_cid(const qsr_session_table_t *sessions, const uint8_t *packet,
@@ -283,6 +295,17 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
   }
   qsr_session_key_t dcid_key = qsr_session_single_cid_key(packet + 6U, dcid_len);
   return qsr_session_table_get(sessions, &dcid_key);
+}
+
+[[nodiscard]] static qsr_session_t *lookup_long_header_response_dcid(const qsr_config_t *runtime_config,
+                                                                     const qsr_session_table_t *sessions,
+                                                                     const uint8_t *packet, size_t packet_len) {
+  qsr_session_t *session = lookup_long_header_dcid(sessions, packet, packet_len);
+  if (session != nullptr && !qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
+                                                         session->backend_addr_len)) {
+    return session;
+  }
+  return nullptr;
 }
 
 [[nodiscard]] static qsr_session_t *lookup_backend_dcid(const qsr_config_t *runtime_config,
@@ -371,6 +394,12 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       qsr_session_key_t pair_key =
           qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
       session = qsr_session_table_get(sessions, &pair_key);
+      /* Post-Retry Initials use the backend's Retry SCID as their DCID. Once
+       * we have observed the Retry, a DCID alias is enough to route the packet
+       * without decrypting/parsing the second ClientHello flight. */
+      if (session == nullptr && !source_is_backend) {
+        session = lookup_long_header_request_dcid(runtime_config, sessions, &initial);
+      }
       /* Backend Initial responses use DCID = the client's SCID. The client
        * Initial taught us that single-CID alias, and it is per connection;
        * the backend tuple alias is shared by all concurrent handshakes to the
@@ -385,6 +414,9 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
         }
       }
     }
+  }
+  if (session == nullptr) {
+    session = lookup_long_header_response_dcid(runtime_config, sessions, packet, packet_len);
   }
   if (session == nullptr && source_is_backend) {
     session = lookup_backend_dcid(runtime_config, sessions, packet, packet_len);

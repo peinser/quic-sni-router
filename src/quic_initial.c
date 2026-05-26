@@ -23,6 +23,52 @@ qsr_status_t qsr_quic_parse_varint(const uint8_t *data, size_t len, uint64_t *va
   return QSR_OK;
 }
 
+qsr_status_t qsr_quic_parse_long_header(const uint8_t *data, size_t len, qsr_quic_long_header_t *out) {
+  if (data == nullptr || out == nullptr) {
+    return QSR_ERR_INVALID;
+  }
+  if (len < 7U) {
+    return QSR_ERR_TRUNCATED;
+  }
+  /* Long header (bit 7 set) and fixed bit (bit 6 set) are version-independent. */
+  if ((data[0] & 0x80U) == 0U || (data[0] & 0x40U) == 0U) {
+    return QSR_ERR_INVALID;
+  }
+
+  qsr_quic_long_header_t parsed = {0};
+  parsed.version = ((uint32_t)data[1] << 24U) | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 8U) | data[4];
+  if (parsed.version != QSR_QUIC_V1 && parsed.version != QSR_QUIC_V2) {
+    return QSR_ERR_UNSUPPORTED;
+  }
+  parsed.type_bits = data[0] & 0x30U;
+
+  size_t offset = 5U;
+  parsed.dcid_len = data[offset++];
+  if (parsed.dcid_len > sizeof(parsed.dcid) || parsed.dcid_len > len - offset) {
+    return QSR_ERR_INVALID;
+  }
+  if (parsed.dcid_len > 0U) {
+    memcpy(parsed.dcid, data + offset, parsed.dcid_len);
+  }
+  offset += parsed.dcid_len;
+
+  if (offset >= len) {
+    return QSR_ERR_TRUNCATED;
+  }
+  parsed.scid_len = data[offset++];
+  if (parsed.scid_len > sizeof(parsed.scid) || parsed.scid_len > len - offset) {
+    return QSR_ERR_INVALID;
+  }
+  if (parsed.scid_len > 0U) {
+    memcpy(parsed.scid, data + offset, parsed.scid_len);
+  }
+  offset += parsed.scid_len;
+  parsed.remainder_offset = offset;
+
+  *out = parsed;
+  return QSR_OK;
+}
+
 /*
  * Long-header type bits (positions 4-5 of byte 0, masked with 0x30) encoding
  * "Initial" packet — differs between QUIC v1 and v2:
@@ -48,51 +94,33 @@ qsr_status_t qsr_quic_parse_initial(const uint8_t *data, size_t len, qsr_quic_in
   if (data == nullptr || out == nullptr) {
     return QSR_ERR_INVALID;
   }
-  if (len < 7U) {
-    return QSR_ERR_TRUNCATED;
+  qsr_quic_long_header_t header;
+  qsr_status_t status = qsr_quic_parse_long_header(data, len, &header);
+  if (status != QSR_OK) {
+    return status;
   }
-  /* Long header (bit 7 set) and fixed bit (bit 6 set) are version-independent. */
-  if ((data[0] & 0x80U) == 0U || (data[0] & 0x40U) == 0U) {
+
+  /* Reject Retry/Handshake/0-RTT: only Initial advances to the deprotection path. */
+  if (header.type_bits != expected_initial_type_bits(header.version)) {
     return QSR_ERR_INVALID;
   }
 
   qsr_quic_initial_t parsed = {0};
-  parsed.version = ((uint32_t)data[1] << 24U) | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 8U) | data[4];
+  parsed.version = header.version;
+  parsed.dcid_len = header.dcid_len;
+  parsed.scid_len = header.scid_len;
+  memcpy(parsed.dcid, header.dcid, header.dcid_len);
+  memcpy(parsed.scid, header.scid, header.scid_len);
 
-  const uint8_t expected_type = expected_initial_type_bits(parsed.version);
-  if (expected_type == 0xFFU) {
-    return QSR_ERR_UNSUPPORTED;
-  }
-  /* Reject Retry/Handshake/0-RTT: only Initial advances to the deprotection path. */
-  if ((data[0] & 0x30U) != expected_type) {
-    return QSR_ERR_INVALID;
-  }
-
-  size_t offset = 5U;
-  parsed.dcid_len = data[offset++];
-  if (parsed.dcid_len > sizeof(parsed.dcid) || parsed.dcid_len > len - offset) {
-    return QSR_ERR_INVALID;
-  }
   /* RFC 9000 17.2: peers MUST validate 8 <= DCID length on client Initials. */
   if (parsed.dcid_len < 8U) {
     return QSR_ERR_INVALID;
   }
-  memcpy(parsed.dcid, data + offset, parsed.dcid_len);
-  offset += parsed.dcid_len;
 
-  if (offset >= len) {
-    return QSR_ERR_TRUNCATED;
-  }
-  parsed.scid_len = data[offset++];
-  if (parsed.scid_len > sizeof(parsed.scid) || parsed.scid_len > len - offset) {
-    return QSR_ERR_INVALID;
-  }
-  memcpy(parsed.scid, data + offset, parsed.scid_len);
-  offset += parsed.scid_len;
-
+  size_t offset = header.remainder_offset;
   uint64_t token_len = 0;
   size_t consumed = 0;
-  qsr_status_t status = qsr_quic_parse_varint(data + offset, len - offset, &token_len, &consumed);
+  status = qsr_quic_parse_varint(data + offset, len - offset, &token_len, &consumed);
   if (status != QSR_OK) {
     return status;
   }
