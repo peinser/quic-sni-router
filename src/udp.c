@@ -201,6 +201,25 @@ static void put_alias(qsr_session_table_t *sessions, const qsr_session_key_t *ke
   }
 }
 
+[[nodiscard]] static bool is_known_backend_addr(const qsr_config_t *runtime_config, const qsr_session_table_t *sessions,
+                                                const struct sockaddr_storage *addr, socklen_t addr_len) {
+  if (qsr_route_table_has_backend(&runtime_config->routes, addr, addr_len)) {
+    return true;
+  }
+
+  /*
+   * Kubernetes Service/NAT paths can make backend packets arrive from the
+   * selected pod tuple rather than the configured Service tuple. Once a packet
+   * from that tuple has been routed to a client, remember it as a backend
+   * source too; otherwise later stale-Initial and post-idle reset paths treat
+   * the pod tuple as a client and can misclassify the session direction.
+   */
+  const qsr_session_key_t key = qsr_session_tuple_key(addr, addr_len);
+  const qsr_session_t *session = qsr_session_table_get(sessions, &key);
+  return session != nullptr &&
+         !qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr, session->backend_addr_len);
+}
+
 static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t *packet, size_t packet_len,
                                    const struct sockaddr_storage *source, socklen_t source_len,
                                    const struct sockaddr_storage *dest, socklen_t dest_len, time_t now) {
@@ -232,8 +251,8 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
                                                                     const qsr_quic_initial_t *initial) {
   qsr_session_key_t dcid_key = qsr_session_single_cid_key(initial->dcid, initial->dcid_len);
   qsr_session_t *session = qsr_session_table_get(sessions, &dcid_key);
-  if (session != nullptr && qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
-                                                        session->backend_addr_len)) {
+  if (session != nullptr &&
+      is_known_backend_addr(runtime_config, sessions, &session->backend_addr, session->backend_addr_len)) {
     return session;
   }
   return nullptr;
@@ -301,8 +320,8 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
                                                                      const qsr_session_table_t *sessions,
                                                                      const uint8_t *packet, size_t packet_len) {
   qsr_session_t *session = lookup_long_header_dcid(sessions, packet, packet_len);
-  if (session != nullptr && !qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
-                                                         session->backend_addr_len)) {
+  if (session != nullptr &&
+      !is_known_backend_addr(runtime_config, sessions, &session->backend_addr, session->backend_addr_len)) {
     return session;
   }
   return nullptr;
@@ -315,8 +334,8 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
   if (session == nullptr) {
     session = lookup_short_header_cid(sessions, packet, packet_len);
   }
-  if (session != nullptr && !qsr_route_table_has_backend(&runtime_config->routes, &session->backend_addr,
-                                                         session->backend_addr_len)) {
+  if (session != nullptr &&
+      !is_known_backend_addr(runtime_config, sessions, &session->backend_addr, session->backend_addr_len)) {
     return session;
   }
   return nullptr;
@@ -362,7 +381,7 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
                           socklen_t source_len, time_t now) {
   qsr_session_key_t key = qsr_session_tuple_key(source, source_len);
   qsr_session_t *session = nullptr;
-  const bool source_is_backend = qsr_route_table_has_backend(&runtime_config->routes, source, source_len);
+  const bool source_is_backend = is_known_backend_addr(runtime_config, sessions, source, source_len);
 
   /*
    * Initial packets need careful handling. There are three sub-cases:
@@ -380,11 +399,11 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
    * The trap is case 1 with a kernel-reused source port: the stale tuple
    * alias from a closed previous connection still maps to a backend, so a
    * bare tuple match misroutes the fresh Initial. The fix is to
-   * distinguish (1) from (3) — a tuple match whose destination is a
-   * configured backend is the port-reuse case; a tuple match whose
-   * destination is NOT a configured backend is a reverse alias for a
-   * backend->client response. qsr_route_table_has_backend answers exactly
-   * that, in O(N_routes) — only paid on Initials, which are rare.
+   * distinguish (1) from (3) — a tuple match whose destination is a known
+   * backend is the port-reuse case; a tuple match whose destination is NOT a
+   * known backend is a reverse alias for a backend->client response. Known
+   * backends include configured route addresses plus backend source tuples
+   * learned from Kubernetes/NAT return traffic.
    */
   bool is_initial = false;
   {
@@ -407,9 +426,8 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       if (session == nullptr && source_is_backend) {
         qsr_session_key_t dcid_key = qsr_session_single_cid_key(initial.dcid, initial.dcid_len);
         qsr_session_t *dcid_session = qsr_session_table_get(sessions, &dcid_key);
-        if (dcid_session != nullptr &&
-            !qsr_route_table_has_backend(&runtime_config->routes, &dcid_session->backend_addr,
-                                         dcid_session->backend_addr_len)) {
+        if (dcid_session != nullptr && !is_known_backend_addr(runtime_config, sessions, &dcid_session->backend_addr,
+                                                              dcid_session->backend_addr_len)) {
           session = dcid_session;
         }
       }
@@ -438,9 +456,8 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
      * route_initial_datagram below route fresh by SNI.
      */
     if (tuple_session != nullptr &&
-        (!is_initial ||
-         !qsr_route_table_has_backend(&runtime_config->routes, &tuple_session->backend_addr,
-                                      tuple_session->backend_addr_len))) {
+        (!is_initial || !is_known_backend_addr(runtime_config, sessions, &tuple_session->backend_addr,
+                                               tuple_session->backend_addr_len))) {
       session = tuple_session;
     }
   }
@@ -506,6 +523,9 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
   }
 
   session->last_seen = now;
+  if (!is_known_backend_addr(runtime_config, sessions, &session->backend_addr, session->backend_addr_len)) {
+    (void)qsr_session_table_put(sessions, &key, &session->backend_addr, session->backend_addr_len, now);
+  }
   /*
    * Learning is cheap and idempotent: re-running here picks up CID rotations
    * on coalesced Initial+Handshake datagrams from either direction.
