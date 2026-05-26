@@ -62,10 +62,12 @@ async def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--hostname", required=True)
+    parser.add_argument("--idle-timeout", type=float, default=60.0)
     args = parser.parse_args()
 
     cert, key = ensure_cert(Path("/tmp/qsr-e2e-certs"), args.hostname)
     configuration = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
+    configuration.idle_timeout = args.idle_timeout
     configuration.load_cert_chain(str(cert), str(key))
 
     await serve(

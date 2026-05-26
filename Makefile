@@ -9,7 +9,7 @@ QSR_ENABLE_LTO ?= OFF
 DOCKER ?= docker
 CLANG ?= clang
 
-.PHONY: help configure build format lint test test-e2e test-e2e-reload test-loadtest fuzz-smoke sanitize benchmark benchmark-native docker-build clean
+.PHONY: help configure build format lint test test-e2e test-e2e-idle test-e2e-reload test-loadtest fuzz-smoke sanitize benchmark benchmark-native docker-build clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -46,6 +46,9 @@ test: build ## Run unit tests
 
 test-e2e: ## Run Docker HTTP/3 end-to-end test
 	tests/e2e/http3/run.sh
+
+test-e2e-idle: ## Run Docker backend-idle timeout end-to-end test
+	tests/e2e/idle/run.sh
 
 test-e2e-reload: ## Run Docker hot-reload end-to-end test
 	tests/e2e/reload/run.sh

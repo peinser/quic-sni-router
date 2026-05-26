@@ -7,4 +7,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir aioquic==1.2.0
 
 WORKDIR /app
-COPY http3_backend.py http3_client.py ./
+COPY *.py ./
