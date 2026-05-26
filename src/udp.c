@@ -523,7 +523,21 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
   }
 
   session->last_seen = now;
-  if (!is_known_backend_addr(runtime_config, sessions, &session->backend_addr, session->backend_addr_len)) {
+  const bool destination_is_backend = is_known_backend_addr(runtime_config, sessions, &session->backend_addr,
+                                                           session->backend_addr_len);
+  if (destination_is_backend) {
+    /*
+     * Refresh the backend->client reverse tuple on every client packet. This
+     * is the only route available for QUIC stateless resets, whose bytes are
+     * deliberately indistinguishable from random short-header packets and
+     * cannot be CID-routed by a non-terminating proxy. Without this refresh, a
+     * backend idle timeout can produce a reset that follows a stale reverse
+     * tuple to another client, leaving the real client to time out with a
+     * browser-level QUIC protocol error.
+     */
+    qsr_session_key_t reverse_key = qsr_session_tuple_key(&session->backend_addr, session->backend_addr_len);
+    (void)qsr_session_table_put(sessions, &reverse_key, source, source_len, now);
+  } else {
     (void)qsr_session_table_put(sessions, &key, &session->backend_addr, session->backend_addr_len, now);
   }
   /*
