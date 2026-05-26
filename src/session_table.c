@@ -155,40 +155,33 @@ qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr
 }
 
 /*
- * Backward-shift deletion: remove the entry at `index` and pull subsequent
- * entries up until probe-chain integrity is restored. Preserves correctness
- * for open addressing better than a zero-fill, which would orphan keys whose
- * hash placed them before the removed slot.
+ * Delete one entry and reinsert the following probe cluster so lookup remains
+ * correct. A plain zero-fill can orphan keys whose probe walk crossed the
+ * deleted slot.
  *
  * Returns the index the caller should re-examine: the slot that originally
- * sat at `index` now holds a (possibly expired/evictable) shifted entry, so
- * a sweeping caller should not advance past it on this iteration.
+ * followed `index` may now hold a (possibly expired/evictable) reinserted
+ * entry, so a sweeping caller should not advance past it on this iteration.
  */
 static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
-  size_t hole = index;
-  size_t cursor = index;
-  for (;;) {
-    cursor = (cursor + 1U) % table->capacity;
-    if (!table->sessions[cursor].used) {
-      memset(&table->sessions[hole], 0, sizeof(table->sessions[hole]));
-      break;
-    }
-    /*
-     * Move an entry only if the hole lies on that entry's probe walk from its
-     * natural slot to its current slot. If the current entry cannot move, keep
-     * scanning: a later wrapped/colliding entry may still depend on this hole
-     * being filled. Stopping at the first non-movable entry orphans those later
-     * keys under some hash seeds.
-     */
-    const size_t natural = key_hash(&table->sessions[cursor].key, table->capacity);
-    const size_t hole_dist = (hole + table->capacity - natural) % table->capacity;
-    const size_t cursor_dist = (cursor + table->capacity - natural) % table->capacity;
-    if (hole_dist < cursor_dist) {
-      table->sessions[hole] = table->sessions[cursor];
-      hole = cursor;
-    }
-  }
+  memset(&table->sessions[index], 0, sizeof(table->sessions[index]));
   table->count--;
+
+  /*
+   * Reinsert the following probe cluster until the first empty slot. This is
+   * simpler and less fragile than hand-rolled backward-shift stop conditions:
+   * every surviving key is placed exactly where qsr_session_table_put would
+   * put it in the table with the deleted slot removed. Deletion runs only from
+   * expiry / eviction / reload paths, not the steady-state packet hot path.
+   */
+  size_t cursor = (index + 1U) % table->capacity;
+  while (table->sessions[cursor].used) {
+    qsr_session_t saved = table->sessions[cursor];
+    memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
+    table->count--;
+    (void)qsr_session_table_put(table, &saved.key, &saved.backend_addr, saved.backend_addr_len, saved.last_seen);
+    cursor = (cursor + 1U) % table->capacity;
+  }
   return index;
 }
 
