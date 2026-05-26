@@ -84,6 +84,16 @@ static reader_t r_init(const uint8_t *data, size_t len) {
   return QSR_OK;
 }
 
+[[nodiscard]] static qsr_status_t r_subreader_available(reader_t *r, size_t declared_len, reader_t *child,
+                                                        bool *truncated) {
+  const size_t available = r_remaining(r);
+  const size_t child_len = declared_len < available ? declared_len : available;
+  *child = (reader_t){.data = r->data + r->offset, .end = child_len, .offset = 0U};
+  r->offset += child_len;
+  *truncated = child_len < declared_len;
+  return child_len == 0U && declared_len > 0U ? QSR_ERR_TRUNCATED : QSR_OK;
+}
+
 [[nodiscard]] static const uint8_t *r_ptr(const reader_t *r) { return r->data + r->offset; }
 
 /*
@@ -196,7 +206,8 @@ qsr_status_t qsr_tls_client_hello_sni(const uint8_t *data, size_t len, qsr_sni_t
     return QSR_ERR_TRUNCATED;
   }
   reader_t hello;
-  if (r_subreader(&r, hello_len, &hello) != QSR_OK) {
+  bool hello_truncated = false;
+  if (r_subreader_available(&r, hello_len, &hello, &hello_truncated) != QSR_OK) {
     return QSR_ERR_TRUNCATED;
   }
 
@@ -239,7 +250,8 @@ qsr_status_t qsr_tls_client_hello_sni(const uint8_t *data, size_t len, qsr_sni_t
     return QSR_ERR_TRUNCATED;
   }
   reader_t extensions;
-  if (r_subreader(&hello, extensions_len, &extensions) != QSR_OK) {
+  bool extensions_truncated = false;
+  if (r_subreader_available(&hello, extensions_len, &extensions, &extensions_truncated) != QSR_OK) {
     return QSR_ERR_TRUNCATED;
   }
 
@@ -257,5 +269,5 @@ qsr_status_t qsr_tls_client_hello_sni(const uint8_t *data, size_t len, qsr_sni_t
       return parse_sni_extension(ext_body, out);
     }
   }
-  return QSR_ERR_NOT_FOUND;
+  return hello_truncated || extensions_truncated ? QSR_ERR_TRUNCATED : QSR_ERR_NOT_FOUND;
 }

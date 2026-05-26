@@ -20,6 +20,23 @@ static void test_extracts_sni(void) {
   ASSERT_TRUE(sni.name[0] == 'r');
 }
 
+static void test_extracts_sni_from_partial_resumed_hello(void) {
+  uint8_t hello[] = {
+      0x01, 0x00, 0x01, 0x00, 0x03, 0x03,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x01, 0x00,
+      0x00, 0x00, 0x00, 0x1a, 0x00, 0x18, 0x00, 0x00,
+      0x15, 'r',  'v',  'r',  '-',  'a',  '.',  'f',
+      'l',  'i',  'g',  'h',  't',  'd',  'e',  'c',
+      'k',  '.',  't',  'e',  's',  't'};
+  qsr_sni_t sni;
+  ASSERT_TRUE(qsr_tls_client_hello_sni(hello, sizeof(hello), &sni) == QSR_OK);
+  ASSERT_TRUE(strcmp(sni.name, "rvr-a.flightdeck.test") == 0);
+}
+
 static void test_rejects_oversize(void) {
   static uint8_t too_large[QSR_MAX_CLIENT_HELLO_SIZE + 1U] = {0};
   qsr_sni_t sni;
@@ -70,6 +87,7 @@ static void test_rejects_invalid_hostname(void) {
 
 void test_tls_client_hello(void) {
   test_extracts_sni();
+  test_extracts_sni_from_partial_resumed_hello();
   test_rejects_oversize();
   test_rejects_truncated();
   test_rejects_wrong_handshake_type();
