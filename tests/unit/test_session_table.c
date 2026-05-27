@@ -59,14 +59,14 @@ static void test_expire_preserves_probe_chain(void) {
    * keeping the other two with a recent timestamp, all four lookups must
    * behave correctly (hits and a miss).
    */
-  qsr_session_key_t keep_a = qsr_session_single_cid_key(
-      (const uint8_t[]){0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA}, 8);
-  qsr_session_key_t keep_b = qsr_session_single_cid_key(
-      (const uint8_t[]){0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB}, 8);
-  qsr_session_key_t drop_a = qsr_session_single_cid_key(
-      (const uint8_t[]){0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC}, 8);
-  qsr_session_key_t drop_b = qsr_session_single_cid_key(
-      (const uint8_t[]){0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD}, 8);
+  qsr_session_key_t keep_a =
+      qsr_session_single_cid_key((const uint8_t[]){0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA}, 8);
+  qsr_session_key_t keep_b =
+      qsr_session_single_cid_key((const uint8_t[]){0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB}, 8);
+  qsr_session_key_t drop_a =
+      qsr_session_single_cid_key((const uint8_t[]){0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC}, 8);
+  qsr_session_key_t drop_b =
+      qsr_session_single_cid_key((const uint8_t[]){0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD}, 8);
 
   ASSERT_TRUE(qsr_session_table_put(&table, &keep_a, &backend, sizeof(struct sockaddr_in), 100) == QSR_OK);
   ASSERT_TRUE(qsr_session_table_put(&table, &drop_a, &backend, sizeof(struct sockaddr_in), 10) == QSR_OK);
@@ -113,6 +113,51 @@ static void test_lru_eviction_when_full(void) {
   qsr_session_table_free(&table);
 }
 
+static void test_incremental_expire_respects_budget(void) {
+  qsr_session_table_t table;
+  ASSERT_TRUE(qsr_session_table_init(&table, 4U) == QSR_OK);
+  struct sockaddr_storage backend = make_v4(0x0100007fU, 8443U);
+
+  qsr_session_key_t old_keys[4];
+  for (size_t i = 0; i < 4; i++) {
+    const uint8_t cid[8] = {(uint8_t)(0x20 + i), 0, 0, 0, 0, 0, 0, 0};
+    old_keys[i] = qsr_session_single_cid_key(cid, 8);
+    ASSERT_TRUE(qsr_session_table_put(&table, &old_keys[i], &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+  }
+
+  const size_t first = qsr_session_table_expire_incremental(&table, 100, 60, 2U);
+  ASSERT_TRUE(first <= 2U);
+  ASSERT_TRUE(table.count >= 2U);
+  size_t total = first;
+  for (size_t i = 0; i < 8U && table.count > 0U; i++) {
+    total += qsr_session_table_expire_incremental(&table, 100, 60, 2U);
+  }
+  ASSERT_TRUE(total == 4U);
+  ASSERT_TRUE(table.count == 0U);
+
+  qsr_session_table_free(&table);
+}
+
+static void test_cid_length_mask_tracks_inserted_lengths(void) {
+  qsr_session_table_t table;
+  ASSERT_TRUE(qsr_session_table_init(&table, 8U) == QSR_OK);
+  struct sockaddr_storage backend = make_v4(0x0100007fU, 8443U);
+
+  const uint8_t cid8[8] = {0x80, 0, 0, 0, 0, 0, 0, 0};
+  const uint8_t cid12[12] = {0x90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  qsr_session_key_t k8 = qsr_session_single_cid_key(cid8, sizeof(cid8));
+  qsr_session_key_t k12 = qsr_session_single_cid_key(cid12, sizeof(cid12));
+  ASSERT_TRUE(qsr_session_table_put(&table, &k8, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+  ASSERT_TRUE(qsr_session_table_put(&table, &k12, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+
+  const uint32_t mask = qsr_session_table_cid_len_mask(&table);
+  ASSERT_TRUE((mask & (1U << 8U)) != 0U);
+  ASSERT_TRUE((mask & (1U << 12U)) != 0U);
+  ASSERT_TRUE((mask & (1U << 9U)) == 0U);
+
+  qsr_session_table_free(&table);
+}
+
 static bool predicate_evict_all(const qsr_session_t *s, void *userdata) {
   (void)s;
   (void)userdata;
@@ -132,8 +177,7 @@ typedef struct evict_match_addr {
 
 static bool predicate_evict_matching_backend(const qsr_session_t *s, void *userdata) {
   const evict_match_addr_t *match = userdata;
-  return s->backend_addr_len == match->target_len &&
-         memcmp(&s->backend_addr, &match->target, match->target_len) == 0;
+  return s->backend_addr_len == match->target_len && memcmp(&s->backend_addr, &match->target, match->target_len) == 0;
 }
 
 static void test_evict_if_returns_zero_when_empty(void) {
@@ -245,6 +289,8 @@ void test_session_table(void) {
   test_invalid_keys_rejected();
   test_expire_preserves_probe_chain();
   test_lru_eviction_when_full();
+  test_incremental_expire_respects_budget();
+  test_cid_length_mask_tracks_inserted_lengths();
   test_evict_if_returns_zero_when_empty();
   test_evict_if_all_clears_table();
   test_evict_if_none_keeps_table();

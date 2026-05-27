@@ -197,7 +197,7 @@ listen:
   udp: ":443"
 sessions:
   idleTimeout: 60s         # 1..86400, applied with CLOCK_MONOTONIC
-  maxSessions: 100000      # 1..1000000; oldest-by-last-seen evicted when full
+  maxSessions: 100000      # session-table entries; one QUIC connection uses multiple aliases
 routes:
   rvr-a.flightdeck.tower.peinser.com:
     host: flightdeck-rvr-a.tower-system.svc.cluster.local

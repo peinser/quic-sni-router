@@ -35,6 +35,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Performance
 
+- Session expiry now runs as a bounded incremental sweep instead of scanning the entire configured session table once per second. Large `maxSessions` values no longer create predictable full-table dataplane pauses.
+- Session-table eviction under pressure now samples a bounded window instead of scanning the full table for the oldest entry, and large tables begin pressure eviction before reaching 100% load to avoid pathological linear-probing stalls.
+- Short-header CID lookup now skips CID lengths that have never been learned, reducing backend return-path hash probes for the common fixed-CID-length case.
+- Fragmented Initial CRYPTO merge now tracks populated byte ranges and avoids scanning the full 8 KiB ClientHello buffer for every fragment.
 - `qsr_route_table_has_backend` now uses a resolved backend-address hash index instead of scanning all routes. This removes an O(routes) check from backend-source detection on the dataplane path and from hot-reload session classification.
 - `learn_long_header_cids` and `lookup_rebound_initial` peek the long-header bit before invoking the QUIC Initial parser. These are called on every packet of every established session, and the overwhelming majority are short-header 1-RTT packets that the parser would fast-fail anyway — peek shaves ~10ns/packet off the steady-state hot path.
 - Combined `qsr_session_table_put`'s lookup + insertion-slot probe into a single open-addressing walk. The previous shape hashed and probed twice per insert; new shape walks the table once and only re-walks after eviction (bounded at exactly 2 walks per put).

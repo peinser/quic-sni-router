@@ -73,5 +73,5 @@ A Linux-only loopback bench that drives the full UDP router with synthetic QUIC 
 Known performance gaps to close before stronger production performance claims:
 
 - Quantify the resolved backend-address hash index under large route counts and high backend-return packet rates.
-- Add dataplane counters for tuple hits, CID hits, backend-DCID hits, Initial decrypts, drops, send failures, and socket-buffer clamp results.
+- Add dataplane counters for tuple hits, CID hits, backend-DCID hits, Initial decrypts, drops, pending-Initial evictions, session pressure evictions, incremental-expiry work, send failures, and socket-buffer clamp results.
 - Add an end-to-end loopback benchmark outside Docker to separate router cost from Python/aioquic backend cost.

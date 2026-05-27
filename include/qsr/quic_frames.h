@@ -16,6 +16,8 @@ typedef struct qsr_crypto_stream {
   uint8_t data[QSR_MAX_CLIENT_HELLO_SIZE];
   uint8_t received[QSR_MAX_CLIENT_HELLO_SIZE];
   size_t len;
+  size_t first_received;
+  size_t last_received;
 } qsr_crypto_stream_t;
 
 void qsr_crypto_stream_init(qsr_crypto_stream_t *stream);

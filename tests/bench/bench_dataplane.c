@@ -21,7 +21,7 @@ static void print_rate(const char *name, uint64_t elapsed_ns, uint64_t iteration
   printf("%-28s %10.2f ops/s  %8.2f ns/op\n", name, rate, (double)elapsed_ns / (double)iterations);
 }
 
-static void bench_route_lookup(void) {
+static bool bench_route_lookup(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
   for (size_t i = 0U; i < 256U; i++) {
@@ -41,13 +41,18 @@ static void bench_route_lookup(void) {
   const uint64_t elapsed = nanos() - start;
   if (hits != BENCH_ITERS) {
     fprintf(stderr, "route benchmark sanity check failed\n");
+    return false;
   }
   print_rate("route hash lookup", elapsed, BENCH_ITERS);
+  return true;
 }
 
-static void bench_session_lookup(void) {
+static bool bench_session_lookup(void) {
   qsr_session_table_t table;
-  (void)qsr_session_table_init(&table, 4096U);
+  if (qsr_session_table_init(&table, 4096U) != QSR_OK) {
+    fprintf(stderr, "session benchmark init failed\n");
+    return false;
+  }
   struct sockaddr_storage backend;
   memset(&backend, 0, sizeof(backend));
   backend.ss_family = AF_INET;
@@ -61,7 +66,11 @@ static void bench_session_lookup(void) {
     if (i == 1024U) {
       target = key;
     }
-    (void)qsr_session_table_put(&table, &key, &backend, sizeof(struct sockaddr_in), 1);
+    if (qsr_session_table_put(&table, &key, &backend, sizeof(struct sockaddr_in), 1) != QSR_OK) {
+      fprintf(stderr, "session benchmark insert failed\n");
+      qsr_session_table_free(&table);
+      return false;
+    }
   }
   const uint64_t start = nanos();
   size_t hits = 0U;
@@ -73,12 +82,15 @@ static void bench_session_lookup(void) {
   const uint64_t elapsed = nanos() - start;
   if (hits != BENCH_ITERS) {
     fprintf(stderr, "session benchmark sanity check failed\n");
+    qsr_session_table_free(&table);
+    return false;
   }
   print_rate("session cid lookup", elapsed, BENCH_ITERS);
   qsr_session_table_free(&table);
+  return true;
 }
 
-static void bench_crypto_extract(void) {
+static bool bench_crypto_extract(void) {
   uint8_t frame[256];
   memset(frame, 'a', sizeof(frame));
   frame[0] = 0x06U;
@@ -97,16 +109,19 @@ static void bench_crypto_extract(void) {
   const uint64_t elapsed = nanos() - start;
   if (hits != BENCH_ITERS) {
     fprintf(stderr, "crypto extract benchmark sanity check failed: %zu\n", hits);
+    return false;
   }
   print_rate("crypto frame extraction", elapsed, BENCH_ITERS);
+  return true;
 }
 
 int main(void) {
   printf("Synthetic dataplane CPU benchmarks (%u iterations)\n", BENCH_ITERS);
-  bench_route_lookup();
-  bench_session_lookup();
-  bench_crypto_extract();
+  bool ok = true;
+  ok = bench_route_lookup() && ok;
+  ok = bench_session_lookup() && ok;
+  ok = bench_crypto_extract() && ok;
   printf("\nUser-space lookup/parsing costs only. Drive the live Linux UDP loop\n");
   printf("(recvmmsg/sendmmsg) with synthetic packets to measure end-to-end p99.\n");
-  return 0;
+  return ok ? 0 : 1;
 }

@@ -34,6 +34,23 @@ jobs:
     - name: Test
       run: ctest --test-dir build --output-on-failure
 
+  release-build-test:
+    runs-on:
+      group: on-prem
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+    - name: Setup dependencies
+      uses: ./.github/actions/setup-deps
+      with:
+        extras: clang
+    - name: Configure Release
+      run: cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+    - name: Build Release
+      run: cmake --build build-release
+    - name: Test Release
+      run: ctest --test-dir build-release --output-on-failure
+
   sanitize:
     runs-on:
       group: on-prem

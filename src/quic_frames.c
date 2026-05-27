@@ -7,6 +7,7 @@
 void qsr_crypto_stream_init(qsr_crypto_stream_t *stream) {
   if (stream != nullptr) {
     memset(stream, 0, sizeof(*stream));
+    stream->first_received = QSR_MAX_CLIENT_HELLO_SIZE;
   }
 }
 
@@ -14,7 +15,9 @@ void qsr_crypto_stream_merge(qsr_crypto_stream_t *dest, const qsr_crypto_stream_
   if (dest == nullptr || src == nullptr) {
     return;
   }
-  for (size_t i = 0U; i < src->len && i < QSR_MAX_CLIENT_HELLO_SIZE; i++) {
+  const size_t start = src->first_received < QSR_MAX_CLIENT_HELLO_SIZE ? src->first_received : 0U;
+  const size_t end = src->last_received < QSR_MAX_CLIENT_HELLO_SIZE ? src->last_received : QSR_MAX_CLIENT_HELLO_SIZE;
+  for (size_t i = start; i < end; i++) {
     if (src->received[i] != 0U) {
       dest->data[i] = src->data[i];
       dest->received[i] = 1U;
@@ -22,6 +25,12 @@ void qsr_crypto_stream_merge(qsr_crypto_stream_t *dest, const qsr_crypto_stream_
   }
   if (src->len > dest->len) {
     dest->len = src->len;
+  }
+  if (src->first_received < dest->first_received) {
+    dest->first_received = src->first_received;
+  }
+  if (src->last_received > dest->last_received) {
+    dest->last_received = src->last_received;
   }
 }
 
@@ -141,6 +150,12 @@ qsr_status_t qsr_quic_extract_crypto(const uint8_t *plaintext, size_t plaintext_
     memcpy(stream->data + (size_t)crypto_offset, plaintext + offset, (size_t)crypto_len);
     memset(stream->received + (size_t)crypto_offset, 1, (size_t)crypto_len);
     const size_t end = (size_t)crypto_offset + (size_t)crypto_len;
+    if ((size_t)crypto_offset < stream->first_received) {
+      stream->first_received = (size_t)crypto_offset;
+    }
+    if (end > stream->last_received) {
+      stream->last_received = end;
+    }
     if (end > stream->len) {
       stream->len = end;
     }

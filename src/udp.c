@@ -27,6 +27,8 @@
 
 enum : int { QSR_EXPIRE_SWEEP_INTERVAL_SECONDS = 1 };
 enum : unsigned { QSR_UDP_BATCH_SIZE = 32U };
+enum : size_t { QSR_SESSION_EXPIRE_MIN_SCAN = 1024U };
+enum : size_t { QSR_SESSION_EXPIRE_MAX_SCAN = 16384U };
 enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 64U };
 enum : size_t { QSR_PENDING_INITIAL_MAX_PACKETS = 8U };
 enum : time_t { QSR_PENDING_INITIAL_IDLE_SECONDS = 5 };
@@ -490,7 +492,11 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
    * bytes after the header byte, capped at 20 (QUIC v1 max).
    */
   const size_t max_cid_len = packet_len - 1U < QSR_MAX_QUIC_CID_LEN ? packet_len - 1U : QSR_MAX_QUIC_CID_LEN;
+  const uint32_t learned_lengths = qsr_session_table_cid_len_mask(sessions);
   for (size_t cid_len = max_cid_len; cid_len >= QSR_MIN_LEARNED_CID_LEN; cid_len--) {
+    if (learned_lengths != 0U && (learned_lengths & (1U << cid_len)) == 0U) {
+      continue;
+    }
     qsr_session_key_t key = qsr_session_single_cid_key(packet + 1U, cid_len);
     qsr_session_t *session = qsr_session_table_get(sessions, &key);
     if (session != nullptr) {
@@ -589,6 +595,17 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
 static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_key_t *new_tuple_key,
                               const struct sockaddr_storage *backend, socklen_t backend_len, time_t now) {
   (void)qsr_session_table_put(sessions, new_tuple_key, backend, backend_len, now);
+}
+
+static size_t session_expire_scan_budget(const qsr_session_table_t *sessions) {
+  size_t budget = sessions->capacity / 60U;
+  if (budget < QSR_SESSION_EXPIRE_MIN_SCAN) {
+    budget = QSR_SESSION_EXPIRE_MIN_SCAN;
+  }
+  if (budget > QSR_SESSION_EXPIRE_MAX_SCAN) {
+    budget = QSR_SESSION_EXPIRE_MAX_SCAN;
+  }
+  return budget;
 }
 
 static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_t *sessions,
@@ -968,19 +985,26 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     return QSR_ERR_FULL;
   }
   sender_init(&sender);
+#ifdef __linux__
+  uint8_t packets[QSR_UDP_BATCH_SIZE][QSR_MAX_DATAGRAM_SIZE];
+  struct sockaddr_storage sources[QSR_UDP_BATCH_SIZE];
+  struct iovec iovecs[QSR_UDP_BATCH_SIZE];
+  struct mmsghdr messages[QSR_UDP_BATCH_SIZE];
+  memset(sources, 0, sizeof(sources));
+  memset(messages, 0, sizeof(messages));
+  for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
+    iovecs[i].iov_base = packets[i];
+    iovecs[i].iov_len = sizeof(packets[i]);
+    messages[i].msg_hdr.msg_iov = &iovecs[i];
+    messages[i].msg_hdr.msg_iovlen = 1U;
+    messages[i].msg_hdr.msg_name = &sources[i];
+  }
+#endif
   while (!g_stop) {
 #ifdef __linux__
     qsr_runtime_poll(&runtime);
-    uint8_t packets[QSR_UDP_BATCH_SIZE][QSR_MAX_DATAGRAM_SIZE];
-    struct sockaddr_storage sources[QSR_UDP_BATCH_SIZE] = {0};
-    struct iovec iovecs[QSR_UDP_BATCH_SIZE] = {0};
-    struct mmsghdr messages[QSR_UDP_BATCH_SIZE] = {0};
     for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
-      iovecs[i].iov_base = packets[i];
-      iovecs[i].iov_len = sizeof(packets[i]);
-      messages[i].msg_hdr.msg_iov = &iovecs[i];
-      messages[i].msg_hdr.msg_iovlen = 1U;
-      messages[i].msg_hdr.msg_name = &sources[i];
+      messages[i].msg_len = 0U;
       messages[i].msg_hdr.msg_namelen = sizeof(sources[i]);
     }
 
@@ -995,7 +1019,9 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         }
         const time_t sweep_now = monotonic_now();
         if (sweep_now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
-          (void)qsr_session_table_expire(&runtime.sessions, sweep_now, (time_t)runtime.config.idle_timeout_seconds);
+          (void)qsr_session_table_expire_incremental(&runtime.sessions, sweep_now,
+                                                     (time_t)runtime.config.idle_timeout_seconds,
+                                                     session_expire_scan_budget(&runtime.sessions));
           pending_initial_expire(pending_initials, sweep_now);
           last_expire = sweep_now;
         }
@@ -1035,7 +1061,8 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     sender_flush(&sender, fd);
 #endif
     if (now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
-      (void)qsr_session_table_expire(&runtime.sessions, now, (time_t)runtime.config.idle_timeout_seconds);
+      (void)qsr_session_table_expire_incremental(&runtime.sessions, now, (time_t)runtime.config.idle_timeout_seconds,
+                                                 session_expire_scan_budget(&runtime.sessions));
       pending_initial_expire(pending_initials, now);
       last_expire = now;
     }

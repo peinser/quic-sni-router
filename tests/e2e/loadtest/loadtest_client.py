@@ -16,6 +16,7 @@ sessions.
 """
 import argparse
 import asyncio
+import math
 import random
 import ssl
 import sys
@@ -98,8 +99,8 @@ async def worker(snis: list[str], port: int, deadline: float, timeout: float, st
 def percentile(sorted_values: list[float], p: float) -> float:
     if not sorted_values:
         return 0.0
-    idx = int(p / 100.0 * len(sorted_values))
-    return sorted_values[min(idx, len(sorted_values) - 1)]
+    idx = math.ceil(p / 100.0 * len(sorted_values)) - 1
+    return sorted_values[max(0, min(idx, len(sorted_values) - 1))]
 
 
 async def main() -> int:
@@ -112,6 +113,13 @@ async def main() -> int:
     parser.add_argument("--pass-threshold", type=float, default=0.95,
                         help="minimum success rate (0..1) for exit-0")
     args = parser.parse_args()
+
+    if args.port < 1 or args.port > 65535 or args.concurrency < 1 or args.duration <= 0 or args.timeout <= 0:
+        print("invalid port/concurrency/duration/timeout", file=sys.stderr)
+        return 2
+    if args.pass_threshold < 0.0 or args.pass_threshold > 1.0:
+        print("invalid pass threshold", file=sys.stderr)
+        return 2
 
     snis = [s.strip() for s in args.snis.split(",") if s.strip()]
     if not snis:

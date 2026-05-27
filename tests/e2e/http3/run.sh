@@ -19,7 +19,7 @@ dump_logs() {
   docker logs "${project}-rvr-b" >&2 2>/dev/null || true
   docker logs "${project}-client" >&2 2>/dev/null || true
 }
-trap cleanup EXIT
+trap 'rc=$?; if [ ${rc} -ne 0 ]; then dump_logs; fi; cleanup' EXIT
 
 cleanup
 

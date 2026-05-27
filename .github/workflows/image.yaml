@@ -74,6 +74,19 @@ jobs:
         driver-opts: |
           image=harbor.peinser.com/dockerhub/moby/buildkit:buildx-stable-1
 
+    - name: Validate CPU target
+      env:
+        QSR_CPU_TARGET: ${{ vars.QSR_CPU_TARGET }}
+      run: |
+        if [ "${QSR_CPU_TARGET}" = "native" ]; then
+          echo "QSR_CPU_TARGET=native is not allowed for published multi-arch images" >&2
+          exit 1
+        fi
+        if [ -n "${QSR_CPU_TARGET}" ] && [ "${{ matrix.arch }}" != "amd64" ]; then
+          echo "QSR_CPU_TARGET=${QSR_CPU_TARGET} is not valid for ${{ matrix.arch }} image builds" >&2
+          exit 1
+        fi
+
     - name: Build and push release by digest
       id: build_release
       uses: docker/build-push-action@v7

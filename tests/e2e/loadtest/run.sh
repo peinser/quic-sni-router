@@ -44,6 +44,13 @@ if [ "${persistent}" = "1" ]; then
   client_script="persistent_loadtest_client.py"
 fi
 
+case "${duration}:${concurrency}:${n_backends}" in
+  *[!0-9:]*|0:*|*:0:*|*:0)
+    echo "invalid loadtest duration/concurrency/backends" >&2
+    exit 2
+    ;;
+esac
+
 cleanup() {
   # Wildcard cleanup catches all per-backend containers and the client.
   ids="$(docker ps -a --filter "name=^${project}-" -q 2>/dev/null || true)"

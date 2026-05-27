@@ -8,7 +8,7 @@ routing cost.
 """
 import argparse
 import asyncio
-import random
+import math
 import ssl
 import sys
 import time
@@ -65,8 +65,8 @@ class PersistentClientProtocol(QuicConnectionProtocol):
             self._bodies.pop(stream_id, None)
 
 
-async def worker(snis: list[str], port: int, deadline: float, timeout: float, stats: dict) -> None:
-    sni = random.choice(snis)
+async def worker(worker_id: int, snis: list[str], port: int, deadline: float, timeout: float, stats: dict) -> None:
+    sni = snis[worker_id % len(snis)]
     cfg = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     cfg.verify_mode = ssl.CERT_NONE
     cfg.server_name = sni
@@ -98,8 +98,8 @@ async def worker(snis: list[str], port: int, deadline: float, timeout: float, st
 def percentile(sorted_values: list[float], p: float) -> float:
     if not sorted_values:
         return 0.0
-    idx = int(p / 100.0 * len(sorted_values))
-    return sorted_values[min(idx, len(sorted_values) - 1)]
+    idx = math.ceil(p / 100.0 * len(sorted_values)) - 1
+    return sorted_values[max(0, min(idx, len(sorted_values) - 1))]
 
 
 async def main() -> int:
@@ -112,6 +112,13 @@ async def main() -> int:
     parser.add_argument("--pass-threshold", type=float, default=0.95,
                         help="minimum success rate (0..1) for exit-0")
     args = parser.parse_args()
+
+    if args.port < 1 or args.port > 65535 or args.concurrency < 1 or args.duration <= 0 or args.timeout <= 0:
+        print("invalid port/concurrency/duration/timeout", file=sys.stderr)
+        return 2
+    if args.pass_threshold < 0.0 or args.pass_threshold > 1.0:
+        print("invalid pass threshold", file=sys.stderr)
+        return 2
 
     snis = [s.strip() for s in args.snis.split(",") if s.strip()]
     if not snis:
@@ -130,7 +137,7 @@ async def main() -> int:
     print(f"persistent loadtest: {args.concurrency} connections x {args.duration}s "
           f"across {len(snis)} SNI(s), per-request timeout {args.timeout}s")
     start = time.monotonic()
-    workers = [worker(snis, args.port, deadline, args.timeout, stats) for _ in range(args.concurrency)]
+    workers = [worker(i, snis, args.port, deadline, args.timeout, stats) for i in range(args.concurrency)]
     await asyncio.gather(*workers)
     elapsed = time.monotonic() - start
 

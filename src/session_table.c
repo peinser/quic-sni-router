@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum : size_t { QSR_EVICT_SCAN_BUDGET = 4096U };
+enum : size_t { QSR_PRESSURE_EVICT_MIN_CAPACITY = 1024U };
+enum : size_t { QSR_PRESSURE_EVICT_LOAD_PERCENT = 90U };
+
 static bool key_valid(const qsr_session_key_t *key) {
   if (key == nullptr || (!key->has_tuple && !key->has_cids) || key->dcid_len > sizeof(key->dcid) ||
       key->scid_len > sizeof(key->scid)) {
@@ -123,6 +127,9 @@ qsr_status_t qsr_session_table_init(qsr_session_table_t *table, size_t capacity)
   }
   table->capacity = capacity;
   table->count = 0U;
+  table->expire_cursor = 0U;
+  table->evict_cursor = 0U;
+  table->cid_len_mask = 0U;
   return QSR_OK;
 }
 
@@ -134,6 +141,13 @@ void qsr_session_table_free(qsr_session_table_t *table) {
   table->sessions = nullptr;
   table->capacity = 0U;
   table->count = 0U;
+  table->expire_cursor = 0U;
+  table->evict_cursor = 0U;
+  table->cid_len_mask = 0U;
+}
+
+uint32_t qsr_session_table_cid_len_mask(const qsr_session_table_t *table) {
+  return table == nullptr ? 0U : table->cid_len_mask;
 }
 
 qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr_session_key_t *key) {
@@ -153,6 +167,10 @@ qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr
   }
   return nullptr;
 }
+
+static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const qsr_session_key_t *key,
+                                               const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
+                                               time_t now, bool allow_pressure_evict);
 
 /*
  * Delete one entry and reinsert the following probe cluster so lookup remains
@@ -179,7 +197,8 @@ static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
     qsr_session_t saved = table->sessions[cursor];
     memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
     table->count--;
-    (void)qsr_session_table_put(table, &saved.key, &saved.backend_addr, saved.backend_addr_len, saved.last_seen);
+    (void)session_table_put_internal(table, &saved.key, &saved.backend_addr, saved.backend_addr_len, saved.last_seen,
+                                     false);
     cursor = (cursor + 1U) % table->capacity;
   }
   return index;
@@ -197,20 +216,29 @@ static void evict_oldest(qsr_session_table_t *table) {
   }
   size_t victim = SIZE_MAX;
   time_t oldest = 0;
-  for (size_t i = 0U; i < table->capacity; i++) {
-    if (table->sessions[i].used && (victim == SIZE_MAX || table->sessions[i].last_seen < oldest)) {
-      victim = i;
-      oldest = table->sessions[i].last_seen;
+  const size_t scans = table->capacity < QSR_EVICT_SCAN_BUDGET ? table->capacity : QSR_EVICT_SCAN_BUDGET;
+  for (size_t i = 0U; i < scans; i++) {
+    const size_t index = (table->evict_cursor + i) % table->capacity;
+    if (table->sessions[index].used && (victim == SIZE_MAX || table->sessions[index].last_seen < oldest)) {
+      victim = index;
+      oldest = table->sessions[index].last_seen;
     }
   }
+  table->evict_cursor = (table->evict_cursor + scans) % table->capacity;
   if (victim == SIZE_MAX) {
     return;
   }
   (void)table_delete_at(table, victim);
 }
 
-qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session_key_t *key,
-                                   const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len, time_t now) {
+static bool pressure_evict_needed(const qsr_session_table_t *table) {
+  return table->capacity >= QSR_PRESSURE_EVICT_MIN_CAPACITY &&
+         table->count * 100U >= table->capacity * QSR_PRESSURE_EVICT_LOAD_PERCENT;
+}
+
+static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const qsr_session_key_t *key,
+                                               const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
+                                               time_t now, bool allow_pressure_evict) {
   if (table == nullptr || table->sessions == nullptr || table->capacity == 0U || !key_valid(key) ||
       !backend_valid(backend_addr, backend_addr_len)) {
     return QSR_ERR_INVALID;
@@ -231,12 +259,19 @@ qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session
     for (size_t probes = 0U; probes < table->capacity; probes++) {
       qsr_session_t *session = &table->sessions[index];
       if (!session->used) {
+        if (allow_pressure_evict && attempt == 0 && pressure_evict_needed(table)) {
+          evict_oldest(table);
+          break;
+        }
         session->used = true;
         session->key = *key;
         memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
         session->backend_addr_len = backend_addr_len;
         session->last_seen = now;
         table->count++;
+        if (key->has_cids && key->dcid_len >= QSR_MIN_LEARNED_CID_LEN && key->dcid_len <= QSR_MAX_QUIC_CID_LEN) {
+          table->cid_len_mask |= 1U << key->dcid_len;
+        }
         return QSR_OK;
       }
       if (key_equals(&session->key, key)) {
@@ -253,6 +288,12 @@ qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session
     }
   }
   return QSR_ERR_FULL;
+}
+
+qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session_key_t *key,
+                                   const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
+                                   time_t now) {
+  return session_table_put_internal(table, key, backend_addr, backend_addr_len, now, true);
 }
 
 size_t qsr_session_table_expire(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds) {
@@ -272,6 +313,26 @@ size_t qsr_session_table_expire(qsr_session_table_t *table, time_t now, time_t i
       continue;
     }
     i++;
+  }
+  return expired;
+}
+
+size_t qsr_session_table_expire_incremental(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds,
+                                            size_t scan_budget) {
+  if (table == nullptr || table->sessions == nullptr || table->capacity == 0U || scan_budget == 0U) {
+    return 0U;
+  }
+  size_t expired = 0U;
+  size_t scanned = 0U;
+  while (scanned < scan_budget && scanned < table->capacity) {
+    const size_t index = table->expire_cursor;
+    if (table->sessions[index].used && now - table->sessions[index].last_seen >= idle_timeout_seconds) {
+      (void)table_delete_at(table, index);
+      expired++;
+    } else {
+      table->expire_cursor = (table->expire_cursor + 1U) % table->capacity;
+    }
+    scanned++;
   }
   return expired;
 }
