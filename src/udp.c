@@ -368,12 +368,9 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
 }
 #endif
 
-static void rebind_session(qsr_session_table_t *sessions, const qsr_session_key_t *new_tuple_key,
-                           const struct sockaddr_storage *new_source, socklen_t new_source_len,
-                           const struct sockaddr_storage *backend, socklen_t backend_len, time_t now) {
+static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_key_t *new_tuple_key,
+                              const struct sockaddr_storage *backend, socklen_t backend_len, time_t now) {
   (void)qsr_session_table_put(sessions, new_tuple_key, backend, backend_len, now);
-  qsr_session_key_t reverse_key = qsr_session_tuple_key(backend, backend_len);
-  (void)qsr_session_table_put(sessions, &reverse_key, new_source, new_source_len, now);
 }
 
 static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_t *sessions, qsr_udp_sender_t *sender,
@@ -465,13 +462,13 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     const qsr_session_t *cid_session = lookup_short_header_cid(sessions, packet, packet_len);
     if (cid_session != nullptr) {
       /*
-       * NAT rebinding via short-header CID: install both directions of the new
-       * tuple so backend replies follow the client. The previous implementation
-       * forgot the reverse alias and silently black-holed reply traffic.
+       * NAT rebinding via short-header CID: install the new client tuple. The
+       * common direction-refresh block below updates the reverse tuple once the
+       * packet has been classified.
        */
       struct sockaddr_storage backend = cid_session->backend_addr;
       const socklen_t backend_len = cid_session->backend_addr_len;
-      rebind_session(sessions, &key, source, source_len, &backend, backend_len, now);
+      bind_client_tuple(sessions, &key, &backend, backend_len, now);
       session = qsr_session_table_get(sessions, &key);
     }
   }
@@ -486,7 +483,7 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     if (cid_session != nullptr) {
       struct sockaddr_storage backend = cid_session->backend_addr;
       const socklen_t backend_len = cid_session->backend_addr_len;
-      rebind_session(sessions, &key, source, source_len, &backend, backend_len, now);
+      bind_client_tuple(sessions, &key, &backend, backend_len, now);
       session = qsr_session_table_get(sessions, &key);
     }
   }
@@ -514,8 +511,6 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     }
     put_alias(sessions, &cid_key, &backend, backend_len, now);
     learn_long_header_cids(sessions, packet, packet_len, source, source_len, &backend, backend_len, now);
-    qsr_session_key_t reverse_key = qsr_session_tuple_key(&backend, backend_len);
-    (void)qsr_session_table_put(sessions, &reverse_key, source, source_len, now);
     session = qsr_session_table_get(sessions, &key);
     if (session == nullptr) {
       return;
@@ -538,6 +533,11 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     qsr_session_key_t reverse_key = qsr_session_tuple_key(&session->backend_addr, session->backend_addr_len);
     (void)qsr_session_table_put(sessions, &reverse_key, source, source_len, now);
   } else {
+    /* Backend -> client, possibly from a Kubernetes pod tuple instead of the
+     * configured Service tuple. Pin subsequent client packets to the observed
+     * backend source so a later stateless reset returns on the same tuple. */
+    qsr_session_key_t client_key = qsr_session_tuple_key(&session->backend_addr, session->backend_addr_len);
+    (void)qsr_session_table_put(sessions, &client_key, source, source_len, now);
     (void)qsr_session_table_put(sessions, &key, &session->backend_addr, session->backend_addr_len, now);
   }
   /*

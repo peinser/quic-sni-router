@@ -76,6 +76,8 @@ jobs:
       run: make test-e2e
     - name: Docker backend-idle e2e
       run: make test-e2e-idle
+    - name: Docker reverse-tuple e2e
+      run: make test-e2e-reverse
     - name: Docker hot-reload e2e
       run: make test-e2e-reload
 
