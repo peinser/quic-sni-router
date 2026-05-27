@@ -168,7 +168,7 @@ static void sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *pack
 
 static void format_addr(const struct sockaddr_storage *addr, socklen_t addr_len, char *out, size_t out_len) {
   char host[INET6_ADDRSTRLEN] = {0};
-  uint16_t port = 0U;
+  uint16_t port;
   if (addr != nullptr && addr->ss_family == AF_INET && addr_len >= sizeof(struct sockaddr_in)) {
     const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
     (void)inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
