@@ -12,11 +12,13 @@
 #include <netdb.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -127,6 +129,78 @@ static void sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *pack
   item->packet_len = packet_len;
   memcpy(&item->dest, dest, sizeof(*dest));
   item->dest_len = dest_len;
+}
+
+[[nodiscard]] static bool debug_packets_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *value = getenv("QSR_DEBUG_PACKETS");
+    cached = value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+static void format_addr(const struct sockaddr_storage *addr, socklen_t addr_len, char *out, size_t out_len) {
+  char host[INET6_ADDRSTRLEN] = {0};
+  uint16_t port = 0U;
+  if (addr != nullptr && addr->ss_family == AF_INET && addr_len >= sizeof(struct sockaddr_in)) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+    (void)inet_ntop(AF_INET, &sin->sin_addr, host, sizeof(host));
+    port = ntohs(sin->sin_port);
+    (void)snprintf(out, out_len, "%s:%u", host, port);
+  } else if (addr != nullptr && addr->ss_family == AF_INET6 && addr_len >= sizeof(struct sockaddr_in6)) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+    (void)inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
+    port = ntohs(sin6->sin6_port);
+    (void)snprintf(out, out_len, "[%s]:%u", host, port);
+  } else {
+    (void)snprintf(out, out_len, "?");
+  }
+}
+
+[[nodiscard]] static const char *packet_kind(const uint8_t *packet, size_t packet_len) {
+  if (packet_len == 0U) {
+    return "empty";
+  }
+  if ((packet[0] & 0x80U) == 0U) {
+    return (packet[0] & 0x40U) != 0U ? "short" : "short-no-fixed";
+  }
+  if ((packet[0] & 0x40U) == 0U) {
+    return "long-no-fixed";
+  }
+  if (packet_len < 5U) {
+    return "long-truncated";
+  }
+  const uint32_t version = ((uint32_t)packet[1] << 24U) | ((uint32_t)packet[2] << 16U) |
+                           ((uint32_t)packet[3] << 8U) | (uint32_t)packet[4];
+  const uint8_t type_bits = packet[0] & 0x30U;
+  if ((version == QSR_QUIC_V1 && type_bits == 0x00U) || (version == QSR_QUIC_V2 && type_bits == 0x10U)) {
+    return "initial";
+  }
+  if ((version == QSR_QUIC_V1 && type_bits == 0x30U) || (version == QSR_QUIC_V2 && type_bits == 0x00U)) {
+    return "retry";
+  }
+  if ((version == QSR_QUIC_V1 && type_bits == 0x20U) || (version == QSR_QUIC_V2 && type_bits == 0x30U)) {
+    return "handshake";
+  }
+  return "long";
+}
+
+static void debug_packet_decision(const char *decision, const uint8_t *packet, size_t packet_len,
+                                  const struct sockaddr_storage *source, socklen_t source_len,
+                                  const struct sockaddr_storage *dest, socklen_t dest_len, bool source_is_backend,
+                                  int status) {
+  if (!debug_packets_enabled()) {
+    return;
+  }
+  char src[INET6_ADDRSTRLEN + 16] = "?";
+  char dst[INET6_ADDRSTRLEN + 16] = "?";
+  format_addr(source, source_len, src, sizeof(src));
+  if (dest != nullptr) {
+    format_addr(dest, dest_len, dst, sizeof(dst));
+  }
+  (void)fprintf(stderr, "qsr packet decision=%s kind=%s len=%zu src=%s src_backend=%d dst=%s status=%d\n", decision,
+                packet_kind(packet, packet_len), packet_len, src, source_is_backend ? 1 : 0, dst, status);
 }
 
 [[nodiscard]] static qsr_status_t split_listen(const char *listen, char *host, size_t host_len, char *port,
@@ -379,6 +453,7 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
   qsr_session_key_t key = qsr_session_tuple_key(source, source_len);
   qsr_session_t *session = nullptr;
   const bool source_is_backend = is_known_backend_addr(runtime_config, sessions, source, source_len);
+  const char *decision = "unclassified";
 
   /*
    * Initial packets need careful handling. There are three sub-cases:
@@ -410,11 +485,17 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       qsr_session_key_t pair_key =
           qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
       session = qsr_session_table_get(sessions, &pair_key);
+      if (session != nullptr) {
+        decision = "initial_pair";
+      }
       /* Post-Retry Initials use the backend's Retry SCID as their DCID. Once
        * we have observed the Retry, a DCID alias is enough to route the packet
        * without decrypting/parsing the second ClientHello flight. */
       if (session == nullptr && !source_is_backend) {
         session = lookup_long_header_request_dcid(runtime_config, sessions, &initial);
+        if (session != nullptr) {
+          decision = "initial_request_dcid";
+        }
       }
       /* Backend Initial responses use DCID = the client's SCID. The client
        * Initial taught us that single-CID alias, and it is per connection;
@@ -426,15 +507,22 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
         if (dcid_session != nullptr && !is_known_backend_addr(runtime_config, sessions, &dcid_session->backend_addr,
                                                               dcid_session->backend_addr_len)) {
           session = dcid_session;
+          decision = "backend_initial_dcid";
         }
       }
     }
   }
   if (session == nullptr) {
     session = lookup_long_header_response_dcid(runtime_config, sessions, packet, packet_len);
+    if (session != nullptr) {
+      decision = "long_response_dcid";
+    }
   }
   if (session == nullptr && source_is_backend) {
     session = lookup_backend_dcid(runtime_config, sessions, packet, packet_len);
+    if (session != nullptr) {
+      decision = "backend_dcid";
+    }
   }
   if (session == nullptr) {
     qsr_session_t *tuple_session = qsr_session_table_get(sessions, &key);
@@ -456,6 +544,7 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
         (!is_initial || !is_known_backend_addr(runtime_config, sessions, &tuple_session->backend_addr,
                                                tuple_session->backend_addr_len))) {
       session = tuple_session;
+      decision = "tuple";
     }
   }
   if (session == nullptr) {
@@ -470,6 +559,9 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       const socklen_t backend_len = cid_session->backend_addr_len;
       bind_client_tuple(sessions, &key, &backend, backend_len, now);
       session = qsr_session_table_get(sessions, &key);
+      if (session != nullptr) {
+        decision = "short_cid_rebind";
+      }
     }
   }
   /*
@@ -485,6 +577,9 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       const socklen_t backend_len = cid_session->backend_addr_len;
       bind_client_tuple(sessions, &key, &backend, backend_len, now);
       session = qsr_session_table_get(sessions, &key);
+      if (session != nullptr) {
+        decision = "rebound_initial";
+      }
     }
   }
   if (session == nullptr) {
@@ -496,6 +591,8 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
      * an attacker cannot burn CPU on us for free.
      */
     if (packet_len < QSR_MIN_INITIAL_DATAGRAM_SIZE) {
+      debug_packet_decision("drop_short_unknown", packet, packet_len, source, source_len, nullptr, 0, source_is_backend,
+                            0);
       return;
     }
     struct sockaddr_storage backend;
@@ -503,18 +600,25 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     qsr_session_key_t cid_key;
     qsr_status_t status = route_initial_datagram(runtime_config, packet, packet_len, &backend, &backend_len, &cid_key);
     if (status != QSR_OK) {
+      debug_packet_decision("drop_initial_route", packet, packet_len, source, source_len, nullptr, 0, source_is_backend,
+                            (int)status);
       return;
     }
     status = qsr_session_table_put(sessions, &key, &backend, backend_len, now);
     if (status != QSR_OK) {
+      debug_packet_decision("drop_session_put", packet, packet_len, source, source_len, &backend, backend_len,
+                            source_is_backend, (int)status);
       return;
     }
     put_alias(sessions, &cid_key, &backend, backend_len, now);
     learn_long_header_cids(sessions, packet, packet_len, source, source_len, &backend, backend_len, now);
     session = qsr_session_table_get(sessions, &key);
     if (session == nullptr) {
+      debug_packet_decision("drop_session_get", packet, packet_len, source, source_len, &backend, backend_len,
+                            source_is_backend, 0);
       return;
     }
+    decision = "fresh_sni";
   }
 
   session->last_seen = now;
@@ -546,6 +650,8 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
    */
   learn_long_header_cids(sessions, packet, packet_len, source, source_len, &session->backend_addr,
                          session->backend_addr_len, now);
+  debug_packet_decision(decision, packet, packet_len, source, source_len, &session->backend_addr,
+                        session->backend_addr_len, source_is_backend, 0);
   sender_enqueue(sender, fd, packet, packet_len, &session->backend_addr, session->backend_addr_len);
 }
 
