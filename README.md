@@ -173,6 +173,7 @@ Useful build toggles:
 - `-DQSR_CPU_TARGET=native`: tune Release builds for the local CPU.
 - `-DQSR_CPU_TARGET=znver3` or `znver4`: tune Release builds for a known Ryzen generation.
 - `-DQSR_ENABLE_LTO=ON`: enable Release interprocedural optimization when supported by the compiler/linker.
+- `-DQSR_ENABLE_PACKET_DEBUG=ON`: compile packet decision logging support. Published images use a separate `-debug` tag for this and still require `QSR_DEBUG_PACKETS=1` at runtime before logging packets.
 
 For Ryzen-only hosts, benchmark the portable Release build against a native-tuned build:
 
@@ -187,7 +188,7 @@ For a host-specific container image on the same Ryzen fleet, build with:
 make docker-build QSR_CPU_TARGET=native QSR_ENABLE_LTO=ON
 ```
 
-Use `native` only when the image will run on CPUs compatible with the build host. For published portable images, leave `QSR_CPU_TARGET` empty. The image workflow publishes a multi-arch manifest (`linux/amd64` and `linux/arm64`) built on native runners and stitched together via `docker buildx imagetools`.
+Use `native` only when the image will run on CPUs compatible with the build host. For published portable images, leave `QSR_CPU_TARGET` empty. The image workflow publishes paired multi-arch manifests (`linux/amd64` and `linux/arm64`): the default tag has packet debug logging compiled out, and the matching `-debug` tag compiles it in for production diagnosis.
 
 ## Config
 

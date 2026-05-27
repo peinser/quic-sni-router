@@ -58,6 +58,7 @@ QSR_LOADTEST_DIRECT=1 make test-loadtest
 QSR_LOADTEST_PERSISTENT=1 make test-loadtest
 QSR_LOADTEST_PERSISTENT=1 QSR_LOADTEST_DIRECT=1 make test-loadtest
 QSR_LOADTEST_BACKENDS=2 QSR_LOADTEST_CONCURRENCY=10 make test-loadtest
+QSR_LOADTEST_PACKET_DEBUG=1 make test-loadtest
 ```
 
 ## What this benchmark is and isn't

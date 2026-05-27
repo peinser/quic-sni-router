@@ -14,6 +14,7 @@
 #   QSR_LOADTEST_BACKENDS    default 10
 #   QSR_LOADTEST_DIRECT      bypass router and hit backends directly, default 0
 #   QSR_LOADTEST_PERSISTENT  reuse one HTTP/3 session per worker, default 0
+#   QSR_LOADTEST_PACKET_DEBUG build router with packet debug support, default 0
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -36,6 +37,7 @@ threshold="${QSR_LOADTEST_THRESHOLD:-0.95}"
 n_backends="${QSR_LOADTEST_BACKENDS:-10}"
 direct="${QSR_LOADTEST_DIRECT:-0}"
 persistent="${QSR_LOADTEST_PERSISTENT:-0}"
+packet_debug="${QSR_LOADTEST_PACKET_DEBUG:-0}"
 backend_port=8443
 client_script="loadtest_client.py"
 if [ "${persistent}" = "1" ]; then
@@ -86,7 +88,12 @@ chmod 0644 "${config_dir}/router.yaml"
 # Build images. Router uses the production target (no baked config); we
 # overlay the generated config in a tiny derived image — same trick as the
 # reload e2e, which sidesteps Docker Desktop's bind-mount restrictions.
-docker build -t "${router_base_image}" -f ../../../docker/Dockerfile --target production ../../..
+packet_debug_cmake="OFF"
+if [ "${packet_debug}" = "1" ]; then
+  packet_debug_cmake="ON"
+fi
+docker build --build-arg QSR_ENABLE_PACKET_DEBUG="${packet_debug_cmake}" \
+  -t "${router_base_image}" -f ../../../docker/Dockerfile --target production ../../..
 cp "${config_dir}/router.yaml" router.yaml
 docker build -t "${router_initial_image}" -f - . <<EOF
 FROM ${router_base_image}

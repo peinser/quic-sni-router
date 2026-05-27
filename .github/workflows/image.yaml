@@ -47,8 +47,20 @@ jobs:
         include:
         - platform: linux/amd64
           arch: amd64
+          flavor: release
+          packet_debug: OFF
         - platform: linux/arm64
           arch: arm64
+          flavor: release
+          packet_debug: OFF
+        - platform: linux/amd64
+          arch: amd64
+          flavor: debug
+          packet_debug: ON
+        - platform: linux/arm64
+          arch: arm64
+          flavor: debug
+          packet_debug: ON
     # Both legs run on the same on-prem group (amd64 hardware). The arm64
     # leg cross-builds under QEMU; legs run in parallel on separate runners,
     # so wall-clock is max(amd64, arm64) instead of sum.
@@ -90,6 +102,7 @@ jobs:
           CREATED=${{ github.event.repository.updated_at }}
           QSR_CPU_TARGET=${{ vars.QSR_CPU_TARGET }}
           QSR_ENABLE_LTO=${{ vars.QSR_ENABLE_LTO || 'OFF' }}
+          QSR_ENABLE_PACKET_DEBUG=${{ matrix.packet_debug }}
         # push-by-digest: emit a single-platform image keyed only by content
         # hash; the merge job below stitches per-arch digests into the tagged
         # multi-arch manifest. name-canonical=true keeps each per-arch image
@@ -99,20 +112,20 @@ jobs:
         # Per-platform cache refs avoid the two legs trampling each other and
         # keep each arch's cache focused (arm64 cache otherwise stays cold
         # because amd64 layers don't apply).
-        cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
-        cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max
+        cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.flavor }}
+        cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}-${{ matrix.flavor }},mode=max
 
     - name: Export digest
       run: |
         mkdir -p /tmp/digests
         # Strip the "sha256:" prefix; the file name is the bare hex digest.
         digest="${{ steps.build.outputs.digest }}"
-        echo "${digest}" > "/tmp/digests/${digest#sha256:}"
+        echo "${digest}" > "/tmp/digests/${{ matrix.flavor }}-${digest#sha256:}"
 
     - name: Upload digest artifact
       uses: actions/upload-artifact@v4
       with:
-        name: digest-${{ matrix.arch }}
+        name: digest-${{ matrix.flavor }}-${{ matrix.arch }}
         path: /tmp/digests/*
         if-no-files-found: error
         retention-days: 1
@@ -142,30 +155,25 @@ jobs:
         driver-opts: |
           image=harbor.peinser.com/dockerhub/moby/buildkit:buildx-stable-1
 
-    - name: Extract image metadata
-      id: meta
-      uses: docker/metadata-action@v6
-      with:
-        images: ${{ env.IMAGE }}
-        tags: |
-          type=raw,value=${{ needs.prepare.outputs.tag }}
-
-    - name: Create multi-arch manifest
+    - name: Create multi-arch manifests
       working-directory: /tmp/digests
       run: |
         # imagetools create accepts a list of per-arch refs of the form
         # <image>@sha256:<digest> and produces a single multi-arch manifest at
-        # each -t tag.
-        tags=()
-        for tag in $(jq -r '.tags | .[]' <<< "${DOCKER_METADATA_OUTPUT_JSON}"); do
-          tags+=("-t" "${tag}")
+        # each -t tag. The debug tag is Release-equivalent except packet
+        # decision logging is compiled in and still gated by QSR_DEBUG_PACKETS.
+        release_sources=()
+        for f in release-*; do
+          release_sources+=("${{ env.IMAGE }}@sha256:${f#release-}")
         done
-        sources=()
-        for f in *; do
-          sources+=("${{ env.IMAGE }}@sha256:${f}")
+        debug_sources=()
+        for f in debug-*; do
+          debug_sources+=("${{ env.IMAGE }}@sha256:${f#debug-}")
         done
-        docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+        docker buildx imagetools create -t "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}" "${release_sources[@]}"
+        docker buildx imagetools create -t "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}-debug" "${debug_sources[@]}"
 
     - name: Inspect resulting manifest
       run: |
         docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}"
+        docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}-debug"

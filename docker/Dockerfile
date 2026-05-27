@@ -3,6 +3,7 @@ FROM harbor.peinser.com/dockerhub/ubuntu:24.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG QSR_CPU_TARGET=
 ARG QSR_ENABLE_LTO=OFF
+ARG QSR_ENABLE_PACKET_DEBUG=OFF
 WORKDIR /src
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,6 +25,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=c
         $(if [ "${QSR_ENABLE_LTO}" = "ON" ]; then printf '%s' '-DCMAKE_AR=llvm-ar -DCMAKE_RANLIB=llvm-ranlib'; fi) \
         -DQSR_CPU_TARGET="${QSR_CPU_TARGET}" \
         -DQSR_ENABLE_LTO="${QSR_ENABLE_LTO}" \
+        -DQSR_ENABLE_PACKET_DEBUG="${QSR_ENABLE_PACKET_DEBUG}" \
     && cmake --build build \
     && ctest --test-dir build --output-on-failure
 

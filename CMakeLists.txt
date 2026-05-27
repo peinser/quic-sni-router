@@ -10,6 +10,7 @@ option(QSR_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanit
 option(QSR_BUILD_FUZZERS "Build libFuzzer targets" OFF)
 option(QSR_BUILD_BENCHMARKS "Build local benchmark harnesses" OFF)
 option(QSR_ENABLE_LTO "Enable interprocedural optimization for Release builds" OFF)
+option(QSR_ENABLE_PACKET_DEBUG "Compile packet decision debug logging support" OFF)
 set(QSR_CPU_TARGET "" CACHE STRING "Release CPU target for Clang/GCC, for example native, znver3, or znver4")
 
 set(CMAKE_C_STANDARD 23)
@@ -52,6 +53,9 @@ target_link_libraries(qsr_core PUBLIC OpenSSL::Crypto PkgConfig::LIBYAML)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_definitions(qsr_core PRIVATE _GNU_SOURCE)
+endif()
+if(QSR_ENABLE_PACKET_DEBUG)
+  target_compile_definitions(qsr_core PRIVATE QSR_ENABLE_PACKET_DEBUG)
 endif()
 
 target_compile_options(qsr_core PRIVATE

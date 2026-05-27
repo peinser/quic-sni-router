@@ -30,6 +30,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- Packet decision logging is now compiled only when `QSR_ENABLE_PACKET_DEBUG=ON`. The default image has this path compiled out; the image pipeline also publishes a matching `-debug` tag that is Release-equivalent but can emit packet traces when `QSR_DEBUG_PACKETS=1` is set.
 - Restructured `src/tls_client_hello.c` around a small `reader_t` abstraction with fail-fast typed reads (`r_u8` / `r_u16` / `r_u24` / `r_skip`) and length-prefixed sub-readers that physically cannot walk past their declared parent length. Replaces 14 hand-rolled `if (offset > end || N > end - offset)` checks with one bounds check per field. Same wire-level semantics; `QSR_ERR_TRUNCATED` vs `QSR_ERR_INVALID` is now reported more accurately (a too-short handshake header was previously conflated as INVALID — it's TRUNCATED).
 
 ### Performance

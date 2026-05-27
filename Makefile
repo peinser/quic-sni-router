@@ -6,6 +6,7 @@ QSR_VERSION ?= $(shell awk '/VERSION/ && /quic-sni-router/ { print $$3; exit }' 
 IMAGE_TAG ?= $(QSR_VERSION)-$(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 QSR_CPU_TARGET ?=
 QSR_ENABLE_LTO ?= OFF
+QSR_ENABLE_PACKET_DEBUG ?= OFF
 DOCKER ?= docker
 CLANG ?= clang
 
@@ -19,7 +20,7 @@ configure: ## Configure CMake build
 		echo "Removing stale CMake cache in $(BUILD_DIR)"; \
 		cmake -E rm -rf "$(BUILD_DIR)"; \
 	fi
-	cmake -S . -B $(BUILD_DIR) $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DQSR_CPU_TARGET=$(QSR_CPU_TARGET) -DQSR_ENABLE_LTO=$(QSR_ENABLE_LTO)
+	cmake -S . -B $(BUILD_DIR) $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DQSR_CPU_TARGET=$(QSR_CPU_TARGET) -DQSR_ENABLE_LTO=$(QSR_ENABLE_LTO) -DQSR_ENABLE_PACKET_DEBUG=$(QSR_ENABLE_PACKET_DEBUG)
 
 build: configure ## Build router and tests
 	cmake --build $(BUILD_DIR)
@@ -92,7 +93,7 @@ benchmark: ## Run synthetic dataplane benchmarks
 		echo "Removing stale CMake cache in $(BUILD_DIR)-bench"; \
 		cmake -E rm -rf "$(BUILD_DIR)-bench"; \
 	fi
-	cmake -S . -B $(BUILD_DIR)-bench $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=Release -DQSR_BUILD_BENCHMARKS=ON -DQSR_CPU_TARGET=$(QSR_CPU_TARGET) -DQSR_ENABLE_LTO=$(QSR_ENABLE_LTO)
+	cmake -S . -B $(BUILD_DIR)-bench $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=Release -DQSR_BUILD_BENCHMARKS=ON -DQSR_CPU_TARGET=$(QSR_CPU_TARGET) -DQSR_ENABLE_LTO=$(QSR_ENABLE_LTO) -DQSR_ENABLE_PACKET_DEBUG=$(QSR_ENABLE_PACKET_DEBUG)
 	cmake --build $(BUILD_DIR)-bench
 	$(BUILD_DIR)-bench/bench_dataplane
 
@@ -106,6 +107,7 @@ docker-build: ## Build production container image
 		--build-arg CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
 		--build-arg QSR_CPU_TARGET=$(QSR_CPU_TARGET) \
 		--build-arg QSR_ENABLE_LTO=$(QSR_ENABLE_LTO) \
+		--build-arg QSR_ENABLE_PACKET_DEBUG=$(QSR_ENABLE_PACKET_DEBUG) \
 		-f docker/Dockerfile \
 		-t $(IMAGE_REPO):$(IMAGE_TAG) .
 
