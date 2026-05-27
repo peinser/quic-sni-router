@@ -35,6 +35,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Performance
 
+- Switched the Linux dataplane to raw-syscall `io_uring` multishot `recvmsg` with a provided-buffer ring plus `sendmmsg` send batching. Receive SQEs use `IORING_RECVSEND_POLL_FIRST`, submissions are checked for partial progress, buffers are recycled through the kernel-provided ring, and the loadtest asserts the expected dataplane at startup.
 - Session expiry now runs as a bounded incremental sweep instead of scanning the entire configured session table once per second. Large `maxSessions` values no longer create predictable full-table dataplane pauses.
 - Session-table eviction under pressure now samples a bounded window instead of scanning the full table for the oldest entry, and large tables begin pressure eviction before reaching 100% load to avoid pathological linear-probing stalls.
 - Short-header CID lookup now skips CID lengths that have never been learned, reducing backend return-path hash probes for the common fixed-CID-length case.
@@ -62,7 +63,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
-- Removed the synchronous `io_uring` dataplane path: it did `submit; wait_cqe` per packet and was strictly slower than batched `recvmmsg`/`sendmmsg`. A proper async rewrite is in [ROADMAP.md](ROADMAP.md).
+- Removed the external `QSR_ENABLE_IO_URING` build toggle; Linux builds now use the `io_uring` dataplane by default.
 - Modernised to C23 (`-std=gnu23`, `nullptr`, `[[nodiscard]]`, designated initialisers).
 - Refactored hot-reload state out of `src/udp.c` into a dedicated `qsr::runtime` module.
 

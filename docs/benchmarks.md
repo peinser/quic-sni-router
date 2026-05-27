@@ -8,7 +8,7 @@ make benchmark
 
 The benchmark covers route lookup, session CID lookup, and CRYPTO frame extraction. It is intended to establish whether user-space lookup/parsing dominates before investing in any heavier kernel-bypass path.
 
-The Linux runtime uses `epoll` plus `recvmmsg`/`sendmmsg`. An earlier `io_uring` path was synchronous (submit then wait per packet) and strictly slower than the batched syscall path; it has been removed. A proper async rewrite using multishot recv, registered buffers, and IORING_RECV_MULTISHOT is the right way to revisit and is tracked as future work.
+The Linux runtime uses raw-syscall `io_uring` multishot `recvmsg` with a provided-buffer ring plus `sendmmsg` send batching.
 
 Future benchmark work should add a Linux-only loopback benchmark that drives the full UDP router with synthetic QUIC datagrams to measure end-to-end p99 latency at varying flow counts.
 
@@ -49,6 +49,15 @@ Reference results from the local Docker/aarch64 environment after the backend-DC
 | Persistent sessions | 2 | 10 | Direct | `240408/240408`, 0 failures, 7982.2 req/s |
 
 Before the backend-DCID fix, the same 2-backend fresh-connection routed test collapsed to roughly 13 req/s with timeouts, while direct stayed near 98 req/s. That regression was not crypto cost; it was incorrect backend return routing through an ambiguous shared backend tuple.
+
+Current Linux `io_uring` multishot results from the local Docker/aarch64 environment with 10 backends, 10 workers, and 10s duration:
+
+| Mode | Result |
+| --- | ---: |
+| Fresh connections | 95.9 req/s, 100% success, 0 misroutes |
+| Persistent sessions | 8495.7 req/s, 100% success, 0 misroutes |
+
+Treat this as a correctness check and a direction signal, not a production benchmark.
 
 Useful commands:
 

@@ -101,12 +101,10 @@ if [ "${packet_debug}" = "1" ]; then
 fi
 docker build --build-arg QSR_ENABLE_PACKET_DEBUG="${packet_debug_cmake}" \
   -t "${router_base_image}" -f ../../../docker/Dockerfile --target production ../../..
-cp "${config_dir}/router.yaml" router.yaml
-docker build -t "${router_initial_image}" -f - . <<EOF
+docker build -t "${router_initial_image}" -f - "${config_dir}" <<EOF
 FROM ${router_base_image}
 COPY router.yaml /config/router.yaml
 EOF
-rm router.yaml
 
 if ! docker image inspect "${http3_image}" >/dev/null 2>&1; then
   docker build -t "${http3_image}" -f ../http3/Dockerfile ../http3
@@ -147,6 +145,24 @@ if [ "${direct}" != "1" ]; then
   done
   if [ -z "${router_ip}" ]; then
     echo "router container did not receive an IPv4 address" >&2
+    exit 1
+  fi
+
+  expected_dataplane="io_uring recvmsg + sendmmsg"
+  dataplane_seen="0"
+  for _ in $(seq 1 20); do
+    router_logs="$(docker logs "${project}-router" 2>&1 || true)"
+    case "${router_logs}" in
+      *"quic-sni-router dataplane: ${expected_dataplane}"*)
+        dataplane_seen="1"
+        break
+        ;;
+    esac
+    sleep 0.25
+  done
+  if [ "${dataplane_seen}" != "1" ]; then
+    echo "router did not start expected dataplane: ${expected_dataplane}" >&2
+    docker logs "${project}-router" >&2 2>/dev/null || true
     exit 1
   fi
 

@@ -60,9 +60,7 @@ Short-header rebinding is best-effort because QUIC does not encode Destination C
 
 ## Linux Dataplane
 
-Linux builds use a nonblocking UDP socket with `epoll`, `recvmmsg` receive batching, and `sendmmsg` send batching (up to 32 datagrams per syscall). macOS and other development platforms use the portable blocking `recvfrom`/`sendto` path.
-
-The earlier `io_uring` path was synchronous (submit-then-wait per packet) and slower than `recvmmsg`/`sendmmsg`; it has been removed. A proper async rewrite using multishot recv and registered buffers is the right way to revisit and is tracked as future work.
+Linux builds use a nonblocking UDP socket with `io_uring` multishot `recvmsg`, provided receive buffers, and `sendmmsg` send batching. macOS and other development platforms use the portable blocking `recvfrom`/`sendto` path.
 
 ## Scaling and Operations
 
