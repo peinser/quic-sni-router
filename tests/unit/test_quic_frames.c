@@ -22,6 +22,23 @@ static void test_extract_split_crypto(void) {
   ASSERT_TRUE(memcmp(stream.data, "hello", 5U) == 0);
 }
 
+static void test_crypto_stream_tracks_contiguous_ranges(void) {
+  const uint8_t second[] = {0x06, 0x02, 0x03, 'l', 'l', 'o'};
+  const uint8_t first[] = {0x06, 0x00, 0x02, 'h', 'e'};
+  qsr_crypto_stream_t a;
+  qsr_crypto_stream_t b;
+  qsr_crypto_stream_init(&a);
+  qsr_crypto_stream_init(&b);
+  ASSERT_TRUE(qsr_quic_extract_crypto(second, sizeof(second), &a) == QSR_OK);
+  ASSERT_TRUE(a.len == 5U);
+  ASSERT_TRUE(qsr_crypto_stream_contiguous_len(&a) == 0U);
+
+  ASSERT_TRUE(qsr_quic_extract_crypto(first, sizeof(first), &b) == QSR_OK);
+  qsr_crypto_stream_merge(&a, &b);
+  ASSERT_TRUE(qsr_crypto_stream_contiguous_len(&a) == 5U);
+  ASSERT_TRUE(memcmp(a.data, "hello", 5U) == 0);
+}
+
 static void test_extract_skips_padding_ping(void) {
   /* PADDING and PING frames are ignored, then CRYPTO is parsed. */
   const uint8_t frames[] = {0x00, 0x00, 0x01, 0x06, 0x00, 0x03, 'h', 'i', '!'};
@@ -71,6 +88,7 @@ static void test_extract_rejects_oversize_input(void) {
 void test_quic_frames(void) {
   test_extract_simple_crypto();
   test_extract_split_crypto();
+  test_crypto_stream_tracks_contiguous_ranges();
   test_extract_skips_padding_ping();
   test_extract_skips_ack();
   test_extract_rejects_unknown_frame();

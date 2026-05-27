@@ -74,6 +74,8 @@ jobs:
         password: ${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}
     - name: Docker HTTP/3 e2e
       run: make test-e2e
+    - name: Docker fragmented-Initial e2e
+      run: make test-e2e-fragmented
     - name: Docker backend-idle e2e
       run: make test-e2e-idle
     - name: Docker reverse-tuple e2e

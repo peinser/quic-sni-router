@@ -17,8 +17,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef __linux__
 #include <arpa/inet.h>
+
+#ifdef __linux__
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -26,6 +27,9 @@
 
 enum : int { QSR_EXPIRE_SWEEP_INTERVAL_SECONDS = 1 };
 enum : unsigned { QSR_UDP_BATCH_SIZE = 32U };
+enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 256U };
+enum : size_t { QSR_PENDING_INITIAL_MAX_PACKETS = 8U };
+enum : time_t { QSR_PENDING_INITIAL_IDLE_SECONDS = 5 };
 
 typedef struct qsr_udp_send_item {
   uint8_t packet[QSR_MAX_DATAGRAM_SIZE];
@@ -38,6 +42,27 @@ typedef struct qsr_udp_sender {
   qsr_udp_send_item_t items[QSR_UDP_BATCH_SIZE];
   size_t count;
 } qsr_udp_sender_t;
+
+typedef struct qsr_pending_initial {
+  bool used;
+  struct sockaddr_storage source;
+  socklen_t source_len;
+  uint8_t dcid[QSR_MAX_QUIC_CID_LEN];
+  size_t dcid_len;
+  uint8_t scid[QSR_MAX_QUIC_CID_LEN];
+  size_t scid_len;
+  qsr_session_key_t cid_key;
+  qsr_crypto_stream_t crypto;
+  uint8_t packets[QSR_PENDING_INITIAL_MAX_PACKETS][QSR_MAX_DATAGRAM_SIZE];
+  size_t packet_lens[QSR_PENDING_INITIAL_MAX_PACKETS];
+  size_t packet_count;
+  time_t last_seen;
+} qsr_pending_initial_t;
+
+typedef struct qsr_pending_initial_table {
+  qsr_pending_initial_t entries[QSR_PENDING_INITIAL_CAPACITY];
+  size_t next_evict;
+} qsr_pending_initial_table_t;
 
 /*
  * Set by SIGINT/SIGTERM handler; the dataplane loop checks it between
@@ -203,6 +228,92 @@ static void debug_packet_decision(const char *decision, const uint8_t *packet, s
                 packet_kind(packet, packet_len), packet_len, src, source_is_backend ? 1 : 0, dst, status);
 }
 
+[[nodiscard]] static bool pending_initial_matches(const qsr_pending_initial_t *entry,
+                                                  const struct sockaddr_storage *source, socklen_t source_len,
+                                                  const qsr_quic_initial_t *initial) {
+  return entry->used && entry->source_len == source_len && memcmp(&entry->source, source, source_len) == 0 &&
+         entry->dcid_len == initial->dcid_len && entry->scid_len == initial->scid_len &&
+         memcmp(entry->dcid, initial->dcid, initial->dcid_len) == 0 &&
+         memcmp(entry->scid, initial->scid, initial->scid_len) == 0;
+}
+
+static qsr_pending_initial_t *pending_initial_get(qsr_pending_initial_table_t *table,
+                                                  const struct sockaddr_storage *source, socklen_t source_len,
+                                                  const qsr_quic_initial_t *initial, time_t now) {
+  for (size_t i = 0U; i < QSR_PENDING_INITIAL_CAPACITY; i++) {
+    if (pending_initial_matches(&table->entries[i], source, source_len, initial)) {
+      table->entries[i].last_seen = now;
+      return &table->entries[i];
+    }
+  }
+  for (size_t i = 0U; i < QSR_PENDING_INITIAL_CAPACITY; i++) {
+    if (!table->entries[i].used) {
+      qsr_pending_initial_t *entry = &table->entries[i];
+      memset(entry, 0, sizeof(*entry));
+      entry->used = true;
+      memcpy(&entry->source, source, sizeof(*source));
+      entry->source_len = source_len;
+      memcpy(entry->dcid, initial->dcid, initial->dcid_len);
+      entry->dcid_len = initial->dcid_len;
+      memcpy(entry->scid, initial->scid, initial->scid_len);
+      entry->scid_len = initial->scid_len;
+      entry->cid_key = qsr_session_cid_key(initial->dcid, initial->dcid_len, initial->scid, initial->scid_len);
+      qsr_crypto_stream_init(&entry->crypto);
+      entry->last_seen = now;
+      return entry;
+    }
+  }
+
+  qsr_pending_initial_t *entry = &table->entries[table->next_evict++ % QSR_PENDING_INITIAL_CAPACITY];
+  memset(entry, 0, sizeof(*entry));
+  entry->used = true;
+  memcpy(&entry->source, source, sizeof(*source));
+  entry->source_len = source_len;
+  memcpy(entry->dcid, initial->dcid, initial->dcid_len);
+  entry->dcid_len = initial->dcid_len;
+  memcpy(entry->scid, initial->scid, initial->scid_len);
+  entry->scid_len = initial->scid_len;
+  entry->cid_key = qsr_session_cid_key(initial->dcid, initial->dcid_len, initial->scid, initial->scid_len);
+  qsr_crypto_stream_init(&entry->crypto);
+  entry->last_seen = now;
+  return entry;
+}
+
+static void pending_initial_remove(qsr_pending_initial_table_t *table, const qsr_pending_initial_t *entry) {
+  if (entry == nullptr) {
+    return;
+  }
+  const size_t index = (size_t)(entry - table->entries);
+  if (index < QSR_PENDING_INITIAL_CAPACITY) {
+    memset(&table->entries[index], 0, sizeof(table->entries[index]));
+  }
+}
+
+static void pending_initial_expire(qsr_pending_initial_table_t *table, time_t now) {
+  for (size_t i = 0U; i < QSR_PENDING_INITIAL_CAPACITY; i++) {
+    if (table->entries[i].used && now - table->entries[i].last_seen >= QSR_PENDING_INITIAL_IDLE_SECONDS) {
+      memset(&table->entries[i], 0, sizeof(table->entries[i]));
+    }
+  }
+}
+
+static void pending_initial_append_packet(qsr_pending_initial_t *entry, const uint8_t *packet, size_t packet_len) {
+  if (entry == nullptr || packet == nullptr || packet_len > QSR_MAX_DATAGRAM_SIZE) {
+    return;
+  }
+  for (size_t i = 0U; i < entry->packet_count; i++) {
+    if (entry->packet_lens[i] == packet_len && memcmp(entry->packets[i], packet, packet_len) == 0) {
+      return;
+    }
+  }
+  if (entry->packet_count >= QSR_PENDING_INITIAL_MAX_PACKETS) {
+    return;
+  }
+  memcpy(entry->packets[entry->packet_count], packet, packet_len);
+  entry->packet_lens[entry->packet_count] = packet_len;
+  entry->packet_count++;
+}
+
 [[nodiscard]] static qsr_status_t split_listen(const char *listen, char *host, size_t host_len, char *port,
                                                size_t port_len) {
   const char *colon = strrchr(listen, ':');
@@ -225,9 +336,38 @@ static void debug_packet_decision(const char *decision, const uint8_t *packet, s
   return QSR_OK;
 }
 
-[[nodiscard]] static qsr_status_t route_initial_datagram(const qsr_config_t *config, const uint8_t *packet,
-                                                         size_t packet_len, struct sockaddr_storage *backend,
-                                                         socklen_t *backend_len, qsr_session_key_t *cid_key) {
+[[nodiscard]] static qsr_status_t route_crypto_stream(const qsr_config_t *config, const qsr_crypto_stream_t *crypto,
+                                                      struct sockaddr_storage *backend, socklen_t *backend_len) {
+  const size_t contiguous_len = qsr_crypto_stream_contiguous_len(crypto);
+  if (contiguous_len == 0U) {
+    return QSR_ERR_TRUNCATED;
+  }
+
+  qsr_sni_t sni;
+  qsr_status_t status = qsr_tls_client_hello_sni(crypto->data, contiguous_len, &sni);
+  if (status != QSR_OK) {
+    return status;
+  }
+
+  const qsr_route_t *route = qsr_route_table_lookup(&config->routes, sni.name);
+  if (route == nullptr) {
+    return QSR_ERR_NOT_FOUND;
+  }
+  if (!route->backend_resolved) {
+    return QSR_ERR_INVALID;
+  }
+  memcpy(backend, &route->backend_addr, sizeof(*backend));
+  *backend_len = route->backend_addr_len;
+  return QSR_OK;
+}
+
+[[nodiscard]] static qsr_status_t route_initial_datagram(const qsr_config_t *config,
+                                                         qsr_pending_initial_table_t *pending_initials,
+                                                         const uint8_t *packet, size_t packet_len,
+                                                         const struct sockaddr_storage *source, socklen_t source_len,
+                                                         time_t now, struct sockaddr_storage *backend,
+                                                         socklen_t *backend_len, qsr_session_key_t *cid_key,
+                                                         qsr_pending_initial_t **pending_entry) {
   qsr_quic_initial_t initial;
   qsr_status_t status = qsr_quic_parse_initial(packet, packet_len, &initial);
   if (status != QSR_OK) {
@@ -250,22 +390,16 @@ static void debug_packet_decision(const char *decision, const uint8_t *packet, s
     return status;
   }
 
-  qsr_sni_t sni;
-  status = qsr_tls_client_hello_sni(crypto.data, crypto.len, &sni);
-  if (status != QSR_OK) {
-    return status;
+  qsr_pending_initial_t *entry = pending_initial_get(pending_initials, source, source_len, &initial, now);
+  pending_initial_append_packet(entry, packet, packet_len);
+  qsr_crypto_stream_merge(&entry->crypto, &crypto);
+  if (pending_entry != nullptr) {
+    *pending_entry = entry;
   }
-
-  const qsr_route_t *route = qsr_route_table_lookup(&config->routes, sni.name);
-  if (route == nullptr) {
-    return QSR_ERR_NOT_FOUND;
+  if (cid_key != nullptr) {
+    *cid_key = entry->cid_key;
   }
-  if (!route->backend_resolved) {
-    return QSR_ERR_INVALID;
-  }
-  memcpy(backend, &route->backend_addr, sizeof(*backend));
-  *backend_len = route->backend_addr_len;
-  return QSR_OK;
+  return route_crypto_stream(config, &entry->crypto, backend, backend_len);
 }
 
 static void put_alias(qsr_session_table_t *sessions, const qsr_session_key_t *key, const struct sockaddr_storage *dest,
@@ -447,8 +581,9 @@ static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_k
   (void)qsr_session_table_put(sessions, new_tuple_key, backend, backend_len, now);
 }
 
-static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_t *sessions, qsr_udp_sender_t *sender,
-                          int fd, const uint8_t *packet, size_t packet_len, const struct sockaddr_storage *source,
+static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_t *sessions,
+                          qsr_pending_initial_table_t *pending_initials, qsr_udp_sender_t *sender, int fd,
+                          const uint8_t *packet, size_t packet_len, const struct sockaddr_storage *source,
                           socklen_t source_len, time_t now) {
   qsr_session_key_t key = qsr_session_tuple_key(source, source_len);
   qsr_session_t *session = nullptr;
@@ -598,9 +733,11 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
     struct sockaddr_storage backend;
     socklen_t backend_len = 0;
     qsr_session_key_t cid_key;
-    qsr_status_t status = route_initial_datagram(runtime_config, packet, packet_len, &backend, &backend_len, &cid_key);
+    qsr_pending_initial_t *pending_entry = nullptr;
+    qsr_status_t status = route_initial_datagram(runtime_config, pending_initials, packet, packet_len, source,
+                                                source_len, now, &backend, &backend_len, &cid_key, &pending_entry);
     if (status != QSR_OK) {
-      debug_packet_decision("drop_initial_route", packet, packet_len, source, source_len, nullptr, 0, source_is_backend,
+      debug_packet_decision("buffer_initial", packet, packet_len, source, source_len, nullptr, 0, source_is_backend,
                             (int)status);
       return;
     }
@@ -619,6 +756,17 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
       return;
     }
     decision = "fresh_sni";
+    qsr_session_key_t reverse_key = qsr_session_tuple_key(&backend, backend_len);
+    (void)qsr_session_table_put(sessions, &reverse_key, source, source_len, now);
+    if (pending_entry != nullptr) {
+      for (size_t i = 0U; i < pending_entry->packet_count; i++) {
+        debug_packet_decision(decision, pending_entry->packets[i], pending_entry->packet_lens[i], source, source_len,
+                              &backend, backend_len, source_is_backend, 0);
+        sender_enqueue(sender, fd, pending_entry->packets[i], pending_entry->packet_lens[i], &backend, backend_len);
+      }
+      pending_initial_remove(pending_initials, pending_entry);
+      return;
+    }
   }
 
   session->last_seen = now;
@@ -802,6 +950,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
 
   time_t last_expire = monotonic_now();
   qsr_udp_sender_t sender;
+  qsr_pending_initial_table_t pending_initials = {0};
   sender_init(&sender);
   while (!g_stop) {
 #ifdef __linux__
@@ -832,6 +981,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         if (sweep_now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
           (void)qsr_session_table_expire(&runtime.sessions, sweep_now,
                                          (time_t)runtime.config.idle_timeout_seconds);
+          pending_initial_expire(&pending_initials, sweep_now);
           last_expire = sweep_now;
         }
         continue;
@@ -844,8 +994,8 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
       if (messages[i].msg_len == 0U || messages[i].msg_len > QSR_MAX_DATAGRAM_SIZE) {
         continue;
       }
-      handle_packet(&runtime.config, &runtime.sessions, &sender, fd, packets[i], messages[i].msg_len, &sources[i],
-                    messages[i].msg_hdr.msg_namelen, now);
+      handle_packet(&runtime.config, &runtime.sessions, &pending_initials, &sender, fd, packets[i], messages[i].msg_len,
+                    &sources[i], messages[i].msg_hdr.msg_namelen, now);
     }
     sender_flush(&sender, fd);
 #else
@@ -865,11 +1015,13 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     }
 
     const time_t now = monotonic_now();
-    handle_packet(&runtime.config, &runtime.sessions, &sender, fd, packet, (size_t)received, &source, source_len, now);
+    handle_packet(&runtime.config, &runtime.sessions, &pending_initials, &sender, fd, packet, (size_t)received, &source,
+                  source_len, now);
     sender_flush(&sender, fd);
 #endif
     if (now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
       (void)qsr_session_table_expire(&runtime.sessions, now, (time_t)runtime.config.idle_timeout_seconds);
+      pending_initial_expire(&pending_initials, now);
       last_expire = now;
     }
   }

@@ -14,10 +14,13 @@
 
 typedef struct qsr_crypto_stream {
   uint8_t data[QSR_MAX_CLIENT_HELLO_SIZE];
+  uint8_t received[QSR_MAX_CLIENT_HELLO_SIZE];
   size_t len;
 } qsr_crypto_stream_t;
 
 void qsr_crypto_stream_init(qsr_crypto_stream_t *stream);
+void qsr_crypto_stream_merge(qsr_crypto_stream_t *dest, const qsr_crypto_stream_t *src);
+[[nodiscard]] size_t qsr_crypto_stream_contiguous_len(const qsr_crypto_stream_t *stream);
 qsr_status_t qsr_quic_extract_crypto(const uint8_t *plaintext, size_t plaintext_len, qsr_crypto_stream_t *stream);
 
 #endif

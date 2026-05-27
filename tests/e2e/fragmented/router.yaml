@@ -1,0 +1,9 @@
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 60s
+  maxSessions: 100000
+routes:
+  fragmented.flightdeck.test:
+    host: marker-backend
+    port: 8443
