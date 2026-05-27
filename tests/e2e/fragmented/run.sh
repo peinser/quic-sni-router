@@ -48,9 +48,16 @@ if [ -z "${router_ip}" ]; then
   dump_logs
   exit 1
 fi
+case "${router_ip}" in
+  *[!0-9.]*|*.*.*.*.*|.*|*.)
+    echo "router container returned unusable IPv4 address: ${router_ip}" >&2
+    dump_logs
+    exit 1
+    ;;
+esac
 
 if ! docker run --name "${project}-client" --network "${network}" \
-  "${http3_image}" python /app/fragmented_initial_client.py --router-host router --router-port 443; then
+  "${http3_image}" python /app/fragmented_initial_client.py --router-host "${router_ip}" --router-port 443; then
   dump_logs
   exit 1
 fi

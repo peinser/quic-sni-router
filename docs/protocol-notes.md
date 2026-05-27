@@ -43,6 +43,8 @@ The CRYPTO extractor accepts the frame types legal in Initial space:
 
 Anything else returns `QSR_ERR_UNSUPPORTED` and the datagram is dropped. The reassembly buffer is bounded at `QSR_MAX_CLIENT_HELLO_SIZE` (8 KiB) - a real ClientHello, even with the QUIC `quic_transport_parameters` extension, fits comfortably below this.
 
+If a fresh client Initial decrypts cleanly but does not yet contain enough contiguous CRYPTO bytes to read SNI, the router keeps a bounded pending entry keyed by source tuple plus Initial DCID/SCID. Later Initial datagrams for that key are merged into the same CRYPTO stream; once SNI is available, all buffered original datagrams are forwarded unchanged to the selected backend. Pending entries are capped at 64 concurrent entries, 8 datagrams per entry, 1500 bytes per datagram, and expire after 5 seconds of inactivity.
+
 ## Session pinning and rebinding
 
 - Tuple alias (client `(addr,port)` -> backend) is the fast path.

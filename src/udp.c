@@ -27,7 +27,7 @@
 
 enum : int { QSR_EXPIRE_SWEEP_INTERVAL_SECONDS = 1 };
 enum : unsigned { QSR_UDP_BATCH_SIZE = 32U };
-enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 256U };
+enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 64U };
 enum : size_t { QSR_PENDING_INITIAL_MAX_PACKETS = 8U };
 enum : time_t { QSR_PENDING_INITIAL_IDLE_SECONDS = 5 };
 
@@ -950,7 +950,15 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
 
   time_t last_expire = monotonic_now();
   qsr_udp_sender_t sender;
-  qsr_pending_initial_table_t pending_initials = {0};
+  qsr_pending_initial_table_t *pending_initials = calloc(1U, sizeof(*pending_initials));
+  if (pending_initials == nullptr) {
+    (void)close(fd);
+    qsr_runtime_free(&runtime);
+#ifdef __linux__
+    (void)close(epoll_fd);
+#endif
+    return QSR_ERR_FULL;
+  }
   sender_init(&sender);
   while (!g_stop) {
 #ifdef __linux__
@@ -981,7 +989,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         if (sweep_now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
           (void)qsr_session_table_expire(&runtime.sessions, sweep_now,
                                          (time_t)runtime.config.idle_timeout_seconds);
-          pending_initial_expire(&pending_initials, sweep_now);
+          pending_initial_expire(pending_initials, sweep_now);
           last_expire = sweep_now;
         }
         continue;
@@ -994,7 +1002,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
       if (messages[i].msg_len == 0U || messages[i].msg_len > QSR_MAX_DATAGRAM_SIZE) {
         continue;
       }
-      handle_packet(&runtime.config, &runtime.sessions, &pending_initials, &sender, fd, packets[i], messages[i].msg_len,
+      handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, packets[i], messages[i].msg_len,
                     &sources[i], messages[i].msg_hdr.msg_namelen, now);
     }
     sender_flush(&sender, fd);
@@ -1015,19 +1023,20 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     }
 
     const time_t now = monotonic_now();
-    handle_packet(&runtime.config, &runtime.sessions, &pending_initials, &sender, fd, packet, (size_t)received, &source,
+    handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, packet, (size_t)received, &source,
                   source_len, now);
     sender_flush(&sender, fd);
 #endif
     if (now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
       (void)qsr_session_table_expire(&runtime.sessions, now, (time_t)runtime.config.idle_timeout_seconds);
-      pending_initial_expire(&pending_initials, now);
+      pending_initial_expire(pending_initials, now);
       last_expire = now;
     }
   }
 
   sender_flush(&sender, fd);
   fprintf(stderr, "quic-sni-router: shutting down\n");
+  free(pending_initials);
   qsr_runtime_free(&runtime);
 #ifdef __linux__
   (void)close(epoll_fd);
