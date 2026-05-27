@@ -20,9 +20,6 @@
 #include <arpa/inet.h>
 
 #ifdef __linux__
-#include <linux/io_uring.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -35,16 +32,6 @@ enum : size_t { QSR_SESSION_EXPIRE_MAX_SCAN = 16384U };
 enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 64U };
 enum : size_t { QSR_PENDING_INITIAL_MAX_PACKETS = 8U };
 enum : time_t { QSR_PENDING_INITIAL_IDLE_SECONDS = 5 };
-
-#ifdef __linux__
-enum : unsigned { QSR_URING_RECV_BUFFERS = 128U };
-enum : unsigned { QSR_URING_RECV_BGID = 7U };
-enum : uint64_t { QSR_URING_MULTISHOT_USER_DATA = UINT64_MAX };
-enum : size_t {
-  QSR_URING_RECV_BUFFER_SIZE =
-      sizeof(struct io_uring_recvmsg_out) + sizeof(struct sockaddr_storage) + QSR_MAX_DATAGRAM_SIZE
-};
-#endif
 
 typedef struct qsr_udp_send_item {
   uint8_t packet[QSR_MAX_DATAGRAM_SIZE];
@@ -78,278 +65,6 @@ typedef struct qsr_pending_initial_table {
   qsr_pending_initial_t entries[QSR_PENDING_INITIAL_CAPACITY];
   size_t next_evict;
 } qsr_pending_initial_table_t;
-
-#ifdef __linux__
-typedef struct qsr_uring {
-  int fd;
-  bool recv_poll_first;
-  struct io_uring_buf_ring *recv_buf_ring;
-  size_t recv_buf_ring_sz;
-  uint8_t *recv_buffers;
-  uint16_t recv_buf_tail;
-  void *sq_ring;
-  size_t sq_ring_sz;
-  void *cq_ring;
-  size_t cq_ring_sz;
-  struct io_uring_sqe *sqes;
-  size_t sqes_sz;
-  unsigned *sq_head;
-  unsigned *sq_tail;
-  unsigned *sq_ring_mask;
-  unsigned *sq_ring_entries;
-  unsigned *sq_array;
-  unsigned *cq_head;
-  unsigned *cq_tail;
-  unsigned *cq_ring_mask;
-  struct io_uring_cqe *cqes;
-} qsr_uring_t;
-
-static int qsr_io_uring_setup(unsigned entries, struct io_uring_params *params) {
-  return (int)syscall(__NR_io_uring_setup, entries, params);
-}
-
-static int qsr_io_uring_enter(int ring_fd, unsigned to_submit, unsigned min_complete, unsigned flags) {
-  return (int)syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, nullptr, 0U);
-}
-
-static int qsr_io_uring_register(int ring_fd, unsigned opcode, const void *arg, unsigned nr_args) {
-  return (int)syscall(__NR_io_uring_register, ring_fd, opcode, arg, nr_args);
-}
-
-static void qsr_uring_close(qsr_uring_t *ring) {
-  if (ring == nullptr) {
-    return;
-  }
-  if (ring->fd >= 0 && ring->recv_buf_ring != nullptr) {
-    const struct io_uring_buf_reg reg = {.bgid = QSR_URING_RECV_BGID};
-    (void)qsr_io_uring_register(ring->fd, IORING_UNREGISTER_PBUF_RING, &reg, 1U);
-  }
-  if (ring->recv_buf_ring != MAP_FAILED && ring->recv_buf_ring != nullptr) {
-    (void)munmap(ring->recv_buf_ring, ring->recv_buf_ring_sz);
-  }
-  free(ring->recv_buffers);
-  if (ring->sqes != MAP_FAILED && ring->sqes != nullptr) {
-    (void)munmap(ring->sqes, ring->sqes_sz);
-  }
-  if (ring->cq_ring != MAP_FAILED && ring->cq_ring != nullptr && ring->cq_ring != ring->sq_ring) {
-    (void)munmap(ring->cq_ring, ring->cq_ring_sz);
-  }
-  if (ring->sq_ring != MAP_FAILED && ring->sq_ring != nullptr) {
-    (void)munmap(ring->sq_ring, ring->sq_ring_sz);
-  }
-  if (ring->fd >= 0) {
-    (void)close(ring->fd);
-  }
-  memset(ring, 0, sizeof(*ring));
-  ring->fd = -1;
-}
-
-static void qsr_uring_buf_ring_add(qsr_uring_t *ring, uint16_t bid, uint16_t offset) {
-  struct io_uring_buf *buf = &ring->recv_buf_ring->bufs[(ring->recv_buf_tail + offset) & (QSR_URING_RECV_BUFFERS - 1U)];
-  buf->addr = (uint64_t)(uintptr_t)&ring->recv_buffers[(size_t)bid * QSR_URING_RECV_BUFFER_SIZE];
-  buf->len = QSR_URING_RECV_BUFFER_SIZE;
-  buf->bid = bid;
-  buf->resv = 0;
-}
-
-static void qsr_uring_buf_ring_advance(qsr_uring_t *ring, uint16_t count) {
-  ring->recv_buf_tail = (uint16_t)(ring->recv_buf_tail + count);
-  __atomic_store_n(&ring->recv_buf_ring->tail, ring->recv_buf_tail, __ATOMIC_RELEASE);
-}
-
-[[nodiscard]] static qsr_status_t qsr_uring_register_recv_buffers(qsr_uring_t *ring) {
-  if (ring == nullptr || ring->fd < 0) {
-    return QSR_ERR_INVALID;
-  }
-  ring->recv_buffers = calloc(QSR_URING_RECV_BUFFERS, QSR_URING_RECV_BUFFER_SIZE);
-  if (ring->recv_buffers == nullptr) {
-    return QSR_ERR_FULL;
-  }
-
-  struct io_uring_buf_reg reg = {
-      .ring_entries = QSR_URING_RECV_BUFFERS,
-      .bgid = QSR_URING_RECV_BGID,
-      .flags = IOU_PBUF_RING_MMAP,
-  };
-  if (qsr_io_uring_register(ring->fd, IORING_REGISTER_PBUF_RING, &reg, 1U) < 0) {
-    free(ring->recv_buffers);
-    ring->recv_buffers = nullptr;
-    return QSR_ERR_UNSUPPORTED;
-  }
-
-  ring->recv_buf_ring_sz = (size_t)QSR_URING_RECV_BUFFERS * sizeof(struct io_uring_buf);
-  ring->recv_buf_ring = mmap(nullptr, ring->recv_buf_ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                             ring->fd, IORING_OFF_PBUF_RING | (QSR_URING_RECV_BGID << IORING_OFF_PBUF_SHIFT));
-  if (ring->recv_buf_ring == MAP_FAILED) {
-    const struct io_uring_buf_reg unregister_reg = {.bgid = QSR_URING_RECV_BGID};
-    (void)qsr_io_uring_register(ring->fd, IORING_UNREGISTER_PBUF_RING, &unregister_reg, 1U);
-    free(ring->recv_buffers);
-    ring->recv_buffers = nullptr;
-    ring->recv_buf_ring = nullptr;
-    return QSR_ERR_UNSUPPORTED;
-  }
-
-  ring->recv_buf_tail = 0;
-  for (size_t i = 0U; i < QSR_URING_RECV_BUFFERS; i++) {
-    qsr_uring_buf_ring_add(ring, (uint16_t)i, (uint16_t)i);
-  }
-  qsr_uring_buf_ring_advance(ring, QSR_URING_RECV_BUFFERS);
-  return QSR_OK;
-}
-
-[[nodiscard]] static qsr_status_t qsr_uring_recvmsg_multishot(qsr_uring_t *ring, int fd, struct msghdr *message) {
-  const unsigned head = __atomic_load_n(ring->sq_head, __ATOMIC_ACQUIRE);
-  const unsigned tail = __atomic_load_n(ring->sq_tail, __ATOMIC_RELAXED);
-  if (tail - head >= *ring->sq_ring_entries) {
-    return QSR_ERR_FULL;
-  }
-  const unsigned index = tail & *ring->sq_ring_mask;
-  struct io_uring_sqe *sqe = &ring->sqes[index];
-  memset(sqe, 0, sizeof(*sqe));
-  sqe->opcode = IORING_OP_RECVMSG;
-  sqe->flags = IOSQE_BUFFER_SELECT;
-  sqe->ioprio = IORING_RECV_MULTISHOT;
-  if (ring->recv_poll_first) {
-    sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
-  }
-  sqe->fd = fd;
-  sqe->addr = (uint64_t)(uintptr_t)message;
-  sqe->len = 1U;
-  sqe->msg_flags = 0U;
-  sqe->user_data = QSR_URING_MULTISHOT_USER_DATA;
-  sqe->buf_group = QSR_URING_RECV_BGID;
-  ring->sq_array[index] = index;
-  __atomic_store_n(ring->sq_tail, tail + 1U, __ATOMIC_RELEASE);
-  return QSR_OK;
-}
-
-[[nodiscard]] static qsr_status_t qsr_uring_init(qsr_uring_t *ring, unsigned entries) {
-  if (ring == nullptr || entries == 0U) {
-    return QSR_ERR_INVALID;
-  }
-  memset(ring, 0, sizeof(*ring));
-  ring->fd = -1;
-  ring->recv_poll_first = true;
-  struct io_uring_params params = {0};
-  const int fd = qsr_io_uring_setup(entries, &params);
-  if (fd < 0) {
-    return QSR_ERR_INVALID;
-  }
-  ring->fd = fd;
-
-  ring->sq_ring_sz = params.sq_off.array + (size_t)params.sq_entries * sizeof(unsigned);
-  ring->cq_ring_sz = params.cq_off.cqes + (size_t)params.cq_entries * sizeof(struct io_uring_cqe);
-  if ((params.features & IORING_FEAT_SINGLE_MMAP) != 0U && ring->cq_ring_sz > ring->sq_ring_sz) {
-    ring->sq_ring_sz = ring->cq_ring_sz;
-  }
-  ring->sq_ring = mmap(nullptr, ring->sq_ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd,
-                       IORING_OFF_SQ_RING);
-  if (ring->sq_ring == MAP_FAILED) {
-    qsr_uring_close(ring);
-    return QSR_ERR_INVALID;
-  }
-  if ((params.features & IORING_FEAT_SINGLE_MMAP) != 0U) {
-    ring->cq_ring = ring->sq_ring;
-  } else {
-    ring->cq_ring = mmap(nullptr, ring->cq_ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd,
-                         IORING_OFF_CQ_RING);
-    if (ring->cq_ring == MAP_FAILED) {
-      qsr_uring_close(ring);
-      return QSR_ERR_INVALID;
-    }
-  }
-  ring->sqes_sz = (size_t)params.sq_entries * sizeof(struct io_uring_sqe);
-  ring->sqes = mmap(nullptr, ring->sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
-  if (ring->sqes == MAP_FAILED) {
-    qsr_uring_close(ring);
-    return QSR_ERR_INVALID;
-  }
-
-  char *sq = ring->sq_ring;
-  char *cq = ring->cq_ring;
-  ring->sq_head = (unsigned *)(sq + params.sq_off.head);
-  ring->sq_tail = (unsigned *)(sq + params.sq_off.tail);
-  ring->sq_ring_mask = (unsigned *)(sq + params.sq_off.ring_mask);
-  ring->sq_ring_entries = (unsigned *)(sq + params.sq_off.ring_entries);
-  ring->sq_array = (unsigned *)(sq + params.sq_off.array);
-  ring->cq_head = (unsigned *)(cq + params.cq_off.head);
-  ring->cq_tail = (unsigned *)(cq + params.cq_off.tail);
-  ring->cq_ring_mask = (unsigned *)(cq + params.cq_off.ring_mask);
-  ring->cqes = (struct io_uring_cqe *)(cq + params.cq_off.cqes);
-  return QSR_OK;
-}
-
-[[nodiscard]] static qsr_status_t qsr_uring_submit(qsr_uring_t *ring) {
-  for (;;) {
-    const unsigned head = __atomic_load_n(ring->sq_head, __ATOMIC_ACQUIRE);
-    const unsigned tail = __atomic_load_n(ring->sq_tail, __ATOMIC_ACQUIRE);
-    const unsigned pending = tail - head;
-    if (pending == 0U) {
-      return QSR_OK;
-    }
-    const int submitted = qsr_io_uring_enter(ring->fd, pending, 0U, 0U);
-    if (submitted > 0) {
-      continue;
-    }
-    if (submitted == 0) {
-      errno = EIO;
-      return QSR_ERR_INVALID;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    return QSR_ERR_INVALID;
-  }
-}
-
-[[nodiscard]] static struct io_uring_cqe *qsr_uring_peek_cqe(qsr_uring_t *ring) {
-  const unsigned head = __atomic_load_n(ring->cq_head, __ATOMIC_ACQUIRE);
-  const unsigned tail = __atomic_load_n(ring->cq_tail, __ATOMIC_ACQUIRE);
-  if (head == tail) {
-    return nullptr;
-  }
-  return &ring->cqes[head & *ring->cq_ring_mask];
-}
-
-static void qsr_uring_cqe_seen(qsr_uring_t *ring) {
-  const unsigned head = __atomic_load_n(ring->cq_head, __ATOMIC_RELAXED);
-  __atomic_store_n(ring->cq_head, head + 1U, __ATOMIC_RELEASE);
-}
-
-[[nodiscard]] static struct io_uring_recvmsg_out *qsr_uring_recvmsg_validate(void *buffer, int buffer_len,
-                                                                              const struct msghdr *message) {
-  if (buffer_len < 0 || (size_t)buffer_len < sizeof(struct io_uring_recvmsg_out)) {
-    return nullptr;
-  }
-  if (buffer == nullptr || message == nullptr) {
-    return nullptr;
-  }
-  const size_t len = (size_t)buffer_len;
-  const size_t header_len = sizeof(struct io_uring_recvmsg_out);
-  if (message->msg_namelen > len - header_len) {
-    return nullptr;
-  }
-  if (message->msg_controllen > len - header_len - message->msg_namelen) {
-    return nullptr;
-  }
-  return (struct io_uring_recvmsg_out *)buffer;
-}
-
-[[nodiscard]] static void *qsr_uring_recvmsg_payload(struct io_uring_recvmsg_out *out,
-                                                      const struct msghdr *message) {
-  return (uint8_t *)(out + 1) + message->msg_namelen + message->msg_controllen;
-}
-
-[[nodiscard]] static size_t qsr_uring_recvmsg_payload_length(struct io_uring_recvmsg_out *out, int buffer_len,
-                                                             const struct msghdr *message) {
-  const uintptr_t payload_start = (uintptr_t)qsr_uring_recvmsg_payload(out, message);
-  const uintptr_t payload_end = (uintptr_t)out + (size_t)buffer_len;
-  if (payload_start >= payload_end) {
-    return 0U;
-  }
-  return (size_t)(payload_end - payload_start);
-}
-#endif
 
 /*
  * Set by SIGINT/SIGTERM handler; the dataplane loop checks it between
@@ -406,7 +121,7 @@ static void sender_flush(qsr_udp_sender_t *sender, int fd) {
   }
   size_t sent = 0U;
   while (sent < sender->count) {
-    const int result = sendmmsg(fd, &messages[sent], (unsigned int)(sender->count - sent), MSG_DONTWAIT);
+    const int result = sendmmsg(fd, &messages[sent], (unsigned int)(sender->count - sent), 0);
     if (result < 0) {
       if (errno == EINTR) {
         continue;
@@ -415,9 +130,6 @@ static void sender_flush(qsr_udp_sender_t *sender, int fd) {
        * EAGAIN/ENOBUFS on a saturated send queue is best treated as a drop:
        * QUIC has its own loss recovery and retransmits.
        */
-      break;
-    }
-    if (result == 0) {
       break;
     }
     sent += (size_t)result;
@@ -862,14 +574,6 @@ static void learn_long_header_cids(qsr_session_table_t *sessions, const uint8_t 
   return QSR_OK;
 }
 
-[[nodiscard]] static qsr_status_t set_blocking(int fd) {
-  const int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
-    return QSR_ERR_INVALID;
-  }
-  return QSR_OK;
-}
-
 [[nodiscard]] static qsr_status_t wait_readable(int epoll_fd) {
   struct epoll_event event = {0};
   for (;;) {
@@ -1232,31 +936,15 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     qsr_runtime_free(&runtime);
     return QSR_ERR_INVALID;
   }
-  qsr_uring_t uring;
-  if (qsr_uring_init(&uring, QSR_UDP_BATCH_SIZE * 2U) != QSR_OK) {
-    fprintf(stderr, "quic-sni-router: io_uring setup failed: %s\n", strerror(errno));
-    (void)close(fd);
-    qsr_runtime_free(&runtime);
-    return QSR_ERR_INVALID;
-  }
-  if (qsr_uring_register_recv_buffers(&uring) != QSR_OK) {
-    fprintf(stderr, "quic-sni-router: io_uring multishot receive buffers unavailable: %s\n", strerror(errno));
-    qsr_uring_close(&uring);
-    (void)close(fd);
-    qsr_runtime_free(&runtime);
-    return QSR_ERR_UNSUPPORTED;
-  }
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0) {
-    qsr_uring_close(&uring);
     (void)close(fd);
     qsr_runtime_free(&runtime);
     return QSR_ERR_INVALID;
   }
-  struct epoll_event event = {.events = EPOLLIN, .data.fd = uring.fd};
-  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, uring.fd, &event) < 0) {
+  struct epoll_event event = {.events = EPOLLIN, .data.fd = fd};
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
     (void)close(epoll_fd);
-    qsr_uring_close(&uring);
     (void)close(fd);
     qsr_runtime_free(&runtime);
     return QSR_ERR_INVALID;
@@ -1280,7 +968,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
           runtime.config.routes.count);
   qsr_runtime_log_routes("startup:", &runtime.config.routes);
 #ifdef __linux__
-  fprintf(stderr, "quic-sni-router dataplane: io_uring recvmsg + sendmmsg\n");
+  fprintf(stderr, "quic-sni-router dataplane: epoll + recvmmsg/sendmmsg\n");
 #else
   fprintf(stderr, "quic-sni-router dataplane: recvfrom/sendto\n");
 #endif
@@ -1292,127 +980,65 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     (void)close(fd);
     qsr_runtime_free(&runtime);
 #ifdef __linux__
-    qsr_uring_close(&uring);
     (void)close(epoll_fd);
 #endif
     return QSR_ERR_FULL;
   }
   sender_init(&sender);
 #ifdef __linux__
-  struct msghdr recv_message = {.msg_namelen = sizeof(struct sockaddr_storage), .msg_controllen = 0U};
-  if (qsr_uring_recvmsg_multishot(&uring, fd, &recv_message) != QSR_OK || qsr_uring_submit(&uring) != QSR_OK) {
-    fprintf(stderr, "quic-sni-router: io_uring multishot receive submit failed: %s\n", strerror(errno));
-    free(pending_initials);
-    qsr_runtime_free(&runtime);
-    qsr_uring_close(&uring);
-    (void)close(epoll_fd);
-    (void)close(fd);
-    return QSR_ERR_INVALID;
+  uint8_t packets[QSR_UDP_BATCH_SIZE][QSR_MAX_DATAGRAM_SIZE];
+  struct sockaddr_storage sources[QSR_UDP_BATCH_SIZE];
+  struct iovec iovecs[QSR_UDP_BATCH_SIZE];
+  struct mmsghdr messages[QSR_UDP_BATCH_SIZE];
+  memset(sources, 0, sizeof(sources));
+  memset(messages, 0, sizeof(messages));
+  for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
+    iovecs[i].iov_base = packets[i];
+    iovecs[i].iov_len = sizeof(packets[i]);
+    messages[i].msg_hdr.msg_iov = &iovecs[i];
+    messages[i].msg_hdr.msg_iovlen = 1U;
+    messages[i].msg_hdr.msg_name = &sources[i];
   }
 #endif
   while (!g_stop) {
 #ifdef __linux__
     qsr_runtime_poll(&runtime);
-    size_t completed = 0U;
-    bool uring_failed = false;
-    const struct io_uring_cqe *cqe;
-    while ((cqe = qsr_uring_peek_cqe(&uring)) != nullptr) {
-      const uint64_t user_data = cqe->user_data;
-      const int result = cqe->res;
-      const unsigned cqe_flags = cqe->flags;
-      qsr_uring_cqe_seen(&uring);
-      if (user_data != QSR_URING_MULTISHOT_USER_DATA) {
+    for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
+      messages[i].msg_len = 0U;
+      messages[i].msg_hdr.msg_namelen = sizeof(sources[i]);
+    }
+
+    int received_count = recvmmsg(fd, messages, QSR_UDP_BATCH_SIZE, 0, nullptr);
+    if (received_count < 0) {
+      if (errno == EINTR) {
         continue;
       }
-      const bool recv_armed = (cqe_flags & IORING_CQE_F_MORE) != 0U;
-      const time_t now = monotonic_now();
-      uint16_t buffer_id = 0U;
-      bool recycle_buffer = false;
-      if ((cqe_flags & IORING_CQE_F_BUFFER) != 0U) {
-        buffer_id = (uint16_t)(cqe_flags >> IORING_CQE_BUFFER_SHIFT);
-        recycle_buffer = buffer_id < QSR_URING_RECV_BUFFERS;
-      }
-      if (result >= 0) {
-        if (!recycle_buffer) {
-          fprintf(stderr, "quic-sni-router: io_uring recvmsg missing provided buffer\n");
-          uring_failed = true;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (wait_readable(epoll_fd) != QSR_OK) {
           break;
         }
-        void *buffer = &uring.recv_buffers[(size_t)buffer_id * QSR_URING_RECV_BUFFER_SIZE];
-        struct io_uring_recvmsg_out *out = qsr_uring_recvmsg_validate(buffer, result, &recv_message);
-        const size_t payload_len =
-            out == nullptr ? 0U : qsr_uring_recvmsg_payload_length(out, result, &recv_message);
-        if (out == nullptr || payload_len == 0U || payload_len > QSR_MAX_DATAGRAM_SIZE ||
-            out->namelen > sizeof(struct sockaddr_storage)) {
-          qsr_uring_buf_ring_add(&uring, buffer_id, 0U);
-          qsr_uring_buf_ring_advance(&uring, 1U);
-          if (!recv_armed &&
-              (qsr_uring_recvmsg_multishot(&uring, fd, &recv_message) != QSR_OK || qsr_uring_submit(&uring) != QSR_OK)) {
-            fprintf(stderr, "quic-sni-router: io_uring multishot receive requeue failed\n");
-            uring_failed = true;
-            break;
-          }
-          continue;
+        const time_t sweep_now = monotonic_now();
+        if (sweep_now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
+          (void)qsr_session_table_expire_incremental(&runtime.sessions, sweep_now,
+                                                     (time_t)runtime.config.idle_timeout_seconds,
+                                                     session_expire_scan_budget(&runtime.sessions));
+          pending_initial_expire(pending_initials, sweep_now);
+          last_expire = sweep_now;
         }
-        const struct sockaddr_storage *source = (const struct sockaddr_storage *)(out + 1);
-        const uint8_t *packet = qsr_uring_recvmsg_payload(out, &recv_message);
-        handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, packet,
-                      payload_len, source, (socklen_t)out->namelen, now);
-        qsr_uring_buf_ring_add(&uring, buffer_id, 0U);
-        qsr_uring_buf_ring_advance(&uring, 1U);
-      } else if (result == -EINVAL && uring.recv_poll_first) {
-        uring.recv_poll_first = false;
-        if (set_blocking(fd) != QSR_OK) {
-          fprintf(stderr, "quic-sni-router: failed to switch socket to blocking io_uring receives\n");
-          uring_failed = true;
-          break;
-        }
-        fprintf(stderr, "quic-sni-router: io_uring POLL_FIRST unsupported; using blocking recv SQEs\n");
-      } else if (result == -EAGAIN || result == -EWOULDBLOCK) {
-        /* POLL_FIRST should make this rare on idle sockets; re-arm without treating it as progress. */
-      } else {
-        errno = -result;
-        fprintf(stderr, "quic-sni-router: io_uring recvmsg failed: %s\n", strerror(errno));
-        uring_failed = true;
-        break;
+        continue;
       }
-      if (!recv_armed) {
-        if (qsr_uring_recvmsg_multishot(&uring, fd, &recv_message) != QSR_OK || qsr_uring_submit(&uring) != QSR_OK) {
-          fprintf(stderr, "quic-sni-router: io_uring multishot receive requeue failed: %s\n", strerror(errno));
-          uring_failed = true;
-          break;
-        }
-      }
-      if (result >= 0) {
-        completed++;
-      }
-    }
-    if (uring_failed) {
-      break;
-    }
-    if (completed > 0U) {
-      if (qsr_uring_submit(&uring) != QSR_OK) {
-        fprintf(stderr, "quic-sni-router: io_uring submit failed: %s\n", strerror(errno));
-        break;
-      }
-      sender_flush(&sender, fd);
-      const time_t now = monotonic_now();
-      if (now - last_expire >= QSR_EXPIRE_SWEEP_INTERVAL_SECONDS) {
-        (void)qsr_session_table_expire_incremental(&runtime.sessions, now, (time_t)runtime.config.idle_timeout_seconds,
-                                                   session_expire_scan_budget(&runtime.sessions));
-        pending_initial_expire(pending_initials, now);
-        last_expire = now;
-      }
-      continue;
-    }
-    if (qsr_uring_submit(&uring) != QSR_OK) {
-      fprintf(stderr, "quic-sni-router: io_uring submit failed: %s\n", strerror(errno));
-      break;
-    }
-    if (wait_readable(epoll_fd) != QSR_OK) {
+      perror("recvmmsg");
       break;
     }
     const time_t now = monotonic_now();
+    for (int i = 0; i < received_count; i++) {
+      if (messages[i].msg_len == 0U || messages[i].msg_len > QSR_MAX_DATAGRAM_SIZE) {
+        continue;
+      }
+      handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, packets[i], messages[i].msg_len,
+                    &sources[i], messages[i].msg_hdr.msg_namelen, now);
+    }
+    sender_flush(&sender, fd);
 #else
     uint8_t packet[QSR_MAX_DATAGRAM_SIZE];
     struct sockaddr_storage source = {0};
@@ -1447,7 +1073,6 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   free(pending_initials);
   qsr_runtime_free(&runtime);
 #ifdef __linux__
-  qsr_uring_close(&uring);
   (void)close(epoll_fd);
 #endif
   (void)close(fd);

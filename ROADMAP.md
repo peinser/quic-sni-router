@@ -13,7 +13,7 @@ What's planned, why it's worth doing, and what would block someone from picking 
 
 ## Mid term
 
-- **io_uring send path**. Linux receive now uses multishot `recvmsg` with provided buffers while sends remain on `sendmmsg`. Consider `io_uring` send, zerocopy send, or UDP segmentation only if end-to-end benchmarks show the send path is the bottleneck.
+- **io_uring fast path, done properly**. The earlier synchronous io_uring path was strictly slower than `recvmmsg`/`sendmmsg` and got removed. A real rewrite uses multishot recv (`IORING_RECV_MULTISHOT`), registered buffers, and zero-copy send. Worth doing once we have benchmarks that show user-space lookup is no longer the bottleneck.
 - **GSO/GRO (segmentation offload)**. Linux UDP supports send-side `UDP_SEGMENT` and recv-side `UDP_GRO`. For high-rate flows this is a 2-3x throughput win. Requires kernel ≥5.0 and `setsockopt(UDP_GRO, 1)`.
 - **HostName / SAN map per route**. SNIs are matched as-is today. For deployments with many SAN-aliased hostnames behind one backend, a `aliases: [a, b, c]` field would avoid repetition.
 - **Native multi-arch image builds (no QEMU)**. The image workflow currently cross-builds arm64 under QEMU. With on-prem arm64 runners + the matrix-and-merge pattern (which we had in an intermediate revision), the arm64 build runs natively at ~3× the speed.

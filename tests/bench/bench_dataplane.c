@@ -122,6 +122,6 @@ int main(void) {
   ok = bench_session_lookup() && ok;
   ok = bench_crypto_extract() && ok;
   printf("\nUser-space lookup/parsing costs only. Drive the live Linux UDP loop\n");
-  printf("(io_uring recvmsg + sendmmsg) with synthetic packets to measure end-to-end p99.\n");
+  printf("(recvmmsg/sendmmsg) with synthetic packets to measure end-to-end p99.\n");
   return ok ? 0 : 1;
 }

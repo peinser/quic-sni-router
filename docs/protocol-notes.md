@@ -173,7 +173,7 @@ new behaviour: backend packets use learned DCID -> correct client
 
 ## Dataplane
 
-- Linux: raw-syscall `io_uring` multishot `recvmsg` with a provided-buffer ring and `sendmmsg` send batching. Receive SQEs use `IORING_RECVSEND_POLL_FIRST` so idle requests poll instead of completing in an `EAGAIN` loop; kernels that reject that flag continue with blocking receive SQEs while sends remain `MSG_DONTWAIT`.
+- Linux: nonblocking UDP socket on `epoll`, batched `recvmmsg` for receive and `sendmmsg` for send. Up to 32 datagrams per syscall.
 - Linux socket receive/send buffers are raised best-effort to 4 MiB. The kernel may clamp this to `net.core.rmem_max` / `net.core.wmem_max`.
 - Other platforms: portable blocking `recvfrom`/`sendto` fallback.
 
@@ -184,4 +184,4 @@ new behaviour: backend packets use learned DCID -> correct client
 - Backend-source detection uses the route table's resolved backend-address index, so configured-backend checks are bounded hash lookups rather than route-count scans.
 - Short-header CID lookup tries possible CID lengths from longest down to `QSR_MIN_LEARNED_CID_LEN`. It is only needed on tuple misses or backend return traffic, but it remains a bounded multi-lookup path rather than a single table hit.
 
-The current `io_uring` path keeps sends on `sendmmsg`; send-side `io_uring` or UDP segmentation offload should be justified by end-to-end latency/throughput measurements before replacing it.
+`io_uring` was prototyped but the path served `submit; wait_cqe` per packet and was strictly slower than `recvmmsg` + `sendmmsg`. It has been removed; a future async-batched rewrite (multishot recv, registered buffers) is the right way to revisit.

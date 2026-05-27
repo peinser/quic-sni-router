@@ -19,7 +19,7 @@ client UDP 443 -> quic-sni-router -> FlightDeck pod UDP 8443
 
 Current status is an MVP dataplane with QUIC v1 + v2 Initial deprotection via OpenSSL libcrypto, CRYPTO frame extraction, TLS ClientHello SNI extraction, exact-SNI route lookup, UDP forwarding, session pinning, CI, fuzz harnesses, Docker e2e tests, and devcontainer setup.
 
-The dataplane pre-resolves configured backend hosts before entering the packet loop and maintains tuple plus observed CID session aliases. NAT rebinding can recover via learned long-header or short-header CIDs on a best-effort basis. Linux builds use `io_uring` multishot `recvmsg` plus `sendmmsg`; other platforms use a portable `recvfrom`/`sendto` loop.
+The dataplane pre-resolves configured backend hosts before entering the packet loop and maintains tuple plus observed CID session aliases. NAT rebinding can recover via learned long-header or short-header CIDs on a best-effort basis. Linux builds use `epoll` plus `recvmmsg`/`sendmmsg` for batched I/O; other platforms use a portable `recvfrom`/`sendto` loop.
 
 ## WAN-facing caveats
 
@@ -163,7 +163,7 @@ spec:
 
 ## Performance Builds
 
-Production containers configure CMake with `-DCMAKE_BUILD_TYPE=Release` and build with `clang`. For Clang/GCC this already enables the toolchain's Release defaults, typically `-O3 -DNDEBUG`. Linux builds use an `io_uring` multishot receive loop plus `sendmmsg` send batching.
+Production containers configure CMake with `-DCMAKE_BUILD_TYPE=Release` and build with `clang`. For Clang/GCC this already enables the toolchain's Release defaults, typically `-O3 -DNDEBUG`. Linux builds use `epoll` plus `recvmmsg`/`sendmmsg`; an earlier `io_uring` path was removed because its `submit; wait_cqe`-per-packet pattern was strictly slower than batched `recvmmsg`/`sendmmsg`.
 
 Useful build toggles:
 
