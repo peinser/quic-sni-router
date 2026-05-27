@@ -21,12 +21,22 @@
 
 #ifdef __linux__
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #endif
 
 enum : int { QSR_EXPIRE_SWEEP_INTERVAL_SECONDS = 1 };
-enum : unsigned { QSR_UDP_BATCH_SIZE = 32U };
+enum : unsigned { QSR_UDP_BATCH_SIZE = 64U };
+/*
+ * Per-recv-slot scratch buffer. Sized well above one Ethernet MTU so the
+ * kernel can coalesce a burst from one client tuple via UDP_GRO into a single
+ * recvmmsg slot; the loop below splits the slot back into individual datagrams
+ * via the SCM_UDP_GRO cmsg. Without GRO, only the first QSR_MAX_DATAGRAM_SIZE
+ * bytes are used.
+ */
+enum : size_t { QSR_UDP_RECV_BUFFER_SIZE = 16U * 1024U };
+enum : size_t { QSR_UDP_RECV_CMSG_SIZE = 64U };
 enum : size_t { QSR_SESSION_EXPIRE_MIN_SCAN = 1024U };
 enum : size_t { QSR_SESSION_EXPIRE_MAX_SCAN = 16384U };
 enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 64U };
@@ -121,7 +131,7 @@ static void sender_flush(qsr_udp_sender_t *sender, int fd) {
   }
   size_t sent = 0U;
   while (sent < sender->count) {
-    const int result = sendmmsg(fd, &messages[sent], (unsigned int)(sender->count - sent), 0);
+    const int result = sendmmsg(fd, &messages[sent], (unsigned int)(sender->count - sent), MSG_DONTWAIT);
     if (result < 0) {
       if (errno == EINTR) {
         continue;
@@ -130,6 +140,9 @@ static void sender_flush(qsr_udp_sender_t *sender, int fd) {
        * EAGAIN/ENOBUFS on a saturated send queue is best treated as a drop:
        * QUIC has its own loss recovery and retransmits.
        */
+      break;
+    }
+    if (result == 0) {
       break;
     }
     sent += (size_t)result;
@@ -855,6 +868,15 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
      */
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
   }
+  /*
+   * UDP_GRO asks the kernel to coalesce consecutive same-flow datagrams into
+   * a single recvmmsg slot, returning the per-segment size via a SCM_UDP_GRO
+   * ancillary message. Cuts per-packet recv overhead on bursty flows; we
+   * demultiplex the buffer on receive. Best-effort: older kernels lack it.
+   */
+#ifdef UDP_GRO
+  (void)setsockopt(fd, IPPROTO_UDP, UDP_GRO, &one, sizeof(one));
+#endif
   return QSR_OK;
 }
 #endif
@@ -986,18 +1008,37 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   }
   sender_init(&sender);
 #ifdef __linux__
-  uint8_t packets[QSR_UDP_BATCH_SIZE][QSR_MAX_DATAGRAM_SIZE];
-  struct sockaddr_storage sources[QSR_UDP_BATCH_SIZE];
-  struct iovec iovecs[QSR_UDP_BATCH_SIZE];
-  struct mmsghdr messages[QSR_UDP_BATCH_SIZE];
-  memset(sources, 0, sizeof(sources));
-  memset(messages, 0, sizeof(messages));
+  /*
+   * Heap-allocated so the receive buffers can be sized larger than one
+   * Ethernet MTU to give UDP_GRO room to coalesce same-flow bursts; stack
+   * allocation at QSR_UDP_BATCH_SIZE * QSR_UDP_RECV_BUFFER_SIZE = ~1 MiB
+   * is too large to rely on across host environments.
+   */
+  uint8_t *recv_buffers = calloc(QSR_UDP_BATCH_SIZE, QSR_UDP_RECV_BUFFER_SIZE);
+  uint8_t *cmsg_buffers = calloc(QSR_UDP_BATCH_SIZE, QSR_UDP_RECV_CMSG_SIZE);
+  struct sockaddr_storage *sources = calloc(QSR_UDP_BATCH_SIZE, sizeof(*sources));
+  struct iovec *iovecs = calloc(QSR_UDP_BATCH_SIZE, sizeof(*iovecs));
+  struct mmsghdr *messages = calloc(QSR_UDP_BATCH_SIZE, sizeof(*messages));
+  if (recv_buffers == nullptr || cmsg_buffers == nullptr || sources == nullptr || iovecs == nullptr ||
+      messages == nullptr) {
+    free(messages);
+    free(iovecs);
+    free(sources);
+    free(cmsg_buffers);
+    free(recv_buffers);
+    free(pending_initials);
+    qsr_runtime_free(&runtime);
+    (void)close(epoll_fd);
+    (void)close(fd);
+    return QSR_ERR_FULL;
+  }
   for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
-    iovecs[i].iov_base = packets[i];
-    iovecs[i].iov_len = sizeof(packets[i]);
+    iovecs[i].iov_base = &recv_buffers[i * QSR_UDP_RECV_BUFFER_SIZE];
+    iovecs[i].iov_len = QSR_UDP_RECV_BUFFER_SIZE;
     messages[i].msg_hdr.msg_iov = &iovecs[i];
     messages[i].msg_hdr.msg_iovlen = 1U;
     messages[i].msg_hdr.msg_name = &sources[i];
+    messages[i].msg_hdr.msg_control = &cmsg_buffers[i * QSR_UDP_RECV_CMSG_SIZE];
   }
 #endif
   while (!g_stop) {
@@ -1006,6 +1047,8 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     for (size_t i = 0U; i < QSR_UDP_BATCH_SIZE; i++) {
       messages[i].msg_len = 0U;
       messages[i].msg_hdr.msg_namelen = sizeof(sources[i]);
+      messages[i].msg_hdr.msg_controllen = QSR_UDP_RECV_CMSG_SIZE;
+      messages[i].msg_hdr.msg_flags = 0;
     }
 
     int received_count = recvmmsg(fd, messages, QSR_UDP_BATCH_SIZE, 0, nullptr);
@@ -1032,11 +1075,44 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     }
     const time_t now = monotonic_now();
     for (int i = 0; i < received_count; i++) {
-      if (messages[i].msg_len == 0U || messages[i].msg_len > QSR_MAX_DATAGRAM_SIZE) {
+      const size_t msg_len = messages[i].msg_len;
+      if (msg_len == 0U || msg_len > QSR_UDP_RECV_BUFFER_SIZE) {
         continue;
       }
-      handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, packets[i], messages[i].msg_len,
-                    &sources[i], messages[i].msg_hdr.msg_namelen, now);
+      /*
+       * The kernel sets MSG_TRUNC when a single datagram exceeded our receive
+       * buffer. Splitting a truncated GRO burst would misalign the segments,
+       * so drop the slot and rely on QUIC's loss recovery to retransmit.
+       */
+      if ((messages[i].msg_hdr.msg_flags & MSG_TRUNC) != 0) {
+        continue;
+      }
+      const uint8_t *slot = &recv_buffers[(size_t)i * QSR_UDP_RECV_BUFFER_SIZE];
+      size_t segment_size = msg_len;
+#ifdef UDP_GRO
+      for (struct cmsghdr *cm = CMSG_FIRSTHDR(&messages[i].msg_hdr); cm != nullptr;
+           cm = CMSG_NXTHDR(&messages[i].msg_hdr, cm)) {
+        if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
+          uint16_t gso = 0U;
+          memcpy(&gso, CMSG_DATA(cm), sizeof(gso));
+          if (gso > 0U) {
+            segment_size = gso;
+          }
+          break;
+        }
+      }
+#endif
+      /* Whether GRO applied or not, a single segment must fit a UDP datagram. */
+      if (segment_size > QSR_MAX_DATAGRAM_SIZE) {
+        continue;
+      }
+      for (size_t offset = 0U; offset < msg_len;) {
+        const size_t remaining = msg_len - offset;
+        const size_t chunk = remaining < segment_size ? remaining : segment_size;
+        handle_packet(&runtime.config, &runtime.sessions, pending_initials, &sender, fd, slot + offset, chunk,
+                      &sources[i], messages[i].msg_hdr.msg_namelen, now);
+        offset += chunk;
+      }
     }
     sender_flush(&sender, fd);
 #else
@@ -1073,6 +1149,11 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   free(pending_initials);
   qsr_runtime_free(&runtime);
 #ifdef __linux__
+  free(messages);
+  free(iovecs);
+  free(sources);
+  free(cmsg_buffers);
+  free(recv_buffers);
   (void)close(epoll_fd);
 #endif
   (void)close(fd);

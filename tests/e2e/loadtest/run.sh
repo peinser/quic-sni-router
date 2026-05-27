@@ -101,12 +101,10 @@ if [ "${packet_debug}" = "1" ]; then
 fi
 docker build --build-arg QSR_ENABLE_PACKET_DEBUG="${packet_debug_cmake}" \
   -t "${router_base_image}" -f ../../../docker/Dockerfile --target production ../../..
-cp "${config_dir}/router.yaml" router.yaml
-docker build -t "${router_initial_image}" -f - . <<EOF
+docker build -t "${router_initial_image}" -f - "${config_dir}" <<EOF
 FROM ${router_base_image}
 COPY router.yaml /config/router.yaml
 EOF
-rm router.yaml
 
 if ! docker image inspect "${http3_image}" >/dev/null 2>&1; then
   docker build -t "${http3_image}" -f ../http3/Dockerfile ../http3
