@@ -29,7 +29,8 @@ docker network create "${network}" >/dev/null
 
 docker run -d --name "${project}-backend" --network "${network}" --network-alias marker-backend \
   "${http3_image}" python /app/marker_backend.py --port 8443 >/dev/null
-docker create --name "${project}-router" --network "${network}" --network-alias fragmented.flightdeck.test \
+docker create --name "${project}-router" --network "${network}" --network-alias router \
+  --network-alias fragmented.flightdeck.test \
   "${router_image}" /config/router.yaml >/dev/null
 docker cp router.yaml "${project}-router:/config/router.yaml"
 docker start "${project}-router" >/dev/null
@@ -49,7 +50,7 @@ if [ -z "${router_ip}" ]; then
 fi
 
 if ! docker run --name "${project}-client" --network "${network}" \
-  "${http3_image}" python /app/fragmented_initial_client.py --router-host fragmented.flightdeck.test --router-port 443; then
+  "${http3_image}" python /app/fragmented_initial_client.py --router-host router --router-port 443; then
   dump_logs
   exit 1
 fi
