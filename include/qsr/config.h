@@ -1,12 +1,14 @@
 /*
  * qsr/config.h: runtime configuration loaded from a YAML file (or built from
  * defaults). Schema mirrors the chart's values.yaml 1:1: listen.udp,
- * sessions.idleTimeout, sessions.maxSessions, routes (SNI -> host:port).
+ * sessions.idleTimeout, sessions.maxSessions, routes (SNI -> host:port),
+ * cidEncoding (optional encrypted-CID routing for stateless QUIC migration).
  * Backed by libyaml; see src/config.c for the loader.
  */
 #ifndef QSR_CONFIG_H
 #define QSR_CONFIG_H
 
+#include "qsr/cid_codec.h"
 #include "qsr/route_table.h"
 
 typedef struct qsr_config {
@@ -14,6 +16,7 @@ typedef struct qsr_config {
   uint32_t idle_timeout_seconds;
   size_t max_sessions;
   qsr_route_table_t routes;
+  qsr_cid_codec_t cid_codec;
 } qsr_config_t;
 
 void qsr_config_default(qsr_config_t *config);

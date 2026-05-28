@@ -1,5 +1,6 @@
 #include "qsr/udp.h"
 
+#include "qsr/cid_codec.h"
 #include "qsr/quic_crypto.h"
 #include "qsr/quic_frames.h"
 #include "qsr/quic_initial.h"
@@ -610,6 +611,64 @@ static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_k
   (void)qsr_session_table_put(sessions, new_tuple_key, backend, backend_len, now);
 }
 
+/*
+ * Try to decode an encoded server_id out of the packet's destination CID.
+ * Returns QSR_OK when the codec is enabled AND the DCID is a 16-byte encoded
+ * CID that passes the magic check. Long headers carry an explicit DCID length;
+ * short headers do not, so we read exactly QSR_CID_ENCODED_LEN bytes and let
+ * the magic check reject everything else.
+ */
+[[nodiscard]] static qsr_status_t try_decode_dcid_server_id(const qsr_cid_codec_t *codec, const uint8_t *packet,
+                                                            size_t packet_len, uint8_t *server_id) {
+  if (codec == nullptr || !codec->enabled || packet == nullptr || packet_len < 1U) {
+    return QSR_ERR_INVALID;
+  }
+  if ((packet[0] & 0x80U) != 0U) {
+    /* Long header: DCID length is in byte 5; the layout sits after byte 0 +
+     * 4 version bytes. */
+    if ((packet[0] & 0x40U) == 0U || packet_len < 7U) {
+      return QSR_ERR_INVALID;
+    }
+    const uint8_t dcid_len = packet[5];
+    if (dcid_len != QSR_CID_ENCODED_LEN || 6U + (size_t)dcid_len > packet_len) {
+      return QSR_ERR_INVALID;
+    }
+    return qsr_cid_codec_decode(codec, &packet[6], dcid_len, server_id);
+  }
+  /* Short header: no explicit DCID length. Try at the codec's fixed length;
+   * the magic check rejects unrelated CIDs. */
+  if ((packet[0] & 0x40U) == 0U || packet_len < 1U + QSR_CID_ENCODED_LEN) {
+    return QSR_ERR_INVALID;
+  }
+  return qsr_cid_codec_decode(codec, &packet[1], QSR_CID_ENCODED_LEN, server_id);
+}
+
+/*
+ * Route by encoded server_id. Returns the installed session, or nullptr if
+ * the DCID does not decode or no resolved route matches. Skipped when the
+ * source is a known backend (a backend's outbound packet's DCID is the
+ * client's CID, which our codec did not generate; decode would fail anyway,
+ * but the explicit guard avoids any accidental loop should that ever change).
+ */
+[[nodiscard]] static qsr_session_t *lookup_encoded_cid(const qsr_config_t *runtime_config,
+                                                       qsr_session_table_t *sessions, const uint8_t *packet,
+                                                       size_t packet_len, const qsr_session_key_t *tuple_key,
+                                                       bool source_is_backend, time_t now) {
+  if (source_is_backend || !runtime_config->cid_codec.enabled) {
+    return nullptr;
+  }
+  uint8_t server_id = 0U;
+  if (try_decode_dcid_server_id(&runtime_config->cid_codec, packet, packet_len, &server_id) != QSR_OK) {
+    return nullptr;
+  }
+  const qsr_route_t *route = qsr_route_table_lookup_by_server_id(&runtime_config->routes, server_id);
+  if (route == nullptr || !route->backend_resolved) {
+    return nullptr;
+  }
+  bind_client_tuple(sessions, tuple_key, &route->backend_addr, route->backend_addr_len, now);
+  return qsr_session_table_get(sessions, tuple_key);
+}
+
 static size_t session_expire_scan_budget(const qsr_session_table_t *sessions) {
   size_t budget = sessions->capacity / 60U;
   if (budget < QSR_SESSION_EXPIRE_MIN_SCAN) {
@@ -629,6 +688,21 @@ static void handle_packet(const qsr_config_t *runtime_config, qsr_session_table_
   qsr_session_t *session = nullptr;
   const bool source_is_backend = is_known_backend_addr(runtime_config, sessions, source, source_len);
   QSR_PACKET_DECISION_VAR;
+
+  /*
+   * Encoded-CID routing runs first when enabled. Any server-issued CID
+   * decodes to the same server_id regardless of which CID the client picked
+   * from its NEW_CONNECTION_ID pool, so this is the lookup that survives
+   * active QUIC connection migration (RFC 9000 §9) — a path the observed-CID
+   * heuristics below cannot follow because the post-handshake NEW_CONNECTION_ID
+   * frames are encrypted in 1-RTT. Falls through to the existing chain when
+   * the codec is disabled, the DCID is not encoded, or no route matches the
+   * decoded server_id. See docs/cid-routing.md.
+   */
+  session = lookup_encoded_cid(runtime_config, sessions, packet, packet_len, &key, source_is_backend, now);
+  if (session != nullptr) {
+    QSR_SET_PACKET_DECISION("encoded_cid");
+  }
 
   /*
    * Initial packets need careful handling. There are three sub-cases:

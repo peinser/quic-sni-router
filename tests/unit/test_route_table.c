@@ -8,7 +8,7 @@
 static void test_add_lookup_normalizes_case(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
-  ASSERT_TRUE(qsr_route_table_add(&table, "RVR-A.flightdeck.test", "127.0.0.1", 8443U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&table, "RVR-A.flightdeck.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
   const qsr_route_t *route = qsr_route_table_lookup(&table, "rvr-a.flightdeck.test");
   ASSERT_TRUE(route != nullptr);
   ASSERT_TRUE(route->port == 8443U);
@@ -19,7 +19,7 @@ static void test_add_lookup_normalizes_case(void) {
 static void test_resolve_local(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
-  ASSERT_TRUE(qsr_route_table_add(&table, "rvr-a.flightdeck.test", "127.0.0.1", 8443U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&table, "rvr-a.flightdeck.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&table) == QSR_OK);
   const qsr_route_t *route = qsr_route_table_lookup(&table, "rvr-a.flightdeck.test");
   ASSERT_TRUE(route != nullptr && route->backend_resolved);
@@ -28,26 +28,26 @@ static void test_resolve_local(void) {
 static void test_rejects_duplicate(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
-  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U) == QSR_OK);
-  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U) == QSR_ERR_INVALID);
+  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U, 0U) == QSR_ERR_INVALID);
 }
 
 static void test_rejects_malformed_sni(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
   /* Leading hyphen in a label is rejected by the hostname validator. */
-  ASSERT_TRUE(qsr_route_table_add(&table, "-bad.flightdeck.test", "127.0.0.1", 8443U) == QSR_ERR_INVALID);
+  ASSERT_TRUE(qsr_route_table_add(&table, "-bad.flightdeck.test", "127.0.0.1", 8443U, 0U) == QSR_ERR_INVALID);
   /* Empty label. */
-  ASSERT_TRUE(qsr_route_table_add(&table, "a..b", "127.0.0.1", 8443U) == QSR_ERR_INVALID);
+  ASSERT_TRUE(qsr_route_table_add(&table, "a..b", "127.0.0.1", 8443U, 0U) == QSR_ERR_INVALID);
   /* Trailing dot. */
-  ASSERT_TRUE(qsr_route_table_add(&table, "a.b.", "127.0.0.1", 8443U) == QSR_ERR_INVALID);
+  ASSERT_TRUE(qsr_route_table_add(&table, "a.b.", "127.0.0.1", 8443U, 0U) == QSR_ERR_INVALID);
 }
 
 static void test_rejects_unresolvable(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
   ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test",
-                                  "this-hostname-does-not-resolve-anywhere.invalid", 8443U) == QSR_OK);
+                                  "this-hostname-does-not-resolve-anywhere.invalid", 8443U, 0U) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&table) == QSR_ERR_INVALID);
 }
 
@@ -62,9 +62,9 @@ static void test_rejects_when_full(void) {
   for (size_t i = 0U; i < QSR_MAX_ROUTES; i++) {
     char sni[64];
     (void)snprintf(sni, sizeof(sni), "host-%zu.example.test", i);
-    ASSERT_TRUE(qsr_route_table_add(&table, sni, "127.0.0.1", 8443U) == QSR_OK);
+    ASSERT_TRUE(qsr_route_table_add(&table, sni, "127.0.0.1", 8443U, 0U) == QSR_OK);
   }
-  ASSERT_TRUE(qsr_route_table_add(&table, "extra.example.test", "127.0.0.1", 8443U) == QSR_ERR_FULL);
+  ASSERT_TRUE(qsr_route_table_add(&table, "extra.example.test", "127.0.0.1", 8443U, 0U) == QSR_ERR_FULL);
 }
 
 static struct sockaddr_storage make_v4(uint32_t addr_be, uint16_t port_be) {
@@ -79,7 +79,7 @@ static struct sockaddr_storage make_v4(uint32_t addr_be, uint16_t port_be) {
 static void test_has_backend(void) {
   qsr_route_table_t table;
   qsr_route_table_init(&table);
-  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&table, "a.example.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&table) == QSR_OK);
 
   const struct sockaddr_storage matching = make_v4(0x0100007fU /* 127.0.0.1 */, htons(8443U));
@@ -113,10 +113,10 @@ static void test_reload_cutover_set_math(void) {
   qsr_route_table_t new_routes;
   qsr_route_table_init(&old_routes);
   qsr_route_table_init(&new_routes);
-  ASSERT_TRUE(qsr_route_table_add(&old_routes, "kept.example.test", "127.0.0.1", 8443U) == QSR_OK);
-  ASSERT_TRUE(qsr_route_table_add(&old_routes, "removed.example.test", "127.0.0.2", 8444U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&old_routes, "kept.example.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&old_routes, "removed.example.test", "127.0.0.2", 8444U, 0U) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&old_routes) == QSR_OK);
-  ASSERT_TRUE(qsr_route_table_add(&new_routes, "kept.example.test", "127.0.0.1", 8443U) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&new_routes, "kept.example.test", "127.0.0.1", 8443U, 0U) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&new_routes) == QSR_OK);
 
   const struct sockaddr_storage kept_addr = make_v4(0x0100007fU, htons(8443U));

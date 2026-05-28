@@ -70,6 +70,9 @@ void qsr_route_table_init(qsr_route_table_t *table) {
     table->buckets[i] = SIZE_MAX;
     table->backend_buckets[i] = SIZE_MAX;
   }
+  for (size_t i = 0U; i < sizeof(table->server_id_index) / sizeof(table->server_id_index[0]); i++) {
+    table->server_id_index[i] = SIZE_MAX;
+  }
 }
 
 static qsr_status_t backend_index_put(qsr_route_table_t *table, size_t route_index) {
@@ -93,7 +96,8 @@ static qsr_status_t backend_index_put(qsr_route_table_t *table, size_t route_ind
   return QSR_ERR_FULL;
 }
 
-qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, const char *host, uint16_t port) {
+qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, const char *host, uint16_t port,
+                                 uint8_t server_id) {
   if (table == nullptr || sni == nullptr || host == nullptr || port == 0U) {
     return QSR_ERR_INVALID;
   }
@@ -108,6 +112,15 @@ qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, cons
   if (qsr_route_table_lookup(table, normalized) != nullptr) {
     return QSR_ERR_INVALID;
   }
+  /*
+   * server_id is the byte backends embed in every server-issued CID. The
+   * router stores routes in a fixed-size table indexed by it, so refuse to
+   * install two routes with the same non-zero server_id — that would be a
+   * silent misconfiguration where one route's CIDs land at another backend.
+   */
+  if (server_id != 0U && table->server_id_index[server_id] != SIZE_MAX) {
+    return QSR_ERR_INVALID;
+  }
 
   size_t bucket = (size_t)(hash_string(normalized) % QSR_ROUTE_BUCKETS);
   for (size_t probes = 0U; probes < QSR_ROUTE_BUCKETS; probes++) {
@@ -120,13 +133,28 @@ qsr_status_t qsr_route_table_add(qsr_route_table_t *table, const char *sni, cons
       memcpy(route->host, host, host_len);
       route->host[host_len] = '\0';
       route->port = port;
+      route->server_id = server_id;
       table->buckets[bucket] = table->count;
+      if (server_id != 0U) {
+        table->server_id_index[server_id] = table->count;
+      }
       table->count++;
       return QSR_OK;
     }
     bucket = (bucket + 1U) % QSR_ROUTE_BUCKETS;
   }
   return QSR_ERR_FULL;
+}
+
+const qsr_route_t *qsr_route_table_lookup_by_server_id(const qsr_route_table_t *table, uint8_t server_id) {
+  if (table == nullptr || server_id == 0U) {
+    return nullptr;
+  }
+  const size_t route_index = table->server_id_index[server_id];
+  if (route_index == SIZE_MAX || route_index >= table->count) {
+    return nullptr;
+  }
+  return &table->routes[route_index];
 }
 
 const qsr_route_t *qsr_route_table_lookup(const qsr_route_table_t *table, const char *sni) {

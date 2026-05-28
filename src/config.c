@@ -169,6 +169,7 @@ void qsr_config_default(qsr_config_t *config) {
   }
   char host[QSR_MAX_ADDR_LEN + 1U] = {0};
   uint16_t port = 0U;
+  uint8_t server_id = 0U;
   for (yaml_node_pair_t *pair = node->data.mapping.pairs.start; pair < node->data.mapping.pairs.top; pair++) {
     yaml_node_t *k = yaml_document_get_node(doc, pair->key);
     yaml_node_t *v = yaml_document_get_node(doc, pair->value);
@@ -192,6 +193,18 @@ void qsr_config_default(qsr_config_t *config) {
       if (status != QSR_OK) {
         return status;
       }
+    } else if (strcmp(key, "serverId") == 0) {
+      char sid_text[8];
+      status = copy_scalar(v, sid_text, sizeof(sid_text));
+      if (status != QSR_OK) {
+        return status;
+      }
+      uint32_t sid = 0U;
+      status = parse_u32(sid_text, 1U, 255U, &sid);
+      if (status != QSR_OK) {
+        return status;
+      }
+      server_id = (uint8_t)sid;
     } else {
       return QSR_ERR_INVALID;
     }
@@ -199,7 +212,35 @@ void qsr_config_default(qsr_config_t *config) {
   if (host[0] == '\0' || port == 0U) {
     return QSR_ERR_INVALID;
   }
-  return qsr_route_table_add(&config->routes, sni, host, port);
+  return qsr_route_table_add(&config->routes, sni, host, port, server_id);
+}
+
+[[nodiscard]] static qsr_status_t parse_cid_encoding(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config) {
+  if (node == nullptr || node->type != YAML_MAPPING_NODE) {
+    return QSR_ERR_INVALID;
+  }
+  char key_hex[QSR_CID_KEY_LEN * 2U + 1U] = {0};
+  for (yaml_node_pair_t *pair = node->data.mapping.pairs.start; pair < node->data.mapping.pairs.top; pair++) {
+    yaml_node_t *k = yaml_document_get_node(doc, pair->key);
+    yaml_node_t *v = yaml_document_get_node(doc, pair->value);
+    char key[16];
+    qsr_status_t status = copy_scalar(k, key, sizeof(key));
+    if (status != QSR_OK) {
+      return status;
+    }
+    if (strcmp(key, "key") == 0) {
+      status = copy_scalar(v, key_hex, sizeof(key_hex));
+      if (status != QSR_OK) {
+        return status;
+      }
+    } else {
+      return QSR_ERR_INVALID;
+    }
+  }
+  if (key_hex[0] == '\0') {
+    return QSR_ERR_INVALID;
+  }
+  return qsr_cid_codec_init_from_hex(&config->cid_codec, key_hex);
 }
 
 [[nodiscard]] static qsr_status_t parse_routes(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config) {
@@ -245,6 +286,8 @@ void qsr_config_default(qsr_config_t *config) {
       status = parse_sessions(doc, v, config);
     } else if (strcmp(key, "routes") == 0) {
       status = parse_routes(doc, v, config);
+    } else if (strcmp(key, "cidEncoding") == 0) {
+      status = parse_cid_encoding(doc, v, config);
     } else {
       return QSR_ERR_INVALID;
     }

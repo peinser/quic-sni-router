@@ -29,7 +29,7 @@ static bool bench_route_lookup(void) {
     char host[64];
     (void)snprintf(sni, sizeof(sni), "rvr-%zu.flightdeck.example.com", i);
     (void)snprintf(host, sizeof(host), "127.0.0.%zu", (i % 250U) + 1U);
-    (void)qsr_route_table_add(&table, sni, host, 8443U);
+    (void)qsr_route_table_add(&table, sni, host, 8443U, 0U);
   }
   const uint64_t start = nanos();
   size_t hits = 0U;

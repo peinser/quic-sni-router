@@ -133,6 +133,7 @@ void test_tls_client_hello(void);
 void test_route_table(void);
 void test_session_table(void);
 void test_hash(void);
+void test_cid_codec(void);
 
 void test_config(void) {
   test_defaults();
@@ -157,5 +158,6 @@ int main(void) {
   test_tls_client_hello();
   test_route_table();
   test_session_table();
+  test_cid_codec();
   return 0;
 }
