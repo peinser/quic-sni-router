@@ -65,7 +65,7 @@ void qsr_flow_table_free(qsr_flow_table_t *table);
                                              socklen_t backend_len, int fd, time_t now);
 
 /* Remove one flow and close its fd. `flow` must point into the table. */
-void qsr_flow_table_remove(qsr_flow_table_t *table, qsr_flow_t *flow);
+void qsr_flow_table_remove(qsr_flow_table_t *table, const qsr_flow_t *flow);
 
 /* Slot accessors for epoll dispatch. slot() returns nullptr for unused slots. */
 [[nodiscard]] qsr_flow_t *qsr_flow_table_slot(const qsr_flow_table_t *table, size_t slot);
