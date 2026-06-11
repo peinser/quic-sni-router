@@ -1,11 +1,14 @@
+#include "qsr/flow_table.h"
 #include "qsr/quic_frames.h"
 #include "qsr/route_table.h"
 #include "qsr/session_table.h"
 
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define BENCH_ITERS 1000000U
 
@@ -115,11 +118,72 @@ static bool bench_crypto_extract(void) {
   return true;
 }
 
+/*
+ * The established short-header fast path is one flow-table get per packet
+ * (no session-table probe), so this number approximates the entire user-space
+ * routing cost of 1-RTT forwarding.
+ */
+static bool bench_flow_lookup(void) {
+  qsr_flow_table_t table;
+  if (qsr_flow_table_init(&table, 4096U) != QSR_OK) {
+    fprintf(stderr, "flow benchmark init failed\n");
+    return false;
+  }
+  struct sockaddr_storage backend;
+  memset(&backend, 0, sizeof(backend));
+  backend.ss_family = AF_INET;
+  struct sockaddr_storage target;
+  memset(&target, 0, sizeof(target));
+  const int fd = open("/dev/null", 0);
+  if (fd < 0) {
+    fprintf(stderr, "flow benchmark open failed\n");
+    qsr_flow_table_free(&table);
+    return false;
+  }
+  for (size_t i = 0U; i < 512U; i++) {
+    struct sockaddr_storage client;
+    memset(&client, 0, sizeof(client));
+    struct sockaddr_in *sin = (struct sockaddr_in *)&client;
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = (uint32_t)(0x0a000001U + i);
+    sin->sin_port = (uint16_t)(40000U + i);
+    if (i == 256U) {
+      target = client;
+    }
+    /* dup so every flow owns a distinct closable fd */
+    if (qsr_flow_table_put(&table, &client, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in), dup(fd),
+                           1) == NULL) {
+      fprintf(stderr, "flow benchmark insert failed\n");
+      (void)close(fd);
+      qsr_flow_table_free(&table);
+      return false;
+    }
+  }
+  (void)close(fd);
+  const uint64_t start = nanos();
+  size_t hits = 0U;
+  for (size_t i = 0U; i < BENCH_ITERS; i++) {
+    if (qsr_flow_table_get(&table, &target, sizeof(struct sockaddr_in)) != NULL) {
+      hits++;
+    }
+  }
+  const uint64_t elapsed = nanos() - start;
+  if (hits != BENCH_ITERS) {
+    fprintf(stderr, "flow benchmark sanity check failed\n");
+    qsr_flow_table_free(&table);
+    return false;
+  }
+  print_rate("flow tuple lookup", elapsed, BENCH_ITERS);
+  qsr_flow_table_free(&table);
+  return true;
+}
+
 int main(void) {
   printf("Synthetic dataplane CPU benchmarks (%u iterations)\n", BENCH_ITERS);
   bool ok = true;
   ok = bench_route_lookup() && ok;
   ok = bench_session_lookup() && ok;
+  ok = bench_flow_lookup() && ok;
   ok = bench_crypto_extract() && ok;
   printf("\nUser-space lookup/parsing costs only. Drive the live Linux UDP loop\n");
   printf("(recvmmsg/sendmmsg) with synthetic packets to measure end-to-end p99.\n");

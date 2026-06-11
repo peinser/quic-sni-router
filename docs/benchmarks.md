@@ -6,7 +6,7 @@ Run the synthetic dataplane CPU benchmark with:
 make benchmark
 ```
 
-The benchmark covers route lookup, session CID lookup, and CRYPTO frame extraction. It is intended to establish whether user-space lookup/parsing dominates before investing in any heavier kernel-bypass path.
+The benchmark covers route lookup, session CID lookup, flow tuple lookup, and CRYPTO frame extraction. It is intended to establish whether user-space lookup/parsing dominates before investing in any heavier kernel-bypass path.
 
 The Linux runtime uses `epoll` plus `recvmmsg`/`sendmmsg`. An earlier `io_uring` path was synchronous (submit then wait per packet) and strictly slower than the batched syscall path; it has been removed. A proper async rewrite using multishot recv, registered buffers, and IORING_RECV_MULTISHOT is the right way to revisit and is tracked as future work.
 
@@ -21,8 +21,16 @@ Linux/aarch64 Debian 13 in the devcontainer, Release build with Clang 18, 5 runs
 ```text
 route hash lookup            ~19 M ops/s     ~52 ns/op
 session cid lookup           ~50 M ops/s     ~20 ns/op
+flow tuple lookup            ~59 M ops/s     ~17 ns/op
 crypto frame extraction      ~8  M ops/s    ~125 ns/op
 ```
+
+The flow tuple lookup is the entire user-space routing cost of the established
+1-RTT fast path: a short-header packet from a client tuple with a live flow is
+forwarded after exactly one flow-table probe (no session-table access, no
+header parsing beyond the long-header bit). Backend return traffic is cheaper
+still: the receiving flow socket identifies the client, so that direction does
+zero table lookups per packet.
 
 Two things to note when reading these vs older snapshots:
 
@@ -47,6 +55,15 @@ Reference results from the local Docker/aarch64 environment after the backend-DC
 | Fresh connections | 10 | 10 | Router | `2734/2734`, 0 failures, 90.9 req/s |
 | Persistent sessions | 2 | 10 | Router | `211127/211127`, 0 failures, 7011.4 req/s |
 | Persistent sessions | 2 | 10 | Direct | `240408/240408`, 0 failures, 7982.2 req/s |
+
+After the per-flow upstream socket rework plus the short-header fast path
+(single flow-table probe per established client packet, fd-identified return
+path), the same environment sustains:
+
+| Mode | Backends | Workers | Path | Result |
+| --- | ---: | ---: | --- | --- |
+| Fresh connections | 10 | 10 | Router | `2711/2711`, 0 failures, 0 misroutes, 90.2 req/s |
+| Persistent sessions | 10 | 10 | Router | `279708/279708`, 0 failures, 0 misroutes, 9286.8 req/s, p50 1.0ms / p99 1.7ms |
 
 Before the backend-DCID fix, the same 2-backend fresh-connection routed test collapsed to roughly 13 req/s with timeouts, while direct stayed near 98 req/s. That regression was not crypto cost; it was incorrect backend return routing through an ambiguous shared backend tuple.
 

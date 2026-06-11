@@ -45,15 +45,15 @@ Anything else returns `QSR_ERR_UNSUPPORTED` and the datagram is dropped. The rea
 
 If a fresh client Initial decrypts cleanly but does not yet contain enough contiguous CRYPTO bytes to read SNI, the router keeps a bounded pending entry keyed by source tuple plus Initial DCID/SCID. Later Initial datagrams for that key are merged into the same CRYPTO stream; once SNI is available, all buffered original datagrams are forwarded unchanged to the selected backend. Pending entries are capped at 64 concurrent entries, 8 datagrams per entry, 1500 bytes per datagram, and expire after 5 seconds of inactivity.
 
-## Session pinning and rebinding
+## Session pinning, flows, and rebinding
 
-- Tuple alias (client `(addr,port)` -> backend) is the fast path.
-- Long-header DCID, SCID, and (DCID, SCID) pair aliases are learned from every Initial in both directions, so a NAT rebinding that lands on a learned CID can recover the session.
-- Backend return traffic is demuxed by QUIC DCID before falling back to the backend tuple. A backend normally serves many QUIC connections from one UDP socket, so `backend_ip:port -> client` is an ambiguous reverse alias under concurrency; the per-connection DCID alias is the authoritative path.
-- Short-header rebinding is best-effort: QUIC short headers do not self-describe the DCID length, so the router tries learned CID-length candidates from longest to shortest. On match, **both** the new client->backend mapping and the reverse backend->client mapping are updated atomically. (An earlier implementation forgot the reverse update and silently black-holed reply traffic - the test `test_expire_preserves_probe_chain` is part of the regression net.)
+- Each client tuple gets a **flow**: a dedicated unconnected UDP socket toward its backend. The backend therefore sees one router source port per client, and its return datagrams arrive on the flow's own fd. Return-path demultiplexing is exact (the fd identifies the client) for any number of concurrent QUIC connections to the same backend, including clients that use zero-length connection IDs or rotate CIDs after the handshake. The client side never sees this: forwarded backend packets are always sent from the listen socket, so the client's peer tuple stays the router's `:443`.
+- Tuple alias (client `(addr,port)` -> backend) is the fast path for client-to-backend classification.
+- Long-header DCID and (DCID, SCID) pair aliases are learned from client Initials, and the server-chosen SCID is learned from backend long-header responses (Initial, Handshake, Retry). A NAT rebinding that lands on a learned CID can recover the session; backend return traffic needs no CID inspection at all.
+- Short-header rebinding is best-effort: QUIC short headers do not self-describe the DCID length, so the router tries learned CID-length candidates from longest to shortest. On match the new client tuple is bound to the backend, and the next client packet flows through a fresh upstream socket (the backend sees a path migration and validates it per RFC 9000 section 9).
 - Idle expiry uses `CLOCK_MONOTONIC` so an NTP step does not prematurely kill or indefinitely extend sessions.
-- The session table uses open-addressing with backward-shift deletion. Expiry runs in-place; there is no rebuild step.
-- When the table is at capacity the oldest entry (by `last_seen`) is evicted to make room. This trades some session loss for resistance to a fill-the-table DoS.
+- The session table uses open-addressing with backward-shift deletion. Expiry runs in-place; there is no rebuild step. The flow table is slot-stable (epoll carries slot indices) with the same probe-cluster reinsertion on delete.
+- When either table is at capacity the oldest entry (by `last_seen`) is evicted to make room. This trades some session loss for resistance to a fill-the-table DoS. Flow sockets are also recycled LRU-style when the process hits its fd limit.
 
 ### Fresh connection flow
 
@@ -73,8 +73,7 @@ If a fresh client Initial decrypts cleanly but does not yet contain enough conti
           |   client tuple              -> backend
           |   (DCID=C1, SCID=C2)        -> backend
           |   single DCID C1            -> backend
-          |   single SCID C2            -> client
-          |   backend tuple             -> client  (fallback only; ambiguous)
+          | open per-client flow socket (router ephemeral port)
           v
    backend_ip:443
 
@@ -84,17 +83,15 @@ If a fresh client Initial decrypts cleanly but does not yet contain enough conti
           |
           | UDP datagram: DCID=C2 (client's SCID)
           v
-   quic-sni-router
+   quic-sni-router (this client's flow socket)
           |
-          | source is a configured backend, so prefer DCID lookup
-          | C2 -> client tuple
+          | the receiving fd identifies the client; no lookup
+          | learn server SCID -> backend (for later NAT rebinding)
           v
-   client_ip:client_port
+   client_ip:client_port  (sent from the router's :443 listen socket)
 ```
 
-The important part is step 2. A backend's UDP tuple is shared by all connections to that backend. Tuple-only reverse routing can overwrite `backend_ip:443 -> client A` with `backend_ip:443 -> client B`, causing backend packets for A to be delivered to B and rejected by QUIC AEAD. The client then times out. DCID-first backend return routing fixes this.
-
-Stateless reset is the exception: it is intentionally indistinguishable from a random short-header packet and is not safely CID-routeable by a non-terminating router. For that path, the router refreshes the backend tuple fallback on every client-to-backend packet before forwarding. That makes a backend reset generated by the just-forwarded packet return to the client tuple that triggered it, even if another client had previously overwritten the backend reverse tuple. `make test-e2e-reverse` reproduces this failure mode with two client tuples sharing one backend tuple.
+The important part is step 2. A backend's UDP tuple is shared by all connections to that backend, so nothing in the packet has to identify the client; the per-client flow socket does. This also covers the packets that carry no routable bits at all: short-header packets toward clients with zero-length connection IDs, packets using post-handshake rotated CIDs (NEW_CONNECTION_ID is encrypted and invisible to the router), and stateless resets, which are intentionally indistinguishable from random short-header packets. `make test-e2e-flows` asserts the isolation property with two concurrent clients on one backend; `make test-e2e-reverse` covers the post-idle reset path.
 
 For production diagnosis, deploy the matching `-debug` image tag and set `QSR_DEBUG_PACKETS=1` on the router pod. It logs one line per forwarded/dropped packet with packet kind, source tuple, backend-source classification, selected destination, and routing decision (`fresh_sni`, `tuple`, `short_cid_rebind`, `drop_initial_route`, etc.). Default images compile this packet logging path out entirely; debug images compile it in but stay quiet unless the environment variable is enabled. Do not leave packet logging enabled under normal traffic volume.
 
@@ -112,12 +109,12 @@ backend return packet:
 
    backend_ip:443
           |
-          | short header, DCID=<client/server-chosen CID learned earlier>
+          | arrives on this client's flow socket
           v
-   lookup learned CID -> client tuple
+   fd -> client tuple (no parsing, no table lookup)
           |
           v
-   forward datagram unchanged
+   forward datagram unchanged from the :443 listen socket
 ```
 
 The router does not decrypt Handshake or 1-RTT packets. It only uses visible QUIC header CIDs plus the learned tuple aliases.
@@ -141,7 +138,7 @@ router installs:
 session continues
 ```
 
-This recovery only works while the packet carries a CID the router has learned. CID rotation after the handshake is opaque to the router unless the client tuple remains stable.
+This recovery only works while the packet carries a CID the router has learned. CID rotation after the handshake is opaque to the router unless the client tuple remains stable. Note this only constrains the client-to-backend direction: backend return traffic is fd-routed per flow and is immune to CID rotation.
 
 ### Two fixed loadtest bugs
 
@@ -160,7 +157,10 @@ client A -> backend X
 client B -> backend X
 backend X has one UDP tuple
 old behaviour: backend tuple -> whichever client wrote last       (ambiguous)
-new behaviour: backend packets use learned DCID -> correct client
+intermediate:  backend packets use learned DCID -> correct client (fails for
+               zero-length or rotated client CIDs)
+new behaviour: per-client upstream flow sockets; the receiving fd IS the
+               demux key, no CID needed
 ```
 
 ## Things the router intentionally does not do
@@ -173,15 +173,16 @@ new behaviour: backend packets use learned DCID -> correct client
 
 ## Dataplane
 
-- Linux: nonblocking UDP socket on `epoll`, batched `recvmmsg` for receive and `sendmmsg` for send. Up to 32 datagrams per syscall.
-- Linux socket receive/send buffers are raised best-effort to 4 MiB. The kernel may clamp this to `net.core.rmem_max` / `net.core.wmem_max`.
-- Other platforms: portable blocking `recvfrom`/`sendto` fallback.
+- Linux: nonblocking sockets on one `epoll` set (listen socket + one upstream socket per flow + inotify), batched `recvmmsg` for receive and `sendmmsg` for send. The send batcher groups consecutive same-fd datagrams so a GRO burst still leaves as one syscall even across per-flow sockets.
+- Linux listen-socket receive/send buffers are raised best-effort to 4 MiB. The kernel may clamp this to `net.core.rmem_max` / `net.core.wmem_max`. Flow sockets keep kernel defaults.
+- `RLIMIT_NOFILE` is raised to the hard limit at startup; if it still cannot cover the flow table (sized at `maxSessions / 4`), a startup warning explains that excess concurrency degrades to LRU flow recycling.
+- Other platforms: portable nonblocking `poll()` + `recvfrom`/`sendto` fallback (development path).
 
 ## Current performance considerations
 
 - Fresh handshakes are the expensive path because the router must perform Initial header protection removal, AES-GCM decrypt, CRYPTO frame extraction, TLS ClientHello parsing, SNI lookup, and several session-table inserts.
-- Established sessions are much cheaper: tuple/CID lookup plus datagram forwarding, no crypto.
-- Backend-source detection uses the route table's resolved backend-address index, so configured-backend checks are bounded hash lookups rather than route-count scans.
-- Short-header CID lookup tries possible CID lengths from longest down to `QSR_MIN_LEARNED_CID_LEN`. It is only needed on tuple misses or backend return traffic, but it remains a bounded multi-lookup path rather than a single table hit.
+- Established sessions are much cheaper: client-to-backend is one tuple lookup plus a flow lookup and datagram forwarding, no crypto; backend-to-client is fd dispatch with zero table lookups (plus a two-bit header peek for SCID learning).
+- Configured-backend checks use the route table's resolved backend-address index, so they are bounded hash lookups rather than route-count scans.
+- Short-header CID lookup tries possible CID lengths from longest down to `QSR_MIN_LEARNED_CID_LEN`. It only runs on client tuple misses (NAT rebinds), and skips lengths never learned.
 
 `io_uring` was prototyped but the path served `submit; wait_cqe` per packet and was strictly slower than `recvmmsg` + `sendmmsg`. It has been removed; a future async-batched rewrite (multishot recv, registered buffers) is the right way to revisit.

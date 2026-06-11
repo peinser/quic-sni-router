@@ -12,6 +12,7 @@
 #define QSR_RUNTIME_H
 
 #include "qsr/config.h"
+#include "qsr/flow_table.h"
 #include "qsr/route_table.h"
 #include "qsr/session_table.h"
 
@@ -27,6 +28,14 @@
 typedef struct qsr_runtime {
   qsr_config_t config;
   qsr_session_table_t sessions;
+  /*
+   * Per-client upstream flows: one UDP socket per client tuple toward its
+   * backend, so backend return traffic demultiplexes exactly regardless of
+   * how many concurrent QUIC connections target the same backend. Owned here
+   * so hot reload can hard-cutover flows whose backend disappeared, together
+   * with the matching session-table eviction.
+   */
+  qsr_flow_table_t flows;
   const char *config_path; /* nullptr = no hot reload */
   int inotify_fd;          /* -1 = no watch (defaults-only run, or setup failed) */
 } qsr_runtime_t;

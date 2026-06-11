@@ -179,15 +179,20 @@ typedef struct reload_backend_sets {
   const qsr_route_table_t *new_routes;
 } reload_backend_sets_t;
 
+static bool should_evict_flow_on_reload(const qsr_flow_t *flow, void *userdata) {
+  const reload_backend_sets_t *sets = userdata;
+  /* Same hard-cutover rule as sessions: drop flows pinned to a backend that
+   * the new config no longer mentions. Closing the flow's fd also removes it
+   * from the dataplane's epoll set. */
+  return qsr_route_table_has_backend(sets->old_routes, &flow->backend_addr, flow->backend_addr_len) &&
+         !qsr_route_table_has_backend(sets->new_routes, &flow->backend_addr, flow->backend_addr_len);
+}
+
 static bool should_evict_on_reload(const qsr_session_t *session, void *userdata) {
   const reload_backend_sets_t *sets = userdata;
   /*
-   * Forward alias: backend_addr is one of the OLD configured backends. Evict
-   * iff that backend is no longer in the NEW config.
-   * Reverse alias: backend_addr is a client tuple (never a configured backend
-   * in any version of the config). The first conjunct is false, so we keep it
-   * untouched, the client will idle out naturally if its forward session was
-   * evicted.
+   * Every session entry's backend_addr points at one of the OLD configured
+   * backends. Evict iff that backend is no longer in the NEW config.
    */
   return qsr_route_table_has_backend(sets->old_routes, &session->backend_addr, session->backend_addr_len) &&
          !qsr_route_table_has_backend(sets->new_routes, &session->backend_addr, session->backend_addr_len);
@@ -216,12 +221,13 @@ static void reload_from_path(qsr_runtime_t *runtime) {
 
   reload_backend_sets_t sets = {.old_routes = &runtime->config.routes, .new_routes = &new_config.routes};
   const size_t evicted = qsr_session_table_evict_if(&runtime->sessions, should_evict_on_reload, &sets);
+  const size_t flows_evicted = qsr_flow_table_evict_if(&runtime->flows, should_evict_flow_on_reload, &sets);
 
   /* Per-route diff lines are emitted before the atomic swap so the log
    * narrative reads "here's what's about to change, then ok". */
   log_route_diff(&runtime->config.routes, &new_config.routes);
-  if (evicted > 0U) {
-    (void)fprintf(stderr, "reload: %zu sessions evicted (backends removed)\n", evicted);
+  if (evicted > 0U || flows_evicted > 0U) {
+    (void)fprintf(stderr, "reload: %zu sessions and %zu flows evicted (backends removed)\n", evicted, flows_evicted);
   }
 
   /* Atomic from the dataplane's point of view: we're single-threaded. */
@@ -231,6 +237,15 @@ static void reload_from_path(qsr_runtime_t *runtime) {
 }
 #endif /* __linux__ */
 
+/*
+ * Each QUIC connection creates roughly four session-table entries (forward
+ * tuple, DCID alias, server-SCID alias, DCID+SCID pair) but exactly one flow,
+ * so the flow table is sized at a quarter of maxSessions. The floor keeps
+ * small dev configs usable.
+ */
+enum : size_t { QSR_FLOWS_PER_SESSION_DIVISOR = 4U };
+enum : size_t { QSR_FLOW_CAPACITY_MIN = 256U };
+
 qsr_status_t qsr_runtime_init(qsr_runtime_t *runtime, const qsr_config_t *config, const char *config_path) {
   if (runtime == nullptr || config == nullptr) {
     return QSR_ERR_INVALID;
@@ -238,8 +253,17 @@ qsr_status_t qsr_runtime_init(qsr_runtime_t *runtime, const qsr_config_t *config
   runtime->config = *config;
   runtime->config_path = config_path;
   runtime->inotify_fd = -1;
-  const qsr_status_t status = qsr_session_table_init(&runtime->sessions, runtime->config.max_sessions);
+  qsr_status_t status = qsr_session_table_init(&runtime->sessions, runtime->config.max_sessions);
   if (status != QSR_OK) {
+    return status;
+  }
+  size_t flow_capacity = runtime->config.max_sessions / QSR_FLOWS_PER_SESSION_DIVISOR;
+  if (flow_capacity < QSR_FLOW_CAPACITY_MIN) {
+    flow_capacity = QSR_FLOW_CAPACITY_MIN;
+  }
+  status = qsr_flow_table_init(&runtime->flows, flow_capacity);
+  if (status != QSR_OK) {
+    qsr_session_table_free(&runtime->sessions);
     return status;
   }
 #ifdef __linux__
@@ -260,12 +284,11 @@ void qsr_runtime_free(qsr_runtime_t *runtime) {
     runtime->inotify_fd = -1;
   }
 #endif
+  qsr_flow_table_free(&runtime->flows);
   qsr_session_table_free(&runtime->sessions);
 }
 
-int qsr_runtime_inotify_fd(const qsr_runtime_t *runtime) {
-  return runtime == nullptr ? -1 : runtime->inotify_fd;
-}
+int qsr_runtime_inotify_fd(const qsr_runtime_t *runtime) { return runtime == nullptr ? -1 : runtime->inotify_fd; }
 
 /*
  * Conceptually a mutator (drives reload_from_path which writes runtime

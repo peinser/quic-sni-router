@@ -1,0 +1,9 @@
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 60s
+  maxSessions: 100000
+routes:
+  flows.flightdeck.test:
+    host: addr-echo-backend
+    port: 8443

@@ -32,11 +32,10 @@ static void test_defaults(void) {
 
 static void test_loads_full_config(void) {
   qsr_config_t config;
-  load_and_unlink(
-      "listen:\n  udp: \":443\"\n"
-      "sessions:\n  idleTimeout: 60s\n  maxSessions: 10\n"
-      "routes:\n  RVR-A.flightdeck.test:\n    host: 127.0.0.1\n    port: 8443\n",
-      &config, QSR_OK);
+  load_and_unlink("listen:\n  udp: \":443\"\n"
+                  "sessions:\n  idleTimeout: 60s\n  maxSessions: 10\n"
+                  "routes:\n  RVR-A.flightdeck.test:\n    host: 127.0.0.1\n    port: 8443\n",
+                  &config, QSR_OK);
   ASSERT_TRUE(config.routes.count == 1U);
   ASSERT_TRUE(qsr_route_table_lookup(&config.routes, "rvr-a.flightdeck.test") != nullptr);
   ASSERT_TRUE(config.max_sessions == 10U);
@@ -66,9 +65,8 @@ static void test_rejects_unknown_top_level_key(void) {
 
 static void test_rejects_unknown_route_field(void) {
   qsr_config_t config;
-  load_and_unlink(
-      "routes:\n  a.example.test:\n    host: 127.0.0.1\n    port: 8443\n    weight: 100\n",
-      &config, QSR_ERR_INVALID);
+  load_and_unlink("routes:\n  a.example.test:\n    host: 127.0.0.1\n    port: 8443\n    weight: 100\n", &config,
+                  QSR_ERR_INVALID);
 }
 
 static void test_rejects_route_missing_port(void) {
@@ -83,15 +81,14 @@ static void test_accepts_comments_and_inline_quotes(void) {
    * after quoted values and any quoted scalar containing a '#'. libyaml does
    * this correctly per YAML 1.1.
    */
-  load_and_unlink(
-      "# leading full-line comment\n"
-      "listen:\n"
-      "  udp: \":443\"  # inline comment after quoted scalar\n"
-      "routes:\n"
-      "  a.example.test:\n"
-      "    host: \"127.0.0.1\"  # quoted host, inline comment\n"
-      "    port: 8443\n",
-      &config, QSR_OK);
+  load_and_unlink("# leading full-line comment\n"
+                  "listen:\n"
+                  "  udp: \":443\"  # inline comment after quoted scalar\n"
+                  "routes:\n"
+                  "  a.example.test:\n"
+                  "    host: \"127.0.0.1\"  # quoted host, inline comment\n"
+                  "    port: 8443\n",
+                  &config, QSR_OK);
   ASSERT_TRUE(config.routes.count == 1U);
   ASSERT_TRUE(qsr_route_table_lookup(&config.routes, "a.example.test") != nullptr);
 }
@@ -99,22 +96,20 @@ static void test_accepts_comments_and_inline_quotes(void) {
 static void test_accepts_flow_style(void) {
   qsr_config_t config;
   /* libyaml accepts JSON-compatible flow style; the schema doesn't care. */
-  load_and_unlink(
-      "{ listen: { udp: \":443\" }, routes: { a.example.test: { host: 127.0.0.1, port: 8443 } } }\n",
-      &config, QSR_OK);
+  load_and_unlink("{ listen: { udp: \":443\" }, routes: { a.example.test: { host: 127.0.0.1, port: 8443 } } }\n",
+                  &config, QSR_OK);
   ASSERT_TRUE(config.routes.count == 1U);
   ASSERT_TRUE(qsr_route_table_lookup(&config.routes, "a.example.test") != nullptr);
 }
 
 static void test_accepts_anchors_and_aliases(void) {
   qsr_config_t config;
-  load_and_unlink(
-      "routes:\n"
-      "  a.example.test: &backend\n"
-      "    host: 127.0.0.1\n"
-      "    port: 8443\n"
-      "  b.example.test: *backend\n",
-      &config, QSR_OK);
+  load_and_unlink("routes:\n"
+                  "  a.example.test: &backend\n"
+                  "    host: 127.0.0.1\n"
+                  "    port: 8443\n"
+                  "  b.example.test: *backend\n",
+                  &config, QSR_OK);
   ASSERT_TRUE(config.routes.count == 2U);
   ASSERT_TRUE(qsr_route_table_lookup(&config.routes, "a.example.test") != nullptr);
   ASSERT_TRUE(qsr_route_table_lookup(&config.routes, "b.example.test") != nullptr);
@@ -132,6 +127,7 @@ void test_quic_crypto(void);
 void test_tls_client_hello(void);
 void test_route_table(void);
 void test_session_table(void);
+void test_flow_table(void);
 void test_hash(void);
 void test_cid_codec(void);
 
@@ -158,6 +154,7 @@ int main(void) {
   test_tls_client_hello();
   test_route_table();
   test_session_table();
+  test_flow_table();
   test_cid_codec();
   return 0;
 }
