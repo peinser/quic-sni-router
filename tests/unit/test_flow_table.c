@@ -58,10 +58,10 @@ static void test_put_existing_tuple_replaces_fd(void) {
   struct sockaddr_storage backend_b = make_v4(0x0300007fU, 8444U);
   const int fd_a = make_fd();
   const int fd_b = make_fd();
-  qsr_flow_t *flow =
+  const qsr_flow_t *flow =
       qsr_flow_table_put(&table, &client, sizeof(struct sockaddr_in), &backend_a, sizeof(struct sockaddr_in), fd_a, 1);
   ASSERT_TRUE(flow != nullptr);
-  qsr_flow_t *updated =
+  const qsr_flow_t *updated =
       qsr_flow_table_put(&table, &client, sizeof(struct sockaddr_in), &backend_b, sizeof(struct sockaddr_in), fd_b, 2);
   ASSERT_TRUE(updated == flow);
   ASSERT_TRUE(table.count == 1U);
@@ -79,7 +79,7 @@ static void test_remove_closes_fd_and_unlinks(void) {
   struct sockaddr_storage client = make_v4(0x0100007fU, 50000U);
   struct sockaddr_storage backend = make_v4(0x0200007fU, 8443U);
   const int fd = make_fd();
-  qsr_flow_t *flow =
+  const qsr_flow_t *flow =
       qsr_flow_table_put(&table, &client, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in), fd, 1);
   ASSERT_TRUE(flow != nullptr);
   qsr_flow_table_remove(&table, flow);
@@ -100,8 +100,8 @@ static void test_full_table_evicts_oldest(void) {
   for (uint16_t i = 0U; i < 5U; i++) {
     clients[i] = make_v4(0x0100007fU, (uint16_t)(50000U + i));
     fds[i] = make_fd();
-    qsr_flow_t *flow = qsr_flow_table_put(&table, &clients[i], sizeof(struct sockaddr_in), &backend,
-                                          sizeof(struct sockaddr_in), fds[i], (time_t)(10 + i));
+    const qsr_flow_t *flow = qsr_flow_table_put(&table, &clients[i], sizeof(struct sockaddr_in), &backend,
+                                                sizeof(struct sockaddr_in), fds[i], (time_t)(10 + i));
     ASSERT_TRUE(flow != nullptr);
   }
   /* Capacity 4, 5 inserts: the oldest (first) flow must have been evicted. */
@@ -132,7 +132,7 @@ static void test_removal_preserves_probe_chains(void) {
                                    sizeof(struct sockaddr_in), make_fd(), 1) != nullptr);
   }
   for (uint16_t i = 0U; i < 48U; i += 2U) {
-    qsr_flow_t *flow = qsr_flow_table_get(&table, &clients[i], sizeof(struct sockaddr_in));
+    const qsr_flow_t *flow = qsr_flow_table_get(&table, &clients[i], sizeof(struct sockaddr_in));
     ASSERT_TRUE(flow != nullptr);
     qsr_flow_table_remove(&table, flow);
   }

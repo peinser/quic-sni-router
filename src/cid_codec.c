@@ -29,7 +29,7 @@ qsr_status_t qsr_cid_codec_init_from_hex(qsr_cid_codec_t *codec, const char *hex
     return QSR_ERR_INVALID;
   }
   memset(codec, 0, sizeof(*codec));
-  if (strlen(hex_key) != QSR_CID_KEY_LEN * 2U) {
+  if (strlen(hex_key) != (size_t)QSR_CID_KEY_LEN * 2U) {
     return QSR_ERR_INVALID;
   }
   for (size_t i = 0U; i < QSR_CID_KEY_LEN; i++) {

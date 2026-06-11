@@ -135,7 +135,7 @@ static void remove_slot(qsr_flow_table_t *table, size_t slot) {
   table->count--;
 }
 
-void qsr_flow_table_remove(qsr_flow_table_t *table, qsr_flow_t *flow) {
+void qsr_flow_table_remove(qsr_flow_table_t *table, const qsr_flow_t *flow) {
   if (table == nullptr || table->flows == nullptr || flow == nullptr || !flow->used) {
     return;
   }

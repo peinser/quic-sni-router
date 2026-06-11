@@ -935,7 +935,7 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
     }
     put_alias(sessions, &cid_key, &backend, backend_len, now);
     learn_client_long_header_cids(sessions, packet, packet_len, &backend, backend_len, now);
-    qsr_flow_t *flow = flow_acquire(dp, source, source_len, &backend, backend_len, now);
+    const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &backend, backend_len, now);
     if (flow == nullptr) {
       QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &backend, backend_len, false, 0);
       return;
@@ -958,7 +958,7 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
   }
 
   session->last_seen = now;
-  qsr_flow_t *flow = flow_acquire(dp, source, source_len, &session->backend_addr, session->backend_addr_len, now);
+  const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &session->backend_addr, session->backend_addr_len, now);
   if (flow == nullptr) {
     QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &session->backend_addr,
                      session->backend_addr_len, false, 0);

@@ -136,7 +136,7 @@ static void test_decode_rejects_random_cids(void) {
   cid[0] = QSR_CID_ENCODED_VERSION;
   for (unsigned trial = 0U; trial < 500U; trial++) {
     for (size_t i = 1U; i < QSR_CID_ENCODED_LEN; i++) {
-      cid[i] = (uint8_t)((trial * 31U + i * 7U) & 0xffU);
+      cid[i] = (uint8_t)(((size_t)trial * 31U + i * 7U) & 0xffU);
     }
     uint8_t sid = 0U;
     ASSERT_TRUE(qsr_cid_codec_decode(&codec, cid, sizeof(cid), &sid) == QSR_ERR_INVALID);
