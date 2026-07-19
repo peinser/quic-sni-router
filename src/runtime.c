@@ -301,6 +301,20 @@ void qsr_runtime_free(qsr_runtime_t *runtime) {
 
 int qsr_runtime_inotify_fd(const qsr_runtime_t *runtime) { return runtime == nullptr ? -1 : runtime->inotify_fd; }
 
+bool qsr_runtime_session_keepalive(const qsr_session_t *session, void *userdata) {
+  const qsr_session_keepalive_ctx_t *ctx = userdata;
+  const qsr_flow_t *flow = nullptr;
+  if (session->owner_flow_id != 0U) {
+    const qsr_flow_t *candidate = qsr_flow_table_slot(ctx->flows, session->owner_slot);
+    if (candidate != nullptr && candidate->id == session->owner_flow_id) {
+      flow = candidate;
+    }
+  } else if (session->key.has_tuple && !session->key.has_cids) {
+    flow = qsr_flow_table_get(ctx->flows, &session->key.client_addr, session->key.client_addr_len);
+  }
+  return flow != nullptr && ctx->now - flow->last_seen < ctx->idle_timeout_seconds;
+}
+
 /*
  * Conceptually a mutator (drives reload_from_path which writes runtime
  * fields), but on non-Linux platforms the body short-circuits and the compiler

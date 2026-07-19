@@ -73,4 +73,21 @@ void qsr_runtime_poll(qsr_runtime_t *runtime);
  */
 void qsr_runtime_log_routes(const char *prefix, const qsr_route_table_t *routes);
 
+/*
+ * Keep-alive predicate for the session expiry sweep (qsr_session_keep_fn).
+ * A session whose idle timeout elapsed is kept (refreshed) while the client's
+ * flow still carries traffic: entries owned by a flow (slot + generation id)
+ * check that flow directly; tuple-keyed entries without an owner fall back to
+ * a flow lookup by client tuple. Without this, every alias of a long-lived
+ * connection expires after idleTimeout (the packet fast path refreshes only
+ * the flow) and NAT rebinding breaks for connections older than that.
+ */
+typedef struct qsr_session_keepalive_ctx {
+  const qsr_flow_table_t *flows;
+  time_t now;
+  time_t idle_timeout_seconds;
+} qsr_session_keepalive_ctx_t;
+
+[[nodiscard]] bool qsr_runtime_session_keepalive(const qsr_session_t *session, void *userdata);
+
 #endif
