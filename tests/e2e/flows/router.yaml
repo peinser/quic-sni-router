@@ -7,3 +7,5 @@ routes:
   flows.flightdeck.test:
     host: addr-echo-backend
     port: 8443
+logging:
+  connections: true

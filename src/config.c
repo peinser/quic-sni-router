@@ -72,6 +72,21 @@ void qsr_config_default(qsr_config_t *config) {
   return QSR_OK;
 }
 
+[[nodiscard]] static qsr_status_t parse_bool(const char *text, bool *out) {
+  if (text == nullptr || out == nullptr) {
+    return QSR_ERR_INVALID;
+  }
+  if (strcmp(text, "true") == 0) {
+    *out = true;
+    return QSR_OK;
+  }
+  if (strcmp(text, "false") == 0) {
+    *out = false;
+    return QSR_OK;
+  }
+  return QSR_ERR_INVALID;
+}
+
 [[nodiscard]] static qsr_status_t parse_port(const char *text, uint16_t *out) {
   uint32_t value = 0U;
   qsr_status_t status = parse_u32(text, 1U, 65535U, &value);
@@ -215,6 +230,35 @@ void qsr_config_default(qsr_config_t *config) {
   return qsr_route_table_add(&config->routes, sni, host, port, server_id);
 }
 
+[[nodiscard]] static qsr_status_t parse_logging(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config) {
+  if (node == nullptr || node->type != YAML_MAPPING_NODE) {
+    return QSR_ERR_INVALID;
+  }
+  for (yaml_node_pair_t *pair = node->data.mapping.pairs.start; pair < node->data.mapping.pairs.top; pair++) {
+    yaml_node_t *k = yaml_document_get_node(doc, pair->key);
+    yaml_node_t *v = yaml_document_get_node(doc, pair->value);
+    char key[16];
+    char value[16];
+    qsr_status_t status = copy_scalar(k, key, sizeof(key));
+    if (status != QSR_OK) {
+      return status;
+    }
+    status = copy_scalar(v, value, sizeof(value));
+    if (status != QSR_OK) {
+      return status;
+    }
+    if (strcmp(key, "connections") == 0) {
+      status = parse_bool(value, &config->log_connections);
+    } else {
+      return QSR_ERR_INVALID;
+    }
+    if (status != QSR_OK) {
+      return status;
+    }
+  }
+  return QSR_OK;
+}
+
 [[nodiscard]] static qsr_status_t parse_cid_encoding(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config) {
   if (node == nullptr || node->type != YAML_MAPPING_NODE) {
     return QSR_ERR_INVALID;
@@ -288,6 +332,8 @@ void qsr_config_default(qsr_config_t *config) {
       status = parse_routes(doc, v, config);
     } else if (strcmp(key, "cidEncoding") == 0) {
       status = parse_cid_encoding(doc, v, config);
+    } else if (strcmp(key, "logging") == 0) {
+      status = parse_logging(doc, v, config);
     } else {
       return QSR_ERR_INVALID;
     }

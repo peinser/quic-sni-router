@@ -15,6 +15,7 @@ typedef struct qsr_config {
   char listen_udp[QSR_MAX_LISTEN_ADDR_LEN];
   uint32_t idle_timeout_seconds;
   size_t max_sessions;
+  bool log_connections; /* logging.connections: one stderr line per flow open/close */
   qsr_route_table_t routes;
   qsr_cid_codec_t cid_codec;
 } qsr_config_t;

@@ -50,6 +50,7 @@ qsr_status_t qsr_flow_table_init(qsr_flow_table_t *table, size_t capacity) {
     table->free_slots[i] = capacity - 1U - i;
   }
   table->free_count = capacity;
+  table->next_id = 1U;
   return QSR_OK;
 }
 
@@ -59,8 +60,13 @@ void qsr_flow_table_free(qsr_flow_table_t *table) {
   }
   if (table->flows != nullptr) {
     for (size_t i = 0U; i < table->capacity; i++) {
-      if (table->flows[i].used && table->flows[i].fd >= 0) {
-        (void)close(table->flows[i].fd);
+      if (table->flows[i].used) {
+        if (table->on_close != nullptr) {
+          table->on_close(&table->flows[i], QSR_FLOW_CLOSE_SHUTDOWN, table->on_close_userdata);
+        }
+        if (table->flows[i].fd >= 0) {
+          (void)close(table->flows[i].fd);
+        }
       }
     }
   }
@@ -120,8 +126,11 @@ static void index_delete_at(qsr_flow_table_t *table, size_t pos) {
   }
 }
 
-static void remove_slot(qsr_flow_table_t *table, size_t slot) {
+static void remove_slot(qsr_flow_table_t *table, size_t slot, qsr_flow_close_reason_t reason) {
   qsr_flow_t *flow = &table->flows[slot];
+  if (table->on_close != nullptr) {
+    table->on_close(flow, reason, table->on_close_userdata);
+  }
   const size_t pos = index_find(table, &flow->client_addr, flow->client_addr_len);
   if (pos != SIZE_MAX && table->index[pos] != 0U) {
     index_delete_at(table, pos);
@@ -141,7 +150,7 @@ void qsr_flow_table_remove(qsr_flow_table_t *table, const qsr_flow_t *flow) {
   }
   const size_t slot = (size_t)(flow - table->flows);
   if (slot < table->capacity) {
-    remove_slot(table, slot);
+    remove_slot(table, slot, QSR_FLOW_CLOSE_REMOVED);
   }
 }
 
@@ -163,7 +172,7 @@ size_t qsr_flow_table_evict_oldest(qsr_flow_table_t *table) {
   if (victim == SIZE_MAX) {
     return 0U;
   }
-  remove_slot(table, victim);
+  remove_slot(table, victim, QSR_FLOW_CLOSE_EVICTED);
   return 1U;
 }
 
@@ -199,6 +208,7 @@ qsr_flow_t *qsr_flow_table_put(qsr_flow_table_t *table, const struct sockaddr_st
   qsr_flow_t *flow = &table->flows[slot];
   memset(flow, 0, sizeof(*flow));
   flow->used = true;
+  flow->id = table->next_id++;
   flow->fd = fd;
   memcpy(&flow->client_addr, client, sizeof(*client));
   flow->client_addr_len = client_len;
@@ -231,7 +241,7 @@ size_t qsr_flow_table_expire_incremental(qsr_flow_table_t *table, time_t now, ti
   while (scanned < scan_budget && scanned < table->capacity) {
     const size_t slot = table->expire_cursor;
     if (table->flows[slot].used && now - table->flows[slot].last_seen >= idle_timeout_seconds) {
-      remove_slot(table, slot);
+      remove_slot(table, slot, QSR_FLOW_CLOSE_IDLE);
       expired++;
     }
     table->expire_cursor = (table->expire_cursor + 1U) % table->capacity;
@@ -247,7 +257,7 @@ size_t qsr_flow_table_evict_if(qsr_flow_table_t *table, qsr_flow_filter_fn pred,
   size_t evicted = 0U;
   for (size_t slot = 0U; slot < table->capacity; slot++) {
     if (table->flows[slot].used && pred(&table->flows[slot], userdata)) {
-      remove_slot(table, slot);
+      remove_slot(table, slot, QSR_FLOW_CLOSE_FILTERED);
       evicted++;
     }
   }

@@ -33,7 +33,38 @@ typedef struct qsr_flow {
   struct sockaddr_storage backend_addr;
   socklen_t backend_addr_len;
   time_t last_seen;
+  /*
+   * Monotonic generation id, assigned at creation and stable for the flow's
+   * lifetime. Session-table entries reference their owning flow as
+   * (slot, id); the id detects a recycled slot. Never 0 for a live flow.
+   */
+  uint64_t id;
+  /*
+   * Connection-log metadata, written once at flow creation and only read when
+   * a flow opens or closes. Kept at the end of the struct so the hot path
+   * (fd, addresses, last_seen) stays in the leading cache lines.
+   */
+  time_t opened_at;
+  uint8_t scid_len;                    /* client's Initial SCID; 0 when unknown */
+  uint8_t scid[QSR_MAX_QUIC_CID_LEN];
+  char sni[QSR_MAX_HOSTNAME_LEN + 1U]; /* routed SNI; empty when unknown */
 } qsr_flow_t;
+
+/* Why a flow was removed; forwarded to the close callback. */
+typedef enum qsr_flow_close_reason {
+  QSR_FLOW_CLOSE_IDLE,     /* idle-timeout expiry sweep */
+  QSR_FLOW_CLOSE_EVICTED,  /* capacity or fd-pressure LRU eviction */
+  QSR_FLOW_CLOSE_FILTERED, /* qsr_flow_table_evict_if (hot-reload cutover) */
+  QSR_FLOW_CLOSE_REMOVED,  /* explicit qsr_flow_table_remove */
+  QSR_FLOW_CLOSE_SHUTDOWN, /* qsr_flow_table_free */
+} qsr_flow_close_reason_t;
+
+/*
+ * Invoked for every removed flow, before its fd is closed. Runs at
+ * connection-close rate only, never per packet. Must not call back into the
+ * flow table.
+ */
+typedef void (*qsr_flow_close_fn)(const qsr_flow_t *flow, qsr_flow_close_reason_t reason, void *userdata);
 
 typedef struct qsr_flow_table {
   qsr_flow_t *flows;  /* slot-stable array of capacity entries */
@@ -45,6 +76,9 @@ typedef struct qsr_flow_table {
   size_t count;
   size_t expire_cursor; /* over the flows array, incremental idle sweep */
   size_t evict_cursor;  /* over the flows array, for oldest-scan eviction */
+  qsr_flow_close_fn on_close; /* optional; see qsr_flow_close_fn */
+  void *on_close_userdata;
+  uint64_t next_id; /* next flow generation id; starts at 1 */
 } qsr_flow_table_t;
 
 [[nodiscard]] qsr_status_t qsr_flow_table_init(qsr_flow_table_t *table, size_t capacity);

@@ -45,6 +45,12 @@
               "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
             }
           }
+        },
+        "logging": {
+          "type": "object",
+          "properties": {
+            "connections": { "type": "boolean" }
+          }
         }
       }
     },

@@ -1,7 +1,10 @@
+#include "qsr/flow_table.h"
+#include "qsr/runtime.h"
 #include "qsr/session_table.h"
 #include "test_main.h"
 
 #include <string.h>
+#include <unistd.h>
 
 static struct sockaddr_storage make_v4(uint32_t addr_be, uint16_t port_be) {
   struct sockaddr_storage ss = {0};
@@ -125,12 +128,12 @@ static void test_incremental_expire_respects_budget(void) {
     ASSERT_TRUE(qsr_session_table_put(&table, &old_keys[i], &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
   }
 
-  const size_t first = qsr_session_table_expire_incremental(&table, 100, 60, 2U);
+  const size_t first = qsr_session_table_expire_incremental(&table, 100, 60, 2U, nullptr, nullptr);
   ASSERT_TRUE(first <= 2U);
   ASSERT_TRUE(table.count >= 2U);
   size_t total = first;
   for (size_t i = 0; i < 8U && table.count > 0U; i++) {
-    total += qsr_session_table_expire_incremental(&table, 100, 60, 2U);
+    total += qsr_session_table_expire_incremental(&table, 100, 60, 2U, nullptr, nullptr);
   }
   ASSERT_TRUE(total == 4U);
   ASSERT_TRUE(table.count == 0U);
@@ -284,6 +287,183 @@ static void test_short_cid_alias_rejected(void) {
   qsr_session_table_free(&table);
 }
 
+/* keep_fn used below: keep exactly the sessions whose key matches *userdata. */
+static bool keep_matching_key(const qsr_session_t *session, void *userdata) {
+  const qsr_session_key_t *kept = userdata;
+  return session->key.has_cids == kept->has_cids && session->key.dcid_len == kept->dcid_len &&
+         memcmp(session->key.dcid, kept->dcid, kept->dcid_len) == 0;
+}
+
+/*
+ * One expire_incremental call caps scans at capacity, and a deletion consumes
+ * a scan without advancing the cursor, so a single call is not guaranteed to
+ * visit every slot (slot placement is SipHash-randomized per process). Sweep
+ * repeatedly, the way the production loop does, so assertions do not depend
+ * on hash luck.
+ */
+static size_t sweep_all(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds, qsr_session_keep_fn keep,
+                        void *userdata) {
+  size_t expired = 0U;
+  for (size_t i = 0U; i < 8U; i++) {
+    expired += qsr_session_table_expire_incremental(table, now, idle_timeout_seconds, table->capacity, keep, userdata);
+  }
+  return expired;
+}
+
+/*
+ * Effect test for the keep-alive sweep: an idle-expired session for which the
+ * keep callback returns true must survive with a refreshed last_seen, while
+ * every other expired session is deleted.
+ */
+static void test_incremental_expire_keep_callback(void) {
+  qsr_session_table_t table;
+  ASSERT_TRUE(qsr_session_table_init(&table, 8U) == QSR_OK);
+  struct sockaddr_storage backend = make_v4(0x0100007fU, 8443U);
+
+  const uint8_t kept_cid[8] = {0xAA, 0, 0, 0, 0, 0, 0, 0};
+  const uint8_t dropped_cid[8] = {0xBB, 0, 0, 0, 0, 0, 0, 0};
+  qsr_session_key_t kept_key = qsr_session_single_cid_key(kept_cid, sizeof(kept_cid));
+  qsr_session_key_t dropped_key = qsr_session_single_cid_key(dropped_cid, sizeof(dropped_cid));
+  ASSERT_TRUE(qsr_session_table_put(&table, &kept_key, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+  ASSERT_TRUE(qsr_session_table_put(&table, &dropped_key, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+
+  /* Both are idle-expired at now=100 with a 60s timeout. */
+  const size_t expired = sweep_all(&table, 100, 60, keep_matching_key, &kept_key);
+  ASSERT_TRUE(expired == 1U);
+  const qsr_session_t *kept = qsr_session_table_get(&table, &kept_key);
+  ASSERT_TRUE(kept != nullptr);
+  ASSERT_TRUE(kept->last_seen == 100);
+  ASSERT_TRUE(qsr_session_table_get(&table, &dropped_key) == nullptr);
+
+  /* Without the callback the kept session expires once truly idle again. */
+  ASSERT_TRUE(sweep_all(&table, 200, 60, nullptr, nullptr) == 1U);
+  ASSERT_TRUE(qsr_session_table_get(&table, &kept_key) == nullptr);
+
+  qsr_session_table_free(&table);
+}
+
+/*
+ * Effect test for the cid_len_mask rebuild: after the sessions carrying an
+ * unusual CID length expire, a full incremental sweep cycle must retire that
+ * length's bit so short-header scans stop probing it, while lengths still in
+ * use keep their bit.
+ */
+static void test_cid_length_mask_retires_stale_bits(void) {
+  qsr_session_table_t table;
+  ASSERT_TRUE(qsr_session_table_init(&table, 8U) == QSR_OK);
+  struct sockaddr_storage backend = make_v4(0x0100007fU, 8443U);
+
+  const uint8_t cid8[8] = {0xC0, 0, 0, 0, 0, 0, 0, 0};
+  const uint8_t cid20[20] = {0xC1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  qsr_session_key_t k8 = qsr_session_single_cid_key(cid8, sizeof(cid8));
+  qsr_session_key_t k20 = qsr_session_single_cid_key(cid20, sizeof(cid20));
+  ASSERT_TRUE(qsr_session_table_put(&table, &k20, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+  ASSERT_TRUE((qsr_session_table_cid_len_mask(&table) & (1U << 20U)) != 0U);
+
+  /* Expire the 20-byte session; keep the 8-byte one alive across sweeps.
+   * sweep_all runs several full cursor cycles, guaranteeing at least one
+   * pending-mask swap after the deletion wherever the cursor sat. */
+  ASSERT_TRUE(qsr_session_table_put(&table, &k8, &backend, sizeof(struct sockaddr_in), 90) == QSR_OK);
+  ASSERT_TRUE(sweep_all(&table, 100, 60, nullptr, nullptr) == 1U);
+
+  const uint32_t mask = qsr_session_table_cid_len_mask(&table);
+  ASSERT_TRUE((mask & (1U << 20U)) == 0U);
+  ASSERT_TRUE((mask & (1U << 8U)) != 0U);
+  ASSERT_TRUE(qsr_session_table_get(&table, &k8) != nullptr);
+
+  qsr_session_table_free(&table);
+}
+
+/*
+ * End-to-end effect test for the flow-keepalive fix, using the real runtime
+ * predicate: a CID alias owned by a live flow survives the sweep while the
+ * flow carries traffic, and expires one idle period after the flow dies.
+ * Before the fix every alias of a long-lived connection expired after
+ * idleTimeout even under continuous traffic.
+ */
+static void test_flow_owned_alias_survives_active_flow(void) {
+  qsr_session_table_t sessions;
+  qsr_flow_table_t flows;
+  ASSERT_TRUE(qsr_session_table_init(&sessions, 8U) == QSR_OK);
+  ASSERT_TRUE(qsr_flow_table_init(&flows, 4U) == QSR_OK);
+
+  struct sockaddr_storage client = make_v4(0x0100007fU, 50000U);
+  struct sockaddr_storage backend = make_v4(0x0200007fU, 8443U);
+  const int fd = dup(0);
+  ASSERT_TRUE(fd >= 0);
+  qsr_flow_t *flow = qsr_flow_table_put(&flows, &client, sizeof(struct sockaddr_in), &backend,
+                                        sizeof(struct sockaddr_in), fd, 1);
+  ASSERT_TRUE(flow != nullptr);
+  ASSERT_TRUE(flow->id != 0U);
+  const size_t slot = qsr_flow_table_slot_of(&flows, flow);
+
+  const uint8_t cid[8] = {0xD0, 0, 0, 0, 0, 0, 0, 0};
+  qsr_session_key_t alias = qsr_session_single_cid_key(cid, sizeof(cid));
+  ASSERT_TRUE(qsr_session_table_put_owned(&sessions, &alias, &backend, sizeof(struct sockaddr_in), 1, slot,
+                                          flow->id) == QSR_OK);
+  qsr_session_key_t tuple = qsr_session_tuple_key(&client, sizeof(struct sockaddr_in));
+  ASSERT_TRUE(qsr_session_table_put(&sessions, &tuple, &backend, sizeof(struct sockaddr_in), 1) == QSR_OK);
+
+  /* now=100: both sessions are past the 60s idle timeout, but the flow saw
+   * traffic at now=90, so the keepalive predicate must retain both (the alias
+   * via its owner link, the tuple entry via the flow lookup fallback). */
+  flow->last_seen = 90;
+  qsr_session_keepalive_ctx_t ctx = {.flows = &flows, .now = 100, .idle_timeout_seconds = 60};
+  ASSERT_TRUE(sweep_all(&sessions, 100, 60, qsr_runtime_session_keepalive, &ctx) == 0U);
+  ASSERT_TRUE(qsr_session_table_get(&sessions, &alias) != nullptr);
+  ASSERT_TRUE(qsr_session_table_get(&sessions, &tuple) != nullptr);
+
+  /* Remove the flow (connection over): one idle period later both expire. */
+  qsr_flow_table_remove(&flows, flow);
+  ctx.now = 200;
+  ASSERT_TRUE(sweep_all(&sessions, 200, 60, qsr_runtime_session_keepalive, &ctx) == 2U);
+  ASSERT_TRUE(qsr_session_table_get(&sessions, &alias) == nullptr);
+
+  qsr_flow_table_free(&flows);
+  qsr_session_table_free(&sessions);
+}
+
+/*
+ * A recycled flow slot must not keep a stale alias alive: the generation id
+ * in the owner link has to mismatch after the slot is reused by a new flow.
+ */
+static void test_recycled_flow_slot_does_not_keep_alias(void) {
+  qsr_session_table_t sessions;
+  qsr_flow_table_t flows;
+  ASSERT_TRUE(qsr_session_table_init(&sessions, 8U) == QSR_OK);
+  ASSERT_TRUE(qsr_flow_table_init(&flows, 1U) == QSR_OK);
+
+  struct sockaddr_storage client_a = make_v4(0x0100007fU, 50000U);
+  struct sockaddr_storage client_b = make_v4(0x0100007fU, 50001U);
+  struct sockaddr_storage backend = make_v4(0x0200007fU, 8443U);
+  qsr_flow_t *flow_a =
+      qsr_flow_table_put(&flows, &client_a, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in), dup(0), 1);
+  ASSERT_TRUE(flow_a != nullptr);
+  const uint64_t id_a = flow_a->id;
+  const size_t slot_a = qsr_flow_table_slot_of(&flows, flow_a);
+
+  const uint8_t cid[8] = {0xE0, 0, 0, 0, 0, 0, 0, 0};
+  qsr_session_key_t alias = qsr_session_single_cid_key(cid, sizeof(cid));
+  ASSERT_TRUE(qsr_session_table_put_owned(&sessions, &alias, &backend, sizeof(struct sockaddr_in), 1, slot_a, id_a) ==
+              QSR_OK);
+
+  /* Capacity 1: inserting client B evicts A and reuses its slot with a new id. */
+  qsr_flow_t *flow_b =
+      qsr_flow_table_put(&flows, &client_b, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in), dup(0),
+                         50);
+  ASSERT_TRUE(flow_b != nullptr);
+  ASSERT_TRUE(qsr_flow_table_slot_of(&flows, flow_b) == slot_a);
+  ASSERT_TRUE(flow_b->id != id_a);
+
+  /* A's alias is idle-expired; B's fresh flow in the same slot must not save it. */
+  qsr_session_keepalive_ctx_t ctx = {.flows = &flows, .now = 100, .idle_timeout_seconds = 60};
+  ASSERT_TRUE(sweep_all(&sessions, 100, 60, qsr_runtime_session_keepalive, &ctx) == 1U);
+  ASSERT_TRUE(qsr_session_table_get(&sessions, &alias) == nullptr);
+
+  qsr_flow_table_free(&flows);
+  qsr_session_table_free(&sessions);
+}
+
 void test_session_table(void) {
   test_put_get_roundtrip();
   test_invalid_keys_rejected();
@@ -291,6 +471,10 @@ void test_session_table(void) {
   test_lru_eviction_when_full();
   test_incremental_expire_respects_budget();
   test_cid_length_mask_tracks_inserted_lengths();
+  test_incremental_expire_keep_callback();
+  test_cid_length_mask_retires_stale_bits();
+  test_flow_owned_alias_survives_active_flow();
+  test_recycled_flow_slot_does_not_keep_alias();
   test_evict_if_returns_zero_when_empty();
   test_evict_if_all_clears_table();
   test_evict_if_none_keeps_table();

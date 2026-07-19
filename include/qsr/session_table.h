@@ -37,6 +37,16 @@ typedef struct qsr_session {
   struct sockaddr_storage backend_addr;
   socklen_t backend_addr_len;
   time_t last_seen;
+  /*
+   * Optional owning flow, as slot + generation id. Lets the expiry sweep keep
+   * CID aliases alive while the client's flow still carries traffic: the fast
+   * path only refreshes the flow, so without this link every alias of a
+   * long-lived connection would expire after idleTimeout and NAT rebinding
+   * would stop working for connections older than that. owner_flow_id 0 means
+   * no owner; the id disambiguates a recycled slot.
+   */
+  size_t owner_slot;
+  uint64_t owner_flow_id;
 } qsr_session_t;
 
 typedef struct qsr_session_table {
@@ -46,6 +56,14 @@ typedef struct qsr_session_table {
   size_t expire_cursor;
   size_t evict_cursor;
   uint32_t cid_len_mask;
+  /*
+   * Accumulator for the next cid_len_mask: bits of surviving/inserted entries
+   * observed during the current incremental sweep cycle. Swapped into
+   * cid_len_mask when the cursor wraps, so stale length bits (from expired
+   * sessions with unusual CID lengths) stop costing short-header scan probes
+   * after at most one full sweep cycle.
+   */
+  uint32_t cid_len_mask_pending;
 } qsr_session_table_t;
 
 [[nodiscard]] qsr_status_t qsr_session_table_init(qsr_session_table_t *table, size_t capacity);
@@ -53,12 +71,30 @@ void qsr_session_table_free(qsr_session_table_t *table);
 [[nodiscard]] qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr_session_key_t *key);
 qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session_key_t *key,
                                    const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len, time_t now);
+
+/*
+ * Like qsr_session_table_put, additionally recording the owning flow
+ * (slot + generation id) on the entry. owner_flow_id 0 leaves any existing
+ * owner untouched on update; non-zero overwrites it.
+ */
+qsr_status_t qsr_session_table_put_owned(qsr_session_table_t *table, const qsr_session_key_t *key,
+                                         const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
+                                         time_t now, size_t owner_slot, uint64_t owner_flow_id);
 qsr_session_key_t qsr_session_tuple_key(const struct sockaddr_storage *addr, socklen_t addr_len);
 qsr_session_key_t qsr_session_cid_key(const uint8_t *dcid, size_t dcid_len, const uint8_t *scid, size_t scid_len);
 qsr_session_key_t qsr_session_single_cid_key(const uint8_t *cid, size_t cid_len);
 size_t qsr_session_table_expire(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds);
+
+/*
+ * Returns true if an idle-expired session should be kept alive (its last_seen
+ * is refreshed to `now` instead of deleting). Called only for entries whose
+ * idle timeout already elapsed, i.e. at sweep rate, never per packet.
+ * Must not mutate the session table.
+ */
+typedef bool (*qsr_session_keep_fn)(const qsr_session_t *session, void *userdata);
+
 size_t qsr_session_table_expire_incremental(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds,
-                                            size_t scan_budget);
+                                            size_t scan_budget, qsr_session_keep_fn keep, void *keep_userdata);
 [[nodiscard]] uint32_t qsr_session_table_cid_len_mask(const qsr_session_table_t *table);
 
 /*

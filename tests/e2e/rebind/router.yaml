@@ -1,0 +1,13 @@
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 3s
+  # Small on purpose: the expiry sweep's scan budget covers a table this size
+  # in about two seconds, so an idle-expired alias is genuinely gone before
+  # the client rebinds. At production sizes lazy expiry can mask the loss for
+  # up to a full sweep cycle, which would let a broken router pass this test.
+  maxSessions: 2000
+routes:
+  rebind.flightdeck.test:
+    host: rebind-backend
+    port: 8443

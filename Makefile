@@ -10,7 +10,7 @@ QSR_ENABLE_PACKET_DEBUG ?= OFF
 DOCKER ?= docker
 CLANG ?= clang
 
-.PHONY: help configure build format lint test test-e2e test-e2e-flows test-e2e-fragmented test-e2e-idle test-e2e-reverse test-e2e-reload test-loadtest fuzz-smoke sanitize benchmark benchmark-native docker-build clean
+.PHONY: help configure build format lint test test-e2e test-e2e-flows test-e2e-fragmented test-e2e-idle test-e2e-rebind test-e2e-reverse test-e2e-reload test-loadtest fuzz-smoke sanitize benchmark benchmark-native docker-build clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -53,6 +53,9 @@ test-e2e-flows: ## Run Docker per-flow upstream isolation e2e test
 
 test-e2e-fragmented: ## Run Docker out-of-order fragmented Initial e2e test
 	tests/e2e/fragmented/run.sh
+
+test-e2e-rebind: ## Run Docker NAT-rebind-on-aged-connection e2e test
+	tests/e2e/rebind/run.sh
 
 test-e2e-idle: ## Run Docker backend-idle timeout end-to-end test
 	tests/e2e/idle/run.sh

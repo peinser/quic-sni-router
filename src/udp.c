@@ -62,8 +62,16 @@ enum : unsigned { QSR_RECV_ROUNDS_PER_EVENT = 4U };
 enum : uint64_t { QSR_EPOLL_DATA_MAIN = UINT64_MAX, QSR_EPOLL_DATA_INOTIFY = UINT64_MAX - 1U };
 #endif
 
+/*
+ * Queued datagram. The payload is a borrowed pointer into buffers that stay
+ * valid until the next flush point (the recv batch buffers between recvmmsg
+ * rounds, or a pending-Initial entry until it is removed); enqueue therefore
+ * copies zero payload bytes. The destination is stored by value because it
+ * may point into a flow slot, and a flow can be evicted (its slot zeroed) by
+ * EMFILE recycling before the queue drains.
+ */
 typedef struct qsr_udp_send_item {
-  uint8_t packet[QSR_MAX_DATAGRAM_SIZE];
+  const uint8_t *packet;
   size_t packet_len;
   struct sockaddr_storage dest;
   socklen_t dest_len;
@@ -199,7 +207,8 @@ static void sender_flush(qsr_udp_sender_t *sender) {
       end++;
     }
     for (size_t i = start; i < end; i++) {
-      iovecs[i].iov_base = sender->items[i].packet;
+      /* iovec cannot express const; the send path never writes through it. */
+      iovecs[i].iov_base = (void *)sender->items[i].packet;
       iovecs[i].iov_len = sender->items[i].packet_len;
       messages[i].msg_hdr.msg_iov = &iovecs[i];
       messages[i].msg_hdr.msg_iovlen = 1U;
@@ -244,21 +253,11 @@ static void sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *pack
     sender_flush(sender);
   }
   qsr_udp_send_item_t *item = &sender->items[sender->count++];
-  memcpy(item->packet, packet, packet_len);
+  item->packet = packet;
   item->packet_len = packet_len;
   memcpy(&item->dest, dest, sizeof(*dest));
   item->dest_len = dest_len;
   item->fd = fd;
-}
-
-#ifdef QSR_ENABLE_PACKET_DEBUG
-[[nodiscard]] static bool packet_debug_enabled(void) {
-  static int cached = -1;
-  if (cached < 0) {
-    const char *value = getenv("QSR_DEBUG_PACKETS");
-    cached = value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 ? 1 : 0;
-  }
-  return cached == 1;
 }
 
 static void format_addr(const struct sockaddr_storage *addr, socklen_t addr_len, char *out, size_t out_len) {
@@ -271,12 +270,32 @@ static void format_addr(const struct sockaddr_storage *addr, socklen_t addr_len,
     (void)snprintf(out, out_len, "%s:%u", host, port);
   } else if (addr != nullptr && addr->ss_family == AF_INET6 && addr_len >= sizeof(struct sockaddr_in6)) {
     const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-    (void)inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
     port = ntohs(sin6->sin6_port);
+    if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+      /* Dual-stack listener: IPv4 clients arrive as v4-mapped v6 addresses
+       * ([::ffff:a.b.c.d]). Log them as the plain IPv4 they are. Display
+       * only; the session/flow keys keep the raw sockaddr untouched. */
+      struct in_addr v4;
+      memcpy(&v4, &sin6->sin6_addr.s6_addr[12], sizeof(v4));
+      (void)inet_ntop(AF_INET, &v4, host, sizeof(host));
+      (void)snprintf(out, out_len, "%s:%u", host, port);
+      return;
+    }
+    (void)inet_ntop(AF_INET6, &sin6->sin6_addr, host, sizeof(host));
     (void)snprintf(out, out_len, "[%s]:%u", host, port);
   } else {
     (void)snprintf(out, out_len, "?");
   }
+}
+
+#ifdef QSR_ENABLE_PACKET_DEBUG
+[[nodiscard]] static bool packet_debug_enabled(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *value = getenv("QSR_DEBUG_PACKETS");
+    cached = value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0 ? 1 : 0;
+  }
+  return cached == 1;
 }
 
 [[nodiscard]] static const char *packet_kind(const uint8_t *packet, size_t packet_len) {
@@ -334,6 +353,92 @@ static void packet_debug_decision(const char *decision, const uint8_t *packet, s
 #define QSR_SET_PACKET_DECISION(value) ((void)0)
 #define QSR_PACKET_DECISION "unclassified"
 #endif
+
+/*
+ * Connection lifecycle logging (config logging.connections): one stderr line
+ * when a backend flow is established and one when it is torn down. Everything
+ * here runs at connection open/close rate only; the per-packet paths never
+ * reach these functions, and when the flag is off the only cost is the flag
+ * check at the open/close sites themselves.
+ */
+[[nodiscard]] static const char *flow_close_reason_name(qsr_flow_close_reason_t reason) {
+  switch (reason) {
+    case QSR_FLOW_CLOSE_IDLE:
+      return "idle";
+    case QSR_FLOW_CLOSE_EVICTED:
+      return "evicted";
+    case QSR_FLOW_CLOSE_FILTERED:
+      return "reload";
+    case QSR_FLOW_CLOSE_REMOVED:
+      return "error";
+    case QSR_FLOW_CLOSE_SHUTDOWN:
+      return "shutdown";
+  }
+  return "unknown";
+}
+
+static void format_cid(const uint8_t *cid, size_t cid_len, char *out, size_t out_len) {
+  static const char hex[] = "0123456789abcdef";
+  if (cid_len == 0U || out_len < cid_len * 2U + 1U) {
+    (void)snprintf(out, out_len, "-");
+    return;
+  }
+  for (size_t i = 0U; i < cid_len; i++) {
+    out[i * 2U] = hex[cid[i] >> 4U];
+    out[i * 2U + 1U] = hex[cid[i] & 0x0fU];
+  }
+  out[cid_len * 2U] = '\0';
+}
+
+static void conn_log_open(const qsr_flow_t *flow) {
+  char src[INET6_ADDRSTRLEN + 16];
+  char backend[INET6_ADDRSTRLEN + 16];
+  char scid[QSR_MAX_QUIC_CID_LEN * 2U + 1U];
+  format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
+  format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
+  format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
+  (void)fprintf(stderr, "conn: open src=%s sni=%s scid=%s backend=%s\n", src, flow->sni[0] != '\0' ? flow->sni : "?",
+                scid, backend);
+}
+
+static void conn_log_close(const qsr_flow_t *flow, const char *reason, time_t now) {
+  char src[INET6_ADDRSTRLEN + 16];
+  char backend[INET6_ADDRSTRLEN + 16];
+  char scid[QSR_MAX_QUIC_CID_LEN * 2U + 1U];
+  format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
+  format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
+  format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
+  const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
+  (void)fprintf(stderr, "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
+                flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
+}
+
+/* Registered as the flow table's on_close hook; fires for idle expiry,
+ * eviction, reload cutover, and shutdown. */
+static void conn_close_callback(const qsr_flow_t *flow, qsr_flow_close_reason_t reason, void *userdata) {
+  const qsr_dataplane_t *dp = userdata;
+  if (!dp->runtime->config.log_connections) {
+    return;
+  }
+  conn_log_close(flow, flow_close_reason_name(reason), monotonic_now());
+}
+
+/*
+ * Stamp the metadata the connection log reads at close time. nullptr sni/scid
+ * mean "not known on this path" and preserve whatever the slot already holds
+ * (freshly created slots are zeroed by the flow table).
+ */
+static void flow_set_conn_metadata(qsr_flow_t *flow, const char *sni, const uint8_t *scid, size_t scid_len,
+                                   time_t now) {
+  flow->opened_at = now;
+  if (sni != nullptr) {
+    (void)snprintf(flow->sni, sizeof(flow->sni), "%s", sni);
+  }
+  if (scid != nullptr && scid_len > 0U && scid_len <= sizeof(flow->scid)) {
+    memcpy(flow->scid, scid, scid_len);
+    flow->scid_len = (uint8_t)scid_len;
+  }
+}
 
 [[nodiscard]] static bool pending_initial_matches(const qsr_pending_initial_t *entry,
                                                   const struct sockaddr_storage *source, socklen_t source_len,
@@ -444,7 +549,8 @@ static void pending_initial_append_packet(qsr_pending_initial_t *entry, const ui
 }
 
 [[nodiscard]] static qsr_status_t route_crypto_stream(const qsr_config_t *config, const qsr_crypto_stream_t *crypto,
-                                                      struct sockaddr_storage *backend, socklen_t *backend_len) {
+                                                      struct sockaddr_storage *backend, socklen_t *backend_len,
+                                                      qsr_sni_t *sni_out) {
   const size_t contiguous_len = qsr_crypto_stream_contiguous_len(crypto);
   if (contiguous_len == 0U) {
     return QSR_ERR_TRUNCATED;
@@ -465,25 +571,25 @@ static void pending_initial_append_packet(qsr_pending_initial_t *entry, const ui
   }
   memcpy(backend, &route->backend_addr, sizeof(*backend));
   *backend_len = route->backend_addr_len;
+  if (sni_out != nullptr) {
+    *sni_out = sni;
+  }
   return QSR_OK;
 }
 
 [[nodiscard]] static qsr_status_t
 route_initial_datagram(const qsr_config_t *config, qsr_pending_initial_table_t *pending_initials, const uint8_t *packet,
-                       size_t packet_len, const struct sockaddr_storage *source, socklen_t source_len, time_t now,
-                       struct sockaddr_storage *backend, socklen_t *backend_len, qsr_session_key_t *cid_key,
-                       qsr_pending_initial_t **pending_entry) {
-  qsr_quic_initial_t initial;
-  qsr_status_t status = qsr_quic_parse_initial(packet, packet_len, &initial);
-  if (status != QSR_OK) {
-    return status;
-  }
+                       size_t packet_len, const qsr_quic_initial_t *initial, const struct sockaddr_storage *source,
+                       socklen_t source_len, time_t now, struct sockaddr_storage *backend, socklen_t *backend_len,
+                       qsr_session_key_t *cid_key, qsr_pending_initial_t **pending_entry, qsr_sni_t *sni_out) {
+  /* The caller already parsed the Initial header (it needed the CIDs for the
+   * pair-alias lookup); reuse it instead of parsing the packet a second time. */
   if (cid_key != nullptr) {
-    *cid_key = qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
+    *cid_key = qsr_session_cid_key(initial->dcid, initial->dcid_len, initial->scid, initial->scid_len);
   }
 
   qsr_quic_plaintext_t plaintext;
-  status = qsr_quic_decrypt_initial(packet, packet_len, &initial, &plaintext);
+  qsr_status_t status = qsr_quic_decrypt_initial(packet, packet_len, initial, &plaintext);
   if (status != QSR_OK) {
     return status;
   }
@@ -495,7 +601,7 @@ route_initial_datagram(const qsr_config_t *config, qsr_pending_initial_table_t *
     return status;
   }
 
-  qsr_pending_initial_t *entry = pending_initial_get(pending_initials, source, source_len, &initial, now);
+  qsr_pending_initial_t *entry = pending_initial_get(pending_initials, source, source_len, initial, now);
   pending_initial_append_packet(entry, packet, packet_len);
   qsr_crypto_stream_merge(&entry->crypto, &crypto);
   if (pending_entry != nullptr) {
@@ -504,13 +610,18 @@ route_initial_datagram(const qsr_config_t *config, qsr_pending_initial_table_t *
   if (cid_key != nullptr) {
     *cid_key = entry->cid_key;
   }
-  return route_crypto_stream(config, &entry->crypto, backend, backend_len);
+  return route_crypto_stream(config, &entry->crypto, backend, backend_len, sni_out);
 }
 
+/*
+ * Insert an alias owned by a flow (slot + generation id), so the expiry sweep
+ * keeps it alive while the flow still carries traffic. owner_flow_id 0 means
+ * no owner (plain alias).
+ */
 static void put_alias(qsr_session_table_t *sessions, const qsr_session_key_t *key, const struct sockaddr_storage *dest,
-                      socklen_t dest_len, time_t now) {
+                      socklen_t dest_len, time_t now, size_t owner_slot, uint64_t owner_flow_id) {
   if (key->has_cids || key->has_tuple) {
-    (void)qsr_session_table_put(sessions, key, dest, dest_len, now);
+    (void)qsr_session_table_put_owned(sessions, key, dest, dest_len, now, owner_slot, owner_flow_id);
   }
 }
 
@@ -525,7 +636,8 @@ static void put_alias(qsr_session_table_t *sessions, const qsr_session_key_t *ke
  * surface of the short-header length scan.
  */
 static void learn_client_long_header_cids(qsr_session_table_t *sessions, const uint8_t *packet, size_t packet_len,
-                                          const struct sockaddr_storage *backend, socklen_t backend_len, time_t now) {
+                                          const struct sockaddr_storage *backend, socklen_t backend_len, time_t now,
+                                          size_t owner_slot, uint64_t owner_flow_id) {
   /*
    * Hot-path short-circuit: this is called for every client packet of every
    * established session, and the vast majority are short-header 1-RTT
@@ -543,8 +655,8 @@ static void learn_client_long_header_cids(qsr_session_table_t *sessions, const u
 
   qsr_session_key_t dcid_key = qsr_session_single_cid_key(header.dcid, header.dcid_len);
   qsr_session_key_t pair_key = qsr_session_cid_key(header.dcid, header.dcid_len, header.scid, header.scid_len);
-  put_alias(sessions, &dcid_key, backend, backend_len, now);
-  put_alias(sessions, &pair_key, backend, backend_len, now);
+  put_alias(sessions, &dcid_key, backend, backend_len, now, owner_slot, owner_flow_id);
+  put_alias(sessions, &pair_key, backend, backend_len, now, owner_slot, owner_flow_id);
 }
 
 /*
@@ -555,7 +667,8 @@ static void learn_client_long_header_cids(qsr_session_table_t *sessions, const u
  * the client's tuple changed.
  */
 static void learn_backend_scid(qsr_session_table_t *sessions, const uint8_t *packet, size_t packet_len,
-                               const struct sockaddr_storage *backend, socklen_t backend_len, time_t now) {
+                               const struct sockaddr_storage *backend, socklen_t backend_len, time_t now,
+                               size_t owner_slot, uint64_t owner_flow_id) {
   if (packet_len == 0U || (packet[0] & 0x80U) == 0U || (packet[0] & 0x40U) == 0U) {
     return;
   }
@@ -564,7 +677,7 @@ static void learn_backend_scid(qsr_session_table_t *sessions, const uint8_t *pac
     return;
   }
   qsr_session_key_t scid_key = qsr_session_single_cid_key(header.scid, header.scid_len);
-  put_alias(sessions, &scid_key, backend, backend_len, now);
+  put_alias(sessions, &scid_key, backend, backend_len, now, owner_slot, owner_flow_id);
 }
 
 [[nodiscard]] static qsr_session_t *lookup_long_header_request_dcid(const qsr_config_t *runtime_config,
@@ -751,16 +864,26 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
  */
 [[nodiscard]] static qsr_flow_t *flow_acquire(qsr_dataplane_t *dp, const struct sockaddr_storage *client,
                                               socklen_t client_len, const struct sockaddr_storage *backend,
-                                              socklen_t backend_len, time_t now) {
+                                              socklen_t backend_len, time_t now, const char *sni, const uint8_t *scid,
+                                              size_t scid_len) {
   qsr_flow_table_t *flows = &dp->runtime->flows;
+  const bool log_connections = dp->runtime->config.log_connections;
   qsr_flow_t *flow = qsr_flow_table_get(flows, client, client_len);
   if (flow != nullptr) {
     if (flow->backend_addr_len != backend_len || memcmp(&flow->backend_addr, backend, backend_len) != 0) {
       /* Same client tuple, different backend: kernel source-port reuse after
        * a close, or a reload re-pointed the route. The socket is unconnected,
-       * so re-aiming it is just a destination update. */
+       * so re-aiming it is just a destination update. The old backend session
+       * effectively ends here, so log a close/open pair for it. */
+      if (log_connections) {
+        conn_log_close(flow, "reroute", now);
+      }
       memcpy(&flow->backend_addr, backend, sizeof(*backend));
       flow->backend_addr_len = backend_len;
+      flow_set_conn_metadata(flow, sni, scid, scid_len, now);
+      if (log_connections) {
+        conn_log_open(flow);
+      }
     }
     flow->last_seen = now;
     return flow;
@@ -774,6 +897,7 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
     (void)close(fd);
     return nullptr;
   }
+  flow_set_conn_metadata(flow, sni, scid, scid_len, now);
 #ifdef __linux__
   struct epoll_event event = {.events = EPOLLIN, .data.u64 = (uint64_t)qsr_flow_table_slot_of(flows, flow)};
   if (epoll_ctl(dp->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
@@ -781,6 +905,9 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
     return nullptr;
   }
 #endif
+  if (log_connections) {
+    conn_log_open(flow);
+  }
   return flow;
 }
 
@@ -846,21 +973,19 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
    * Retry SCID, learned from the backend's response) by the DCID alias.
    * Anything else routes fresh by SNI below.
    */
-  bool is_initial = false;
-  {
-    qsr_quic_initial_t initial;
-    if (qsr_quic_parse_initial(packet, packet_len, &initial) == QSR_OK) {
-      is_initial = true;
-      qsr_session_key_t pair_key = qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
-      session = qsr_session_table_get(sessions, &pair_key);
+  qsr_quic_initial_t initial;
+  const qsr_status_t initial_status = qsr_quic_parse_initial(packet, packet_len, &initial);
+  const bool is_initial = initial_status == QSR_OK;
+  if (is_initial) {
+    qsr_session_key_t pair_key = qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
+    session = qsr_session_table_get(sessions, &pair_key);
+    if (session != nullptr) {
+      QSR_SET_PACKET_DECISION("initial_pair");
+    }
+    if (session == nullptr) {
+      session = lookup_long_header_request_dcid(runtime_config, sessions, &initial);
       if (session != nullptr) {
-        QSR_SET_PACKET_DECISION("initial_pair");
-      }
-      if (session == nullptr) {
-        session = lookup_long_header_request_dcid(runtime_config, sessions, &initial);
-        if (session != nullptr) {
-          QSR_SET_PACKET_DECISION("initial_request_dcid");
-        }
+        QSR_SET_PACKET_DECISION("initial_request_dcid");
       }
     }
   }
@@ -917,29 +1042,49 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
       QSR_PACKET_DEBUG("drop_short_unknown", packet, packet_len, source, source_len, nullptr, 0, false, 0);
       return;
     }
+    /* Non-Initial datagrams from unknown sources cannot be routed by SNI;
+     * the parse above already classified them, no second parse needed. */
+    if (!is_initial) {
+      QSR_PACKET_DEBUG("drop_unroutable", packet, packet_len, source, source_len, nullptr, 0, false,
+                       (int)initial_status);
+      return;
+    }
     struct sockaddr_storage backend;
     socklen_t backend_len = 0;
     qsr_session_key_t cid_key;
     qsr_pending_initial_t *pending_entry = nullptr;
-    qsr_status_t status = route_initial_datagram(runtime_config, dp->pending_initials, packet, packet_len, source,
-                                                 source_len, now, &backend, &backend_len, &cid_key, &pending_entry);
+    qsr_sni_t sni;
+    sni.name[0] = '\0';
+    qsr_status_t status = route_initial_datagram(runtime_config, dp->pending_initials, packet, packet_len, &initial,
+                                                 source, source_len, now, &backend, &backend_len, &cid_key,
+                                                 &pending_entry, &sni);
     if (status != QSR_OK) {
       QSR_PACKET_DEBUG("buffer_initial", packet, packet_len, source, source_len, nullptr, 0, false, (int)status);
       return;
     }
-    status = qsr_session_table_put(sessions, &key, &backend, backend_len, now);
+    /*
+     * Acquire the flow before installing session state so the tuple entry and
+     * every alias can carry the owning flow's (slot, id): that link is what
+     * lets the expiry sweep keep this connection's aliases alive for as long
+     * as the flow itself stays active.
+     */
+    const qsr_flow_t *flow =
+        flow_acquire(dp, source, source_len, &backend, backend_len, now, sni.name,
+                     pending_entry != nullptr ? pending_entry->scid : nullptr,
+                     pending_entry != nullptr ? pending_entry->scid_len : 0U);
+    if (flow == nullptr) {
+      QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &backend, backend_len, false, 0);
+      return;
+    }
+    const size_t flow_slot = qsr_flow_table_slot_of(&dp->runtime->flows, flow);
+    status = qsr_session_table_put_owned(sessions, &key, &backend, backend_len, now, flow_slot, flow->id);
     if (status != QSR_OK) {
       QSR_PACKET_DEBUG("drop_session_put", packet, packet_len, source, source_len, &backend, backend_len, false,
                        (int)status);
       return;
     }
-    put_alias(sessions, &cid_key, &backend, backend_len, now);
-    learn_client_long_header_cids(sessions, packet, packet_len, &backend, backend_len, now);
-    const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &backend, backend_len, now);
-    if (flow == nullptr) {
-      QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &backend, backend_len, false, 0);
-      return;
-    }
+    put_alias(sessions, &cid_key, &backend, backend_len, now, flow_slot, flow->id);
+    learn_client_long_header_cids(sessions, packet, packet_len, &backend, backend_len, now, flow_slot, flow->id);
     /*
      * The triggering datagram was appended to the pending entry by
      * route_initial_datagram, so flushing the entry forwards it along with
@@ -952,13 +1097,17 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
         sender_enqueue(&dp->sender, flow->fd, pending_entry->packets[i], pending_entry->packet_lens[i], &backend,
                        backend_len);
       }
+      /* The enqueued payloads point into the pending entry; flush before the
+       * entry is zeroed. Fresh-connection rate, so the early flush is cheap. */
+      sender_flush(&dp->sender);
       pending_initial_remove(dp->pending_initials, pending_entry);
     }
     return;
   }
 
   session->last_seen = now;
-  const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &session->backend_addr, session->backend_addr_len, now);
+  const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &session->backend_addr, session->backend_addr_len, now,
+                                        nullptr, nullptr, 0U);
   if (flow == nullptr) {
     QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &session->backend_addr,
                      session->backend_addr_len, false, 0);
@@ -968,7 +1117,8 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
    * Learning is cheap and idempotent: re-running here picks up CID rotations
    * on coalesced Initial+Handshake datagrams.
    */
-  learn_client_long_header_cids(sessions, packet, packet_len, &session->backend_addr, session->backend_addr_len, now);
+  learn_client_long_header_cids(sessions, packet, packet_len, &session->backend_addr, session->backend_addr_len, now,
+                                qsr_flow_table_slot_of(&dp->runtime->flows, flow), flow->id);
   QSR_PACKET_DEBUG(QSR_PACKET_DECISION, packet, packet_len, source, source_len, &session->backend_addr,
                    session->backend_addr_len, false, 0);
   sender_enqueue(&dp->sender, flow->fd, packet, packet_len, &session->backend_addr, session->backend_addr_len);
@@ -984,7 +1134,8 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
 static void handle_backend_packet(qsr_dataplane_t *dp, qsr_flow_t *flow, const uint8_t *packet, size_t packet_len,
                                   const struct sockaddr_storage *source, socklen_t source_len, time_t now) {
   flow->last_seen = now;
-  learn_backend_scid(&dp->runtime->sessions, packet, packet_len, &flow->backend_addr, flow->backend_addr_len, now);
+  learn_backend_scid(&dp->runtime->sessions, packet, packet_len, &flow->backend_addr, flow->backend_addr_len, now,
+                     qsr_flow_table_slot_of(&dp->runtime->flows, flow), flow->id);
   QSR_PACKET_DEBUG("backend_flow", packet, packet_len, source, source_len, &flow->client_addr, flow->client_addr_len,
                    true, 0);
 #ifndef QSR_ENABLE_PACKET_DEBUG
@@ -996,8 +1147,14 @@ static void handle_backend_packet(qsr_dataplane_t *dp, qsr_flow_t *flow, const u
 
 static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
   qsr_runtime_t *runtime = dp->runtime;
+  qsr_session_keepalive_ctx_t keepalive_ctx = {
+      .flows = &runtime->flows,
+      .now = now,
+      .idle_timeout_seconds = (time_t)runtime->config.idle_timeout_seconds,
+  };
   (void)qsr_session_table_expire_incremental(&runtime->sessions, now, (time_t)runtime->config.idle_timeout_seconds,
-                                             session_expire_scan_budget(&runtime->sessions));
+                                             session_expire_scan_budget(&runtime->sessions),
+                                             qsr_runtime_session_keepalive, &keepalive_ctx);
   (void)qsr_flow_table_expire_incremental(&runtime->flows, now, (time_t)runtime->config.idle_timeout_seconds,
                                           flow_expire_scan_budget(&runtime->flows));
   pending_initial_expire(dp->pending_initials, now);
@@ -1154,6 +1311,13 @@ static void drain_socket(qsr_dataplane_t *dp, qsr_recv_batch_t *batch, int fd, q
         offset += chunk;
       }
     }
+    /*
+     * Queued payloads point into this round's recv buffers; drain them before
+     * the next recvmmsg (here or in a later drain_socket call) overwrites the
+     * slots. This keeps enqueue zero-copy: the payload bytes are only ever
+     * touched by the kernel on receive and on send.
+     */
+    sender_flush(&dp->sender);
     if ((unsigned)received_count < QSR_UDP_BATCH_SIZE) {
       return;
     }
@@ -1253,6 +1417,10 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
       .epoll_fd = -1,
   };
   sender_init(&dp.sender);
+  /* Terminations (idle expiry, eviction, reload cutover, shutdown) surface
+   * through the flow table's close hook; opens are logged in flow_acquire. */
+  runtime.flows.on_close = conn_close_callback;
+  runtime.flows.on_close_userdata = &dp;
 
 #ifdef __linux__
   int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -1402,6 +1570,9 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
           break;
         }
         handle_client_packet(&dp, packet, (size_t)received, &source, source_len, now);
+        /* The queued payload points at this loop's stack buffer; drain before
+         * the next recvfrom overwrites it. */
+        sender_flush(&dp.sender);
       }
     }
     for (nfds_t p = 1; p < nfds; p++) {
@@ -1424,6 +1595,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
           break;
         }
         handle_backend_packet(&dp, flow, packet, (size_t)received, &source, source_len, now);
+        sender_flush(&dp.sender);
       }
     }
     sender_flush(&dp.sender);

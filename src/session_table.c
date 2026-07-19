@@ -130,6 +130,7 @@ qsr_status_t qsr_session_table_init(qsr_session_table_t *table, size_t capacity)
   table->expire_cursor = 0U;
   table->evict_cursor = 0U;
   table->cid_len_mask = 0U;
+  table->cid_len_mask_pending = 0U;
   return QSR_OK;
 }
 
@@ -144,6 +145,7 @@ void qsr_session_table_free(qsr_session_table_t *table) {
   table->expire_cursor = 0U;
   table->evict_cursor = 0U;
   table->cid_len_mask = 0U;
+  table->cid_len_mask_pending = 0U;
 }
 
 uint32_t qsr_session_table_cid_len_mask(const qsr_session_table_t *table) {
@@ -170,7 +172,8 @@ qsr_session_t *qsr_session_table_get(const qsr_session_table_t *table, const qsr
 
 static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const qsr_session_key_t *key,
                                                const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
-                                               time_t now, bool allow_pressure_evict);
+                                               time_t now, bool allow_pressure_evict, size_t owner_slot,
+                                               uint64_t owner_flow_id);
 
 /*
  * Delete one entry and reinsert the following probe cluster so lookup remains
@@ -191,6 +194,11 @@ static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
    * every surviving key is placed exactly where qsr_session_table_put would
    * put it in the table with the deleted slot removed. Deletion runs only from
    * expiry / eviction / reload paths, not the steady-state packet hot path.
+   *
+   * Worst case is O(capacity) when the table sits at 100% occupancy, which
+   * only tables below QSR_PRESSURE_EVICT_MIN_CAPACITY can reach (larger ones
+   * are pressure-evicted at 90%). That bounds the walk at under 1024 slots,
+   * i.e. microseconds, so no extra machinery is warranted.
    */
   size_t cursor = (index + 1U) % table->capacity;
   while (table->sessions[cursor].used) {
@@ -198,7 +206,7 @@ static size_t table_delete_at(qsr_session_table_t *table, size_t index) {
     memset(&table->sessions[cursor], 0, sizeof(table->sessions[cursor]));
     table->count--;
     (void)session_table_put_internal(table, &saved.key, &saved.backend_addr, saved.backend_addr_len, saved.last_seen,
-                                     false);
+                                     false, saved.owner_slot, saved.owner_flow_id);
     cursor = (cursor + 1U) % table->capacity;
   }
   return index;
@@ -238,7 +246,8 @@ static bool pressure_evict_needed(const qsr_session_table_t *table) {
 
 static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const qsr_session_key_t *key,
                                                const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
-                                               time_t now, bool allow_pressure_evict) {
+                                               time_t now, bool allow_pressure_evict, size_t owner_slot,
+                                               uint64_t owner_flow_id) {
   if (table == nullptr || table->sessions == nullptr || table->capacity == 0U || !key_valid(key) ||
       !backend_valid(backend_addr, backend_addr_len)) {
     return QSR_ERR_INVALID;
@@ -268,9 +277,12 @@ static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const
         memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
         session->backend_addr_len = backend_addr_len;
         session->last_seen = now;
+        session->owner_slot = owner_slot;
+        session->owner_flow_id = owner_flow_id;
         table->count++;
         if (key->has_cids && key->dcid_len >= QSR_MIN_LEARNED_CID_LEN && key->dcid_len <= QSR_MAX_QUIC_CID_LEN) {
           table->cid_len_mask |= 1U << key->dcid_len;
+          table->cid_len_mask_pending |= 1U << key->dcid_len;
         }
         return QSR_OK;
       }
@@ -278,6 +290,10 @@ static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const
         memcpy(&session->backend_addr, backend_addr, sizeof(*backend_addr));
         session->backend_addr_len = backend_addr_len;
         session->last_seen = now;
+        if (owner_flow_id != 0U) {
+          session->owner_slot = owner_slot;
+          session->owner_flow_id = owner_flow_id;
+        }
         return QSR_OK;
       }
       index = (index + 1U) % table->capacity;
@@ -293,7 +309,28 @@ static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const
 qsr_status_t qsr_session_table_put(qsr_session_table_t *table, const qsr_session_key_t *key,
                                    const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
                                    time_t now) {
-  return session_table_put_internal(table, key, backend_addr, backend_addr_len, now, true);
+  return session_table_put_internal(table, key, backend_addr, backend_addr_len, now, true, 0U, 0U);
+}
+
+qsr_status_t qsr_session_table_put_owned(qsr_session_table_t *table, const qsr_session_key_t *key,
+                                         const struct sockaddr_storage *backend_addr, socklen_t backend_addr_len,
+                                         time_t now, size_t owner_slot, uint64_t owner_flow_id) {
+  return session_table_put_internal(table, key, backend_addr, backend_addr_len, now, true, owner_slot, owner_flow_id);
+}
+
+/* Recompute cid_len_mask from live entries. O(capacity); reserved for the
+ * full-walk expire below, which is already O(capacity). */
+static void rebuild_cid_len_mask(qsr_session_table_t *table) {
+  uint32_t mask = 0U;
+  for (size_t i = 0U; i < table->capacity; i++) {
+    const qsr_session_t *session = &table->sessions[i];
+    if (session->used && session->key.has_cids && session->key.dcid_len >= QSR_MIN_LEARNED_CID_LEN &&
+        session->key.dcid_len <= QSR_MAX_QUIC_CID_LEN) {
+      mask |= 1U << session->key.dcid_len;
+    }
+  }
+  table->cid_len_mask = mask;
+  table->cid_len_mask_pending = mask;
 }
 
 size_t qsr_session_table_expire(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds) {
@@ -314,11 +351,14 @@ size_t qsr_session_table_expire(qsr_session_table_t *table, time_t now, time_t i
     }
     i++;
   }
+  if (expired > 0U) {
+    rebuild_cid_len_mask(table);
+  }
   return expired;
 }
 
 size_t qsr_session_table_expire_incremental(qsr_session_table_t *table, time_t now, time_t idle_timeout_seconds,
-                                            size_t scan_budget) {
+                                            size_t scan_budget, qsr_session_keep_fn keep, void *keep_userdata) {
   if (table == nullptr || table->sessions == nullptr || table->capacity == 0U || scan_budget == 0U) {
     return 0U;
   }
@@ -326,11 +366,37 @@ size_t qsr_session_table_expire_incremental(qsr_session_table_t *table, time_t n
   size_t scanned = 0U;
   while (scanned < scan_budget && scanned < table->capacity) {
     const size_t index = table->expire_cursor;
-    if (table->sessions[index].used && now - table->sessions[index].last_seen >= idle_timeout_seconds) {
-      (void)table_delete_at(table, index);
-      expired++;
-    } else {
+    qsr_session_t *session = &table->sessions[index];
+    bool advance = true;
+    if (session->used && now - session->last_seen >= idle_timeout_seconds) {
+      if (keep != nullptr && keep(session, keep_userdata)) {
+        /* Kept alive (e.g. its flow still carries traffic); refresh so the
+         * next sweeps skip it until a full idle period truly elapses. */
+        session->last_seen = now;
+      } else {
+        (void)table_delete_at(table, index);
+        expired++;
+        /* The reinserted entry now at `index` may itself be expired; re-examine. */
+        advance = false;
+      }
+    }
+    if (advance) {
+      /*
+       * Accumulate the surviving entry's CID-length bit for the next mask.
+       * Entries relocated by deletion re-enter via session_table_put_internal,
+       * which ORs into the pending mask directly, so a full cursor cycle
+       * observes every survivor at least once regardless of reinsertion.
+       */
+      if (session->used && session->key.has_cids && session->key.dcid_len >= QSR_MIN_LEARNED_CID_LEN &&
+          session->key.dcid_len <= QSR_MAX_QUIC_CID_LEN) {
+        table->cid_len_mask_pending |= 1U << session->key.dcid_len;
+      }
       table->expire_cursor = (table->expire_cursor + 1U) % table->capacity;
+      if (table->expire_cursor == 0U) {
+        /* Full cycle complete: retire length bits that no live entry carried. */
+        table->cid_len_mask = table->cid_len_mask_pending;
+        table->cid_len_mask_pending = 0U;
+      }
     }
     scanned++;
   }

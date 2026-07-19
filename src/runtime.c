@@ -230,9 +230,20 @@ static void reload_from_path(qsr_runtime_t *runtime) {
     (void)fprintf(stderr, "reload: %zu sessions and %zu flows evicted (backends removed)\n", evicted, flows_evicted);
   }
 
+  if (runtime->config.cid_codec.enabled != new_config.cid_codec.enabled ||
+      (new_config.cid_codec.enabled &&
+       memcmp(runtime->config.cid_codec.key, new_config.cid_codec.key, sizeof(new_config.cid_codec.key)) != 0)) {
+    (void)fprintf(stderr, "reload: cidEncoding updated (enabled=%d)\n", new_config.cid_codec.enabled ? 1 : 0);
+  }
+  if (runtime->config.log_connections != new_config.log_connections) {
+    (void)fprintf(stderr, "reload: logging.connections=%s\n", new_config.log_connections ? "on" : "off");
+  }
+
   /* Atomic from the dataplane's point of view: we're single-threaded. */
   runtime->config.routes = new_config.routes;
   runtime->config.idle_timeout_seconds = new_config.idle_timeout_seconds;
+  runtime->config.cid_codec = new_config.cid_codec;
+  runtime->config.log_connections = new_config.log_connections;
   (void)fprintf(stderr, "reload: ok (%zu routes total)\n", runtime->config.routes.count);
 }
 #endif /* __linux__ */
@@ -289,6 +300,20 @@ void qsr_runtime_free(qsr_runtime_t *runtime) {
 }
 
 int qsr_runtime_inotify_fd(const qsr_runtime_t *runtime) { return runtime == nullptr ? -1 : runtime->inotify_fd; }
+
+bool qsr_runtime_session_keepalive(const qsr_session_t *session, void *userdata) {
+  const qsr_session_keepalive_ctx_t *ctx = userdata;
+  const qsr_flow_t *flow = nullptr;
+  if (session->owner_flow_id != 0U) {
+    const qsr_flow_t *candidate = qsr_flow_table_slot(ctx->flows, session->owner_slot);
+    if (candidate != nullptr && candidate->id == session->owner_flow_id) {
+      flow = candidate;
+    }
+  } else if (session->key.has_tuple && !session->key.has_cids) {
+    flow = qsr_flow_table_get(ctx->flows, &session->key.client_addr, session->key.client_addr_len);
+  }
+  return flow != nullptr && ctx->now - flow->last_seen < ctx->idle_timeout_seconds;
+}
 
 /*
  * Conceptually a mutator (drives reload_from_path which writes runtime

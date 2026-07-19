@@ -32,7 +32,7 @@ Read this before exposing the router to the public internet:
 - **File descriptors.** Every concurrent client flow holds one UDP socket; the flow table is sized at `maxSessions / 4`. The process raises `RLIMIT_NOFILE` to its hard limit at startup and warns if that still cannot cover the flow table; beyond the limit, the oldest flow is recycled LRU-style. Size the container's `ulimit -n` (or `LimitNOFILE`) above expected concurrent connections.
 - **Single-threaded.** Each router process pins to one core. Run multiple processes; `SO_REUSEPORT` is set automatically so the kernel hashes flows across them.
 - **DNS is one-shot.** Backends are resolved at startup AND on every hot reload (see below). To pick up a backend IP change without a config edit, restart the process.
-- **Hot reload.** The directory containing `config.yaml` is watched via `inotify`. Editing the file or having Kubernetes swap the ConfigMap symlink triggers re-parse + DNS re-resolve + atomic swap, with no packet loss. Sessions whose backend disappeared from the new config are evicted (hard cutover); sessions to surviving backends keep going. `listen.udp` and `sessions.maxSessions` changes are logged and ignored until restart.
+- **Hot reload.** The directory containing `config.yaml` is watched via `inotify`. Editing the file or having Kubernetes swap the ConfigMap symlink triggers re-parse + DNS re-resolve + atomic swap, with no packet loss. Sessions whose backend disappeared from the new config are evicted (hard cutover); sessions to surviving backends keep going. `listen.udp` and `sessions.maxSessions` changes are logged and ignored until restart. Note that the reload's DNS resolution is synchronous on the dataplane thread: while `getaddrinfo` runs, packets queue in the kernel socket buffers. With IP-literal backends or a healthy local resolver this is sub-millisecond, but a slow or unreachable DNS server can stall forwarding for its full timeout, so prefer IP backends (or a local caching resolver) where reload latency matters.
 - **ECH-aware behaviour.** With Encrypted ClientHello, the router sees the OUTER ClientHello's cover hostname (e.g. `cloudflare-ech.com`) — not the real inner hostname, which is encrypted. We route by whatever's in the outer SNI, so ECH-using clients work iff the cover hostname is a configured route; otherwise their packets drop like any other unrouted SNI. The router can never see the inner hostname without terminating TLS (we don't).
 - **QUIC versions.** v1 (RFC 9000) and v2 (RFC 9369) are accepted. Any other version returns `UNSUPPORTED` at the parser and the packet is dropped (clients will fall back via version negotiation).
 
@@ -203,14 +203,17 @@ routes:
   rvr-a.flightdeck.tower.peinser.com:
     host: flightdeck-rvr-a.tower-system.svc.cluster.local
     port: 8443             # 1..65535
+logging:
+  connections: false       # optional; one stderr line per backend flow open/close
 ```
 
 The parser uses [libyaml](https://github.com/yaml/libyaml) (YAML 1.1) so the full input surface — block and flow style, single- and double-quoted scalars, multi-line scalars, comments anywhere, anchors and aliases — is accepted. The schema, however, is intentionally strict:
 
-- Top-level keys must be one of `listen`, `sessions`, `routes`. An unknown key (typo) is rejected rather than silently ignored.
+- Top-level keys must be one of `listen`, `sessions`, `routes`, `cidEncoding`, `logging`. An unknown key (typo) is rejected rather than silently ignored.
 - `listen.udp`, `sessions.idleTimeout` (optional `s` suffix, range `1..86400`), `sessions.maxSessions` (range `1..1000000`) are scalar.
 - Each route has exactly `host:` and `port:` (range `1..65535`); other per-route keys are rejected.
 - SNI keys are normalized to lower-case ASCII DNS names and label-validated (no leading hyphen, no empty labels, max 255 chars).
+- `logging.connections` (boolean, default `false`) emits one stderr line when a backend flow is established and one when it is torn down, e.g. `conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443` and the matching `conn: close ... reason=idle duration=63s` (reasons: `idle`, `evicted`, `reload`, `shutdown`, `reroute`, `error`). Logging happens only at connection open/close, never per packet, so it is safe to leave on in production. Hot-reloadable.
 - Empty file = use defaults.
 
 More examples are in `docs/examples.md`, including devcontainer backend services and route/session lookup design notes.
@@ -223,6 +226,7 @@ See `examples/mtls-backends/` for a Docker Compose demo with two HTTP/3 mTLS bac
 - `make sanitize`: C unit tests under ASAN/UBSAN.
 - `make fuzz-smoke`: short libFuzzer smoke tests where libFuzzer is available.
 - `make test-e2e`: Docker HTTP/3 SNI routing test using aioquic mock backends (covers v1 and v2).
+- `make test-e2e-rebind`: Docker NAT-rebind test: age a connection past `sessions.idleTimeout` under continuous traffic, switch the client to a new source port, assert the connection keeps working (guards the flow-keepalive of learned CID aliases).
 - `make test-e2e-reload`: Docker hot-reload test — start with one route, `docker cp` a new config in, assert inotify drove a reload and the new route works.
 - `make test-loadtest`: Docker correctness-under-load test using many fresh QUIC handshakes. Set `QSR_LOADTEST_DIRECT=1` to bypass the router for baseline comparison, or `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.
 - `make benchmark`: synthetic CPU benchmarks for route lookup, session lookup, and CRYPTO frame extraction.
