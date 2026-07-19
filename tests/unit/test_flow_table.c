@@ -195,6 +195,42 @@ static void test_evict_if_selective(void) {
   qsr_flow_table_free(&table);
 }
 
+/*
+ * Flow generation ids: unique per created flow, stable across an in-place
+ * update of the same tuple, and reassigned when a slot is recycled. Session
+ * aliases rely on the id to detect slot reuse.
+ */
+static void test_flow_ids_unique_and_stable(void) {
+  qsr_flow_table_t table;
+  ASSERT_TRUE(qsr_flow_table_init(&table, 2U) == QSR_OK);
+
+  struct sockaddr_storage backend = make_v4(0x0200007fU, 8443U);
+  struct sockaddr_storage c1 = make_v4(0x0100007fU, 50000U);
+  struct sockaddr_storage c2 = make_v4(0x0100007fU, 50001U);
+  const qsr_flow_t *f1 = qsr_flow_table_put(&table, &c1, sizeof(struct sockaddr_in), &backend,
+                                            sizeof(struct sockaddr_in), make_fd(), 1);
+  const qsr_flow_t *f2 = qsr_flow_table_put(&table, &c2, sizeof(struct sockaddr_in), &backend,
+                                            sizeof(struct sockaddr_in), make_fd(), 1);
+  ASSERT_TRUE(f1 != nullptr && f2 != nullptr);
+  ASSERT_TRUE(f1->id != 0U && f2->id != 0U && f1->id != f2->id);
+
+  /* In-place update of the same tuple keeps the identity. */
+  const uint64_t id_before = f1->id;
+  const qsr_flow_t *updated = qsr_flow_table_put(&table, &c1, sizeof(struct sockaddr_in), &backend,
+                                                 sizeof(struct sockaddr_in), make_fd(), 2);
+  ASSERT_TRUE(updated == f1);
+  ASSERT_TRUE(qsr_flow_table_get(&table, &c1, sizeof(struct sockaddr_in))->id == id_before);
+
+  /* Remove + reinsert the tuple: a genuinely new flow, so a new id. */
+  qsr_flow_table_remove(&table, updated);
+  const qsr_flow_t *f3 = qsr_flow_table_put(&table, &c1, sizeof(struct sockaddr_in), &backend,
+                                            sizeof(struct sockaddr_in), make_fd(), 3);
+  ASSERT_TRUE(f3 != nullptr);
+  ASSERT_TRUE(f3->id != id_before);
+
+  qsr_flow_table_free(&table);
+}
+
 typedef struct close_capture {
   size_t calls;
   qsr_flow_close_reason_t last_reason;
@@ -279,6 +315,7 @@ void test_flow_table(void) {
   test_removal_preserves_probe_chains();
   test_expire_incremental_respects_budget();
   test_evict_if_selective();
+  test_flow_ids_unique_and_stable();
   test_close_callback_reasons();
   test_invalid_arguments_rejected();
 }

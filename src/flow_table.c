@@ -50,6 +50,7 @@ qsr_status_t qsr_flow_table_init(qsr_flow_table_t *table, size_t capacity) {
     table->free_slots[i] = capacity - 1U - i;
   }
   table->free_count = capacity;
+  table->next_id = 1U;
   return QSR_OK;
 }
 
@@ -207,6 +208,7 @@ qsr_flow_t *qsr_flow_table_put(qsr_flow_table_t *table, const struct sockaddr_st
   qsr_flow_t *flow = &table->flows[slot];
   memset(flow, 0, sizeof(*flow));
   flow->used = true;
+  flow->id = table->next_id++;
   flow->fd = fd;
   memcpy(&flow->client_addr, client, sizeof(*client));
   flow->client_addr_len = client_len;

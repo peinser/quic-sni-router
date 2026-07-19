@@ -51,6 +51,7 @@ This chart's `ConfigMap` is rendered from `.Values.config`. A `helm upgrade` tha
 - Existing sessions to a route whose backend is **still in the new config** keep going untouched.
 - Existing sessions to a route whose backend **disappeared** from the new config are evicted immediately (hard cutover).
 - A parse failure or DNS-resolution failure on the new file is logged and the previous config keeps serving traffic (fail-closed).
+- The reload's DNS resolution runs synchronously on the dataplane thread; packets queue in kernel buffers while it completes. With in-cluster Services and a healthy CoreDNS this is negligible, but a degraded resolver can stall forwarding for its timeout, so keep cluster DNS healthy or use IP backends where reload latency matters.
 
 To force a pod rotation on every `helm upgrade` instead (drops live QUIC sessions):
 

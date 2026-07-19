@@ -34,6 +34,12 @@ typedef struct qsr_flow {
   socklen_t backend_addr_len;
   time_t last_seen;
   /*
+   * Monotonic generation id, assigned at creation and stable for the flow's
+   * lifetime. Session-table entries reference their owning flow as
+   * (slot, id); the id detects a recycled slot. Never 0 for a live flow.
+   */
+  uint64_t id;
+  /*
    * Connection-log metadata, written once at flow creation and only read when
    * a flow opens or closes. Kept at the end of the struct so the hot path
    * (fd, addresses, last_seen) stays in the leading cache lines.
@@ -72,6 +78,7 @@ typedef struct qsr_flow_table {
   size_t evict_cursor;  /* over the flows array, for oldest-scan eviction */
   qsr_flow_close_fn on_close; /* optional; see qsr_flow_close_fn */
   void *on_close_userdata;
+  uint64_t next_id; /* next flow generation id; starts at 1 */
 } qsr_flow_table_t;
 
 [[nodiscard]] qsr_status_t qsr_flow_table_init(qsr_flow_table_t *table, size_t capacity);

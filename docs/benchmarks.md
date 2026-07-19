@@ -76,6 +76,15 @@ Re-run after the connection-logging feature landed (logging off, its default; Do
 
 The deltas versus the previous rows are within the run-to-run spread of this Docker harness on a shared host; the logging change adds no per-packet work, so no regression is expected or observed.
 
+Re-run after the zero-copy send batching (send queue holds borrowed pointers into the receive buffers, drained per receive round, instead of memcpying each payload) plus the single-parse Initial path, same host and toolchain, same day:
+
+| Mode | Backends | Workers | Path | Result |
+| --- | ---: | ---: | --- | --- |
+| Fresh connections | 10 | 10 | Router | `2703/2703`, 0 failures, 0 misroutes, 89.8 req/s, p50 108.1ms / p99 169.9ms |
+| Persistent sessions | 10 | 10 | Router | `254221/254221`, 0 failures, 0 misroutes, 8437.7 req/s, p50 1.1ms / p95 1.7ms / p99 2.9ms |
+
+Persistent throughput is up ~14% and p99 down ~24% versus the immediately preceding run; that path forwards two datagrams per request (client and backend direction) and previously paid a payload memcpy for each. Fresh-connection mode is unchanged, as expected: it is dominated by the Python client's handshake crypto, not router CPU. The synthetic table-lookup microbenchmarks are also unchanged (medians ~49 / ~19 / ~17 / ~139 ns/op), as none of these changes touch the lookup paths.
+
 Before the backend-DCID fix, the same 2-backend fresh-connection routed test collapsed to roughly 13 req/s with timeouts, while direct stayed near 98 req/s. That regression was not crypto cost; it was incorrect backend return routing through an ambiguous shared backend tuple.
 
 Useful commands:

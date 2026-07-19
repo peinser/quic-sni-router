@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+project="qsr-rebind-e2e"
+network="${project}_e2e"
+router_image="${project}-router:latest"
+http3_image="${project}-http3:latest"
+
+cleanup() {
+  docker rm -f "${project}-client" "${project}-router" "${project}-backend" >/dev/null 2>&1 || true
+  docker network rm "${network}" >/dev/null 2>&1 || true
+}
+
+dump_logs() {
+  docker logs "${project}-router" >&2 2>/dev/null || true
+  docker logs "${project}-backend" >&2 2>/dev/null || true
+  docker logs "${project}-client" >&2 2>/dev/null || true
+}
+trap 'rc=$?; if [ ${rc} -ne 0 ]; then dump_logs; fi; cleanup' EXIT
+
+cleanup
+
+docker build -t "${router_image}" -f ../../../docker/Dockerfile --target e2e ../../..
+docker build -t "${http3_image}" -f ../http3/Dockerfile ../http3
+
+docker network create "${network}" >/dev/null
+
+docker run -d --name "${project}-backend" --network "${network}" --network-alias rebind-backend \
+  "${http3_image}" python /app/http3_backend.py --name rebind --hostname rebind.flightdeck.test \
+  --port 8443 --idle-timeout 60 >/dev/null
+docker create --name "${project}-router" --network "${network}" --network-alias rebind.flightdeck.test \
+  "${router_image}" /config/router.yaml >/dev/null
+docker cp router.yaml "${project}-router:/config/router.yaml"
+docker start "${project}-router" >/dev/null
+
+router_ip=""
+for _ in $(seq 1 20); do
+  router_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${project}-router" 2>/dev/null || true)"
+  if [ -n "${router_ip}" ]; then
+    break
+  fi
+  sleep 0.25
+done
+if [ -z "${router_ip}" ]; then
+  echo "router container did not receive an IPv4 address" >&2
+  dump_logs
+  exit 1
+fi
+
+# router.yaml sets sessions.idleTimeout to 3s; the client ages the connection
+# well past that before rebinding to a new source port.
+if ! docker run --name "${project}-client" --network "${network}" \
+  "${http3_image}" python /app/rebind_client.py --router-host "${router_ip}" --router-port 443 \
+  --router-idle-timeout 3; then
+  dump_logs
+  exit 1
+fi
+
+echo "rebind e2e passed"
