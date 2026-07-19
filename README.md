@@ -203,14 +203,17 @@ routes:
   rvr-a.flightdeck.tower.peinser.com:
     host: flightdeck-rvr-a.tower-system.svc.cluster.local
     port: 8443             # 1..65535
+logging:
+  connections: false       # optional; one stderr line per backend flow open/close
 ```
 
 The parser uses [libyaml](https://github.com/yaml/libyaml) (YAML 1.1) so the full input surface — block and flow style, single- and double-quoted scalars, multi-line scalars, comments anywhere, anchors and aliases — is accepted. The schema, however, is intentionally strict:
 
-- Top-level keys must be one of `listen`, `sessions`, `routes`. An unknown key (typo) is rejected rather than silently ignored.
+- Top-level keys must be one of `listen`, `sessions`, `routes`, `cidEncoding`, `logging`. An unknown key (typo) is rejected rather than silently ignored.
 - `listen.udp`, `sessions.idleTimeout` (optional `s` suffix, range `1..86400`), `sessions.maxSessions` (range `1..1000000`) are scalar.
 - Each route has exactly `host:` and `port:` (range `1..65535`); other per-route keys are rejected.
 - SNI keys are normalized to lower-case ASCII DNS names and label-validated (no leading hyphen, no empty labels, max 255 chars).
+- `logging.connections` (boolean, default `false`) emits one stderr line when a backend flow is established and one when it is torn down, e.g. `conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443` and the matching `conn: close ... reason=idle duration=63s` (reasons: `idle`, `evicted`, `reload`, `shutdown`, `reroute`, `error`). Logging happens only at connection open/close, never per packet, so it is safe to leave on in production. Hot-reloadable.
 - Empty file = use defaults.
 
 More examples are in `docs/examples.md`, including devcontainer backend services and route/session lookup design notes.

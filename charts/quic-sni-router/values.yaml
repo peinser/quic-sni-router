@@ -40,6 +40,11 @@ config:
   #     host: flightdeck-rvr-a.tower-system.svc.cluster.local
   #     port: 8443
   routes: {}
+  logging:
+    # One stderr line per backend flow establishment and termination
+    # (src, sni, scid, backend, close reason, duration). Connection-rate
+    # cost only; the per-packet paths never log. Hot-reloadable.
+    connections: false
 
 configMap:
   # If false, supply your own ConfigMap with key router.yaml and set name below.

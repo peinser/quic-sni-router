@@ -16,14 +16,16 @@ Production builds should start with `-DCMAKE_BUILD_TYPE=Release`, which normally
 
 ## Reference numbers
 
-Linux/aarch64 Debian 13 in the devcontainer, Release build with Clang 18, 5 runs and median reported. All "ops/s" figures are for in-process micro-operations against pre-populated tables, not full datagram processing.
+Linux/aarch64 (Docker Desktop VM, Ubuntu 24.04 toolchain), Release build with GCC 13, 5 runs and median reported. All "ops/s" figures are for in-process micro-operations against pre-populated tables, not full datagram processing. Re-measured after the connection-logging feature (per-flow SNI/SCID metadata added to `qsr_flow_t`); the flow tuple lookup is unchanged because the metadata sits behind the hot fields and is only touched at flow open/close.
 
 ```text
-route hash lookup            ~19 M ops/s     ~52 ns/op
-session cid lookup           ~50 M ops/s     ~20 ns/op
-flow tuple lookup            ~59 M ops/s     ~17 ns/op
-crypto frame extraction      ~8  M ops/s    ~125 ns/op
+route hash lookup            ~20 M ops/s     ~50 ns/op
+session cid lookup           ~51 M ops/s     ~20 ns/op
+flow tuple lookup            ~56 M ops/s     ~18 ns/op
+crypto frame extraction      ~7  M ops/s    ~139 ns/op
 ```
+
+Earlier Clang 18 devcontainer snapshot for comparison: ~52 / ~20 / ~17 / ~125 ns/op. The route-lookup and frame-extraction deltas track the toolchain/host change, not a code change.
 
 The flow tuple lookup is the entire user-space routing cost of the established
 1-RTT fast path: a short-header packet from a client tuple with a live flow is
@@ -64,6 +66,15 @@ path), the same environment sustains:
 | --- | ---: | ---: | --- | --- |
 | Fresh connections | 10 | 10 | Router | `2711/2711`, 0 failures, 0 misroutes, 90.2 req/s |
 | Persistent sessions | 10 | 10 | Router | `279708/279708`, 0 failures, 0 misroutes, 9286.8 req/s, p50 1.0ms / p99 1.7ms |
+
+Re-run after the connection-logging feature landed (logging off, its default; Docker Desktop VM, GCC 13 image build):
+
+| Mode | Backends | Workers | Path | Result |
+| --- | ---: | ---: | --- | --- |
+| Fresh connections | 10 | 10 | Router | `2689/2689`, 0 failures, 0 misroutes, 89.5 req/s, p50 105.9ms / p99 213.4ms |
+| Persistent sessions | 10 | 10 | Router | `223191/223191`, 0 failures, 0 misroutes, 7410.9 req/s, p50 1.1ms / p99 3.8ms |
+
+The deltas versus the previous rows are within the run-to-run spread of this Docker harness on a shared host; the logging change adds no per-packet work, so no regression is expected or observed.
 
 Before the backend-DCID fix, the same 2-backend fresh-connection routed test collapsed to roughly 13 req/s with timeouts, while direct stayed near 98 req/s. That regression was not crypto cost; it was incorrect backend return routing through an ambiguous shared backend tuple.
 

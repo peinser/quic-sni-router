@@ -26,4 +26,8 @@ data:
       {{- end }}
       {{- else }} {}
       {{- end }}
+    {{- if (.Values.config.logging).connections }}
+    logging:
+      connections: true
+    {{- end }}
 {{- end }}

@@ -230,9 +230,20 @@ static void reload_from_path(qsr_runtime_t *runtime) {
     (void)fprintf(stderr, "reload: %zu sessions and %zu flows evicted (backends removed)\n", evicted, flows_evicted);
   }
 
+  if (runtime->config.cid_codec.enabled != new_config.cid_codec.enabled ||
+      (new_config.cid_codec.enabled &&
+       memcmp(runtime->config.cid_codec.key, new_config.cid_codec.key, sizeof(new_config.cid_codec.key)) != 0)) {
+    (void)fprintf(stderr, "reload: cidEncoding updated (enabled=%d)\n", new_config.cid_codec.enabled ? 1 : 0);
+  }
+  if (runtime->config.log_connections != new_config.log_connections) {
+    (void)fprintf(stderr, "reload: logging.connections=%s\n", new_config.log_connections ? "on" : "off");
+  }
+
   /* Atomic from the dataplane's point of view: we're single-threaded. */
   runtime->config.routes = new_config.routes;
   runtime->config.idle_timeout_seconds = new_config.idle_timeout_seconds;
+  runtime->config.cid_codec = new_config.cid_codec;
+  runtime->config.log_connections = new_config.log_connections;
   (void)fprintf(stderr, "reload: ok (%zu routes total)\n", runtime->config.routes.count);
 }
 #endif /* __linux__ */

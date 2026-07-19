@@ -120,6 +120,20 @@ static void test_rejects_malformed_yaml(void) {
   load_and_unlink("listen:\n  udp: \"unclosed\n", &config, QSR_ERR_INVALID);
 }
 
+static void test_logging_connections_flag(void) {
+  qsr_config_t config;
+  /* Default is off. */
+  qsr_config_default(&config);
+  ASSERT_TRUE(!config.log_connections);
+  load_and_unlink("logging:\n  connections: true\n", &config, QSR_OK);
+  ASSERT_TRUE(config.log_connections);
+  load_and_unlink("logging:\n  connections: false\n", &config, QSR_OK);
+  ASSERT_TRUE(!config.log_connections);
+  /* Strict schema: unknown keys and non-boolean values are errors. */
+  load_and_unlink("logging:\n  packets: true\n", &config, QSR_ERR_INVALID);
+  load_and_unlink("logging:\n  connections: yes\n", &config, QSR_ERR_INVALID);
+}
+
 void test_config(void);
 void test_quic_initial(void);
 void test_quic_frames(void);
@@ -143,6 +157,7 @@ void test_config(void) {
   test_accepts_flow_style();
   test_accepts_anchors_and_aliases();
   test_rejects_malformed_yaml();
+  test_logging_connections_flag();
 }
 
 int main(void) {
