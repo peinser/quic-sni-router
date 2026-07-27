@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed (packaging)
+
+- **Container images are published to GitHub Container Registry.** The image workflow still builds per-arch images by digest into the on-prem registry and assembles the multi-arch manifests there, then copies the finished manifests to `ghcr.io/<owner>/quic-sni-router` in the same `imagetools create` invocation. Both registries carry the same `<version>-<sha>` and `<version>-<sha>-debug` tags; pushes to `main` additionally get `latest` and `latest-debug`. GHCR is the public location and is now the default in the Helm chart (`image.repository`) and in `make docker-build` (`IMAGE_REPO`).
+- **`docker/Dockerfile` and `tests/e2e/http3/Dockerfile` take a `BASE_IMAGE` build argument**, defaulting to the public `docker.io/library/ubuntu:24.04` and `docker.io/library/python:3.12-slim`. CI overrides the production image's base with the on-prem pull-through mirror. This makes both images buildable outside the Peinser network, and lets the `docker-e2e` and `loadtest` CI jobs drop their registry login so they can run on pull requests from forks.
+
 ### Fixed (performance/correctness follow-up)
 
 - **Session aliases no longer expire under an active connection.** The 1-RTT fast path refreshes only the flow, so every session-table entry of a long-lived connection (tuple alias, learned CID aliases) used to expire after `idleTimeout` even with continuous traffic, silently breaking NAT rebinding for connections older than that. Aliases now carry an owner link to their flow (slot + generation id, `qsr_session_table_put_owned`), and the incremental expiry sweep keeps an idle-expired entry alive while its owning flow still sees traffic (`qsr_runtime_session_keepalive`); tuple-keyed entries without an owner fall back to a flow lookup. Costs nothing per packet: the check runs only for entries whose idle timeout already elapsed, at sweep rate. Generation ids prevent a recycled flow slot from keeping a stranger's alias alive.

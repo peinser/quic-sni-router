@@ -71,7 +71,7 @@ Highlights:
 | Key | Default | Notes |
 | --- | --- | --- |
 | `replicaCount` | `2` | Multiple replicas share UDP/443 via `SO_REUSEPORT`. |
-| `image.repository` | `harbor.peinser.com/library/quic-sni-router` | Override for a fork or local mirror. |
+| `image.repository` | `ghcr.io/peinser/quic-sni-router` | Override for a fork or local mirror. |
 | `image.tag` | `""` (uses `.Chart.appVersion`) | The publish pipeline pins this to `<version>-<sha>`. |
 | `config.routes` | `{}` | Map of SNI to `{host, port}`. Empty is valid but causes every Initial to be dropped. |
 | `service.type` | `LoadBalancer` | Use `NodePort` for bare-metal without an LB. |

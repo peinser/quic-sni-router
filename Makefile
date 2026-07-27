@@ -1,7 +1,8 @@
 BUILD_DIR ?= build
 BUILD_TYPE ?= Debug
 CMAKE_GENERATOR ?=
-IMAGE_REPO ?= harbor.peinser.com/uas/quic-sni-router
+IMAGE_REPO ?= ghcr.io/peinser/quic-sni-router
+BASE_IMAGE ?=
 QSR_VERSION ?= $(shell awk '/VERSION/ && /quic-sni-router/ { print $$3; exit }' CMakeLists.txt)
 IMAGE_TAG ?= $(QSR_VERSION)-$(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 QSR_CPU_TARGET ?=
@@ -108,6 +109,7 @@ benchmark-native: ## Run benchmarks with host CPU tuning and LTO
 
 docker-build: ## Build production container image
 	$(DOCKER) build \
+		$(if $(BASE_IMAGE),--build-arg BASE_IMAGE=$(BASE_IMAGE),) \
 		--build-arg VERSION=$(IMAGE_TAG) \
 		--build-arg REVISION=$$(git rev-parse HEAD 2>/dev/null || echo unknown) \
 		--build-arg CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
