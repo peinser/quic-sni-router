@@ -3,6 +3,7 @@ run-name: ${{ github.actor }} is building a new quic-sni-router image
 
 permissions:
   contents: read
+  packages: write
 
 on:
   workflow_dispatch:
@@ -21,7 +22,13 @@ on:
     - tests/**
 
 env:
+  # Build target. Per-arch images are pushed here by digest and the tagged
+  # multi-arch manifests are assembled here first.
   IMAGE: ${{ vars.OCI_REGISTRY }}/library/quic-sni-router
+  # Base image for docker/Dockerfile. The default in the Dockerfile is the
+  # public Ubuntu image; CI substitutes the on-prem pull-through mirror to
+  # stay off Docker Hub's rate limits.
+  BASE_IMAGE: ${{ vars.OCI_REGISTRY }}/dockerhub/ubuntu:24.04
 
 jobs:
   prepare:
@@ -29,6 +36,7 @@ jobs:
       group: on-prem
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      ghcr_image: ${{ steps.ghcr.outputs.image }}
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -38,6 +46,14 @@ jobs:
         version="$(awk '/VERSION/ && /quic-sni-router/ { print $3; exit }' CMakeLists.txt)"
         short_sha="$(git rev-parse --short HEAD)"
         echo "tag=${version}-${short_sha}" >> "$GITHUB_OUTPUT"
+    - name: Determine GHCR repository
+      id: ghcr
+      env:
+        OWNER: ${{ github.repository_owner }}
+      run: |
+        # GHCR rejects uppercase in repository names, while the owner login
+        # may legitimately contain them. Lowercase once, here.
+        echo "image=ghcr.io/$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')/quic-sni-router" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -98,6 +114,7 @@ jobs:
         push: true
         provenance: false
         build-args: |
+          BASE_IMAGE=${{ env.BASE_IMAGE }}
           VERSION=${{ needs.prepare.outputs.tag }}
           REVISION=${{ github.sha }}
           CREATED=${{ github.event.repository.updated_at }}
@@ -129,6 +146,7 @@ jobs:
         push: true
         provenance: false
         build-args: |
+          BASE_IMAGE=${{ env.BASE_IMAGE }}
           VERSION=${{ needs.prepare.outputs.tag }}-debug
           REVISION=${{ github.sha }}
           CREATED=${{ github.event.repository.updated_at }}
@@ -178,31 +196,59 @@ jobs:
         username: ${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}
         password: ${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}
 
+    - name: Authenticate with GitHub Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
       with:
         driver-opts: |
           image=harbor.peinser.com/dockerhub/moby/buildkit:buildx-stable-1
 
-    - name: Create multi-arch manifests
+    - name: Create and publish multi-arch manifests
       working-directory: /tmp/digests
+      env:
+        BUILD_IMAGE: ${{ env.IMAGE }}
+        GHCR_IMAGE: ${{ needs.prepare.outputs.ghcr_image }}
+        TAG: ${{ needs.prepare.outputs.tag }}
+        # `latest` only tracks main; development pushes stay addressable by
+        # their <version>-<sha> tag alone.
+        PUBLISH_LATEST: ${{ github.ref == 'refs/heads/main' }}
       run: |
-        # imagetools create accepts a list of per-arch refs of the form
-        # <image>@sha256:<digest> and produces a single multi-arch manifest at
-        # each -t tag. The debug tag is Release-equivalent except packet
-        # decision logging is compiled in and still gated by QSR_DEBUG_PACKETS.
+        set -euo pipefail
+
+        # The build jobs pushed each per-arch image by digest into BUILD_IMAGE.
+        # imagetools create stitches those digests into one multi-arch manifest
+        # per -t tag; when the target repository differs from the sources it
+        # copies the blobs across, which is how the GHCR mirror is populated.
+        # The debug variant is the same Release build with packet decision
+        # logging compiled in, still gated by QSR_DEBUG_PACKETS at runtime.
         release_sources=()
         for f in release-*; do
-          release_sources+=("${{ env.IMAGE }}@sha256:${f#release-}")
+          release_sources+=("${BUILD_IMAGE}@sha256:${f#release-}")
         done
         debug_sources=()
         for f in debug-*; do
-          debug_sources+=("${{ env.IMAGE }}@sha256:${f#debug-}")
+          debug_sources+=("${BUILD_IMAGE}@sha256:${f#debug-}")
         done
-        docker buildx imagetools create -t "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}" "${release_sources[@]}"
-        docker buildx imagetools create -t "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}-debug" "${debug_sources[@]}"
 
-    - name: Inspect resulting manifest
-      run: |
-        docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}"
-        docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.prepare.outputs.tag }}-debug"
+        publish() {
+          local image="$1"
+          local release_tags=(-t "${image}:${TAG}")
+          local debug_tags=(-t "${image}:${TAG}-debug")
+          if [ "${PUBLISH_LATEST}" = "true" ]; then
+            release_tags+=(-t "${image}:latest")
+            debug_tags+=(-t "${image}:latest-debug")
+          fi
+          docker buildx imagetools create "${release_tags[@]}" "${release_sources[@]}"
+          docker buildx imagetools create "${debug_tags[@]}" "${debug_sources[@]}"
+          docker buildx imagetools inspect "${image}:${TAG}"
+          docker buildx imagetools inspect "${image}:${TAG}-debug"
+        }
+
+        publish "${BUILD_IMAGE}"
+        publish "${GHCR_IMAGE}"

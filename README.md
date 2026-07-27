@@ -5,51 +5,75 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-orange.svg)](ROADMAP.md)
 
-A small QUIC SNI router for pod-terminated mTLS and HTTP/3 services.
-
-> **Status: pre-1.0 / MVP.** Production-shape: real CI, sanitizers, fuzz harnesses, RFC-vector tests, Docker e2e for v1 + v2 and hot reload, hardened Helm chart. But pre-1.0 means we may break wire-adjacent behaviour or config-file semantics between 0.x releases without a major bump. Track planned changes in [ROADMAP.md](ROADMAP.md) and breaking changes in [CHANGELOG.md](CHANGELOG.md).
-
-Goal:
+Route QUIC traffic to different backends based on the TLS SNI, without terminating TLS.
 
 ```text
-client UDP 443 -> quic-sni-router -> FlightDeck pod UDP 8443
+client UDP 443 -> quic-sni-router -> backend pod UDP 8443
 ```
 
-`quic-sni-router` receives UDP QUIC packets, decrypts only QUIC v1 (RFC 9000) and QUIC v2 (RFC 9369) Initial packets far enough to read TLS ClientHello SNI, picks a configured backend, and then forwards original datagrams unchanged. Backends keep terminating TLS/mTLS; the router does not load certificates or private keys.
+The router reads incoming UDP datagrams, decrypts just enough of a QUIC Initial packet to recover the TLS ClientHello, extracts the SNI, looks up a backend, and forwards the original datagrams byte-for-byte. It never loads a certificate or a private key. Backends keep terminating their own TLS or mTLS, and they see a genuine QUIC handshake rather than a re-originated one.
 
-Current status is an MVP dataplane with QUIC v1 + v2 Initial deprotection via OpenSSL libcrypto, CRYPTO frame extraction, TLS ClientHello SNI extraction, exact-SNI route lookup, UDP forwarding, session pinning, CI, fuzz harnesses, Docker e2e tests, and devcontainer setup.
+Both QUIC v1 (RFC 9000) and v2 (RFC 9369) Initials are supported. Anything else is dropped at the parser, which makes clients fall back through version negotiation.
 
-The dataplane pre-resolves configured backend hosts before entering the packet loop and maintains tuple plus observed CID session aliases. Each client tuple gets its own upstream UDP socket toward its backend, so the backend sees one router source port per client and return traffic demultiplexes exactly by receiving socket: any number of concurrent QUIC connections to one backend work, including clients with zero-length or post-handshake-rotated connection IDs (Chrome uses zero-length client CIDs). NAT rebinding can recover via learned long-header or short-header CIDs on a best-effort basis. Linux builds use `epoll` plus `recvmmsg`/`sendmmsg` for batched I/O; other platforms use a portable `poll` + `recvfrom`/`sendto` loop.
+## Get the image
 
-## WAN-facing caveats
+Images are published to [GitHub Container Registry](https://github.com/peinser/quic-sni-router/pkgs/container/quic-sni-router) as multi-arch manifests covering `linux/amd64` and `linux/arm64`. No authentication needed.
 
-Read this before exposing the router to the public internet:
+```sh
+docker pull ghcr.io/peinser/quic-sni-router:latest
+```
 
-- **Backend isolation.** Backends should be on a non-routable / cluster-internal network. Backend return traffic is accepted on per-flow upstream sockets (ephemeral ports); an attacker who can both spoof the backend's source address AND hit a live flow's ephemeral port can inject packets toward that flow's client. QUIC's own AEAD makes this an annoyance rather than a takeover, but the safer posture is to make backends unreachable from the WAN.
-- **Anti-amplification.** The router drops Initial datagrams shorter than 1200 bytes from unknown sources (RFC 9000 §14.1), so it cannot be turned into a UDP amplifier. Add upstream BCP 38 / uRPF to block spoofed sources entirely.
-- **CPU DoS.** There is no in-process per-source rate limit. Combine with eBPF/nftables/cloud LB rate limiting before exposing to untrusted networks.
-- **Session table.** Provision `maxSessions` for `expected_connections_per_second × idleTimeout_seconds × ~4`: each new QUIC connection creates roughly 4 table entries (forward tuple, DCID alias, server-SCID alias, DCID+SCID pair). At 1000 conn/s with the default 60s `idleTimeout`, that's ~240k. When the cap is hit, the oldest entry by `last_seen` is evicted; if you're under-provisioned you'll see active connections break mid-flight.
-- **File descriptors.** Every concurrent client flow holds one UDP socket; the flow table is sized at `maxSessions / 4`. The process raises `RLIMIT_NOFILE` to its hard limit at startup and warns if that still cannot cover the flow table; beyond the limit, the oldest flow is recycled LRU-style. Size the container's `ulimit -n` (or `LimitNOFILE`) above expected concurrent connections.
-- **Single-threaded.** Each router process pins to one core. Run multiple processes; `SO_REUSEPORT` is set automatically so the kernel hashes flows across them.
-- **DNS is one-shot.** Backends are resolved at startup AND on every hot reload (see below). To pick up a backend IP change without a config edit, restart the process.
-- **Hot reload.** The directory containing `config.yaml` is watched via `inotify`. Editing the file or having Kubernetes swap the ConfigMap symlink triggers re-parse + DNS re-resolve + atomic swap, with no packet loss. Sessions whose backend disappeared from the new config are evicted (hard cutover); sessions to surviving backends keep going. `listen.udp` and `sessions.maxSessions` changes are logged and ignored until restart. Note that the reload's DNS resolution is synchronous on the dataplane thread: while `getaddrinfo` runs, packets queue in the kernel socket buffers. With IP-literal backends or a healthy local resolver this is sub-millisecond, but a slow or unreachable DNS server can stall forwarding for its full timeout, so prefer IP backends (or a local caching resolver) where reload latency matters.
-- **ECH-aware behaviour.** With Encrypted ClientHello, the router sees the OUTER ClientHello's cover hostname (e.g. `cloudflare-ech.com`) — not the real inner hostname, which is encrypted. We route by whatever's in the outer SNI, so ECH-using clients work iff the cover hostname is a configured route; otherwise their packets drop like any other unrouted SNI. The router can never see the inner hostname without terminating TLS (we don't).
-- **QUIC versions.** v1 (RFC 9000) and v2 (RFC 9369) are accepted. Any other version returns `UNSUPPORTED` at the parser and the packet is dropped (clients will fall back via version negotiation).
+`latest` tracks the head of `main`. For anything you deploy, pin the immutable `<version>-<sha>` tag that build also published:
 
-See [docs/threat-model.md](docs/threat-model.md) for the full threat model.
+```sh
+docker pull ghcr.io/peinser/quic-sni-router:0.1.0-530ab14
+```
+
+To see which tags exist, browse the [packages page](https://github.com/peinser/quic-sni-router/pkgs/container/quic-sni-router) or ask the registry directly:
+
+```sh
+crane ls ghcr.io/peinser/quic-sni-router                             # every tag
+docker buildx imagetools inspect ghcr.io/peinser/quic-sni-router:latest   # what latest resolves to
+```
+
+Every tag has a matching `-debug` variant (`:latest-debug`, `:0.1.0-530ab14-debug`). It is the same Release build with packet decision logging compiled in, still gated behind `QSR_DEBUG_PACKETS=1` at runtime, so it costs nothing until you switch it on.
+
+## Status
+
+Pre-1.0. [ROADMAP.md](ROADMAP.md) has what is planned, [CHANGELOG.md](CHANGELOG.md) has what already changed.
+
+## How forwarding works
+
+Each client tuple gets its own upstream UDP socket toward its backend. The backend therefore sees one router source port per client, and return traffic demultiplexes purely by which socket received it, with no table lookup at all in that direction. That is what makes concurrent connections to the same backend work, including clients that use zero-length connection IDs (Chrome does) or rotate them after the handshake.
+
+Alongside the flows, the router keeps a session table of connection ID aliases learned from long-header packets in both directions. Those aliases are what let a NAT rebind recover: a client that reappears from a new source port is matched by its DCID instead of its tuple. It is best-effort, not guaranteed.
+
+Backend hostnames are resolved once before the packet loop starts, and again on every config reload. On Linux the loop uses `epoll` with `recvmmsg`/`sendmmsg` for batched I/O; elsewhere it falls back to `poll` with `recvfrom`/`sendto`.
+
+## Before you put this on the internet
+
+- **Keep backends off the WAN.** Return traffic is accepted on per-flow ephemeral ports, so an attacker who can both spoof a backend's source address and guess a live flow's port can inject packets toward that client. QUIC's AEAD makes that a nuisance rather than a compromise, but an unroutable backend network removes the problem entirely.
+- **Amplification is handled.** Initial datagrams shorter than 1200 bytes from unknown sources are dropped per RFC 9000 §14.1, so the router cannot be used as a UDP amplifier. BCP 38 / uRPF upstream is still worth having.
+- **Rate limiting is not.** There is no per-source limit in the process. Put eBPF, nftables, or a cloud load balancer in front of it before exposing it to untrusted networks.
+- **Size the session table.** A new QUIC connection creates roughly four to five entries (forward tuple, DCID alias, server SCID alias, DCID+SCID pair, plus a reverse tuple once a rebind happens). Budget `connections_per_second × idleTimeout_seconds × 5`; at 1000 conn/s with the default 60s timeout that is about 300k. When `maxSessions` is reached the least recently seen entry is evicted, which breaks live connections if you are under-provisioned.
+- **Size the file descriptors.** One UDP socket per concurrent flow, with the flow table capped at `maxSessions / 4`. The process raises `RLIMIT_NOFILE` to its hard limit at startup and warns if that is still not enough; past the cap, the oldest flow is recycled. Set the container's `ulimit -n` above your expected concurrency.
+- **One core per process.** The dataplane is single-threaded on purpose. Run several processes instead: `SO_REUSEPORT` is set automatically and the kernel hashes flows across them.
+- **ECH shows you the cover name.** With Encrypted ClientHello the router only ever sees the outer SNI (`cloudflare-ech.com` and friends). Routing works if that cover name is a configured route, and drops otherwise. The inner name is unreachable without terminating TLS, which is exactly what this thing refuses to do.
+
+[docs/threat-model.md](docs/threat-model.md) has the full analysis.
 
 ## Build
 
 ```sh
-make build
-make test
-make test-e2e
-make sanitize
-make fuzz-smoke
-make benchmark
+make build          # router and tests
+make test           # unit tests
+make sanitize       # unit tests under ASAN/UBSAN
+make fuzz-smoke     # short libFuzzer runs over the parsers
+make benchmark      # synthetic route/session/parser benchmarks
+make test-e2e       # Docker HTTP/3 routing test
 ```
 
-`make test-e2e` uses Docker Compose to start two mock HTTP/3 backends and verifies that SNI routes to both through the router. It requires Docker and network access to build the Python/aioquic test image.
+Dependencies are OpenSSL libcrypto, libyaml, CMake 3.25+, and a C23 compiler. The end-to-end targets need Docker and outbound network access to build the aioquic test image. [.devcontainer/](.devcontainer/) has a container with everything preinstalled.
 
 ## Run
 
@@ -57,24 +81,60 @@ make benchmark
 quic-sni-router config.yaml
 ```
 
-Build the production image from `docker/Dockerfile`:
+Or from the published image:
+
+```sh
+docker run --rm -p 443:443/udp -v ./router.yaml:/config/router.yaml:ro \
+  ghcr.io/peinser/quic-sni-router:latest
+```
+
+The runtime image exposes `443/udp`, runs as the non-root `qsr` user, and reads `/config/router.yaml` by default. To build it yourself:
 
 ```sh
 make docker-build
 ```
 
-Run it with the routing config mounted at the default path:
+## Config
 
-```sh
-docker run --rm -p 443:443/udp -v ./router.yaml:/config/router.yaml:ro \
-  harbor.peinser.com/uas/quic-sni-router:dev
+```yaml
+listen:
+  udp: ":443"
+sessions:
+  idleTimeout: 60s         # 1..86400, measured on CLOCK_MONOTONIC
+  maxSessions: 100000      # table entries, not connections; see the sizing note above
+routes:
+  rvr-a.flightdeck.tower.peinser.com:
+    host: flightdeck-rvr-a.tower-system.svc.cluster.local
+    port: 8443             # 1..65535
+logging:
+  connections: false       # one stderr line per backend flow open and close
 ```
 
-The runtime image exposes `443/udp`, runs as the non-root `qsr` user, and defaults to `/config/router.yaml`. It does not contain TLS private keys and does not terminate backend TLS or mTLS.
+Parsing is done by [libyaml](https://github.com/yaml/libyaml), so the whole YAML 1.1 surface is accepted: block and flow style, quoted and multi-line scalars, comments, anchors, aliases. The schema on top of it is deliberately unforgiving:
+
+- The only top-level keys are `listen`, `sessions`, `routes`, `cidEncoding`, and `logging`. Anything else is an error rather than a silently ignored typo.
+- Each route takes exactly `host` and `port`. Extra keys are rejected.
+- SNI keys are lower-cased and validated as DNS names: no empty labels, no leading hyphens, 255 characters max.
+- An empty file means defaults.
+
+With `logging.connections: true` you get one line when a flow opens and one when it closes:
+
+```text
+conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443
+conn: close src=203.0.113.7:51820 sni=rvr-a.example reason=idle duration=63s
+```
+
+Close reasons are `idle`, `evicted`, `reload`, `shutdown`, `reroute`, and `error`. Nothing is logged per packet, so this is safe to leave on in production. Like the rest of the config, it is hot-reloadable.
+
+### Hot reload
+
+The directory holding `config.yaml` is watched with `inotify`. Editing the file, or Kubernetes swapping a ConfigMap symlink, triggers a re-parse, a DNS re-resolve, and an atomic swap with no packet loss. Sessions whose backend vanished from the new config are evicted; everything else keeps running. Changes to `listen.udp` and `sessions.maxSessions` are logged and ignored until restart.
+
+One caveat: the reload's DNS resolution happens synchronously on the dataplane thread, so packets queue in the kernel buffer while `getaddrinfo` runs. That is sub-millisecond with IP literals or a healthy local resolver, but an unreachable DNS server can stall forwarding for its full timeout. Use IP backends or a local caching resolver if reload latency matters to you.
+
+More examples are in [docs/examples.md](docs/examples.md), and [examples/mtls-backends/](examples/mtls-backends/) is a Compose demo with two HTTP/3 mTLS backends routed by SNI.
 
 ## Kubernetes
-
-### Helm (recommended)
 
 ```sh
 helm install qsr oci://harbor.peinser.com/library/charts/quic-sni-router \
@@ -83,13 +143,9 @@ helm install qsr oci://harbor.peinser.com/library/charts/quic-sni-router \
   -f values.yaml
 ```
 
-The chart lives in [charts/quic-sni-router/](charts/quic-sni-router/) and is published to `oci://harbor.peinser.com/library/charts/quic-sni-router` on every push to `main` (see [.github/workflows/helm.yaml](.github/workflows/helm.yaml)). Defaults: 2-replica `Deployment`, `LoadBalancer` Service (`externalTrafficPolicy: Cluster`; switch to `Local` if you want real client source IPs), `PodDisruptionBudget`, hardened pod + container security context, `automountServiceAccountToken: false`, no CPU limit (avoids CFS throttling on the UDP dataplane), and `inotify`-driven hot reload of the `ConfigMap` (no pod restart on `helm upgrade`).
+The chart is in [charts/quic-sni-router/](charts/quic-sni-router/) and is published on every push to `main`. It defaults to a 2-replica Deployment behind a `LoadBalancer` Service, a PodDisruptionBudget, hardened pod and container security contexts, `automountServiceAccountToken: false`, no CPU limit (CFS throttling and a UDP dataplane do not mix), and ConfigMap hot reload, so `helm upgrade` does not restart pods. Switch `externalTrafficPolicy` to `Local` if you need real client source addresses. The [chart README](charts/quic-sni-router/README.md) has the full values reference and a WAN deployment checklist.
 
-See [charts/quic-sni-router/README.md](charts/quic-sni-router/README.md) for the full values reference, schema, and WAN deployment checklist.
-
-### Raw manifests
-
-If you don't use Helm, mount the router config as a ConfigMap at `/config/router.yaml` and expose UDP/443 with a `LoadBalancer`, `NodePort`, host-networked DaemonSet, or equivalent cluster edge pattern.
+Without Helm, mount the config as a ConfigMap at `/config/router.yaml` and expose UDP/443 however you normally reach the cluster edge:
 
 ```yaml
 apiVersion: v1
@@ -120,7 +176,7 @@ spec:
     spec:
       containers:
       - name: router
-        image: harbor.peinser.com/library/quic-sni-router:sha-<revision>
+        image: ghcr.io/peinser/quic-sni-router:<version>-<sha>
         ports:
         - containerPort: 443
           protocol: UDP
@@ -135,9 +191,9 @@ spec:
           name: quic-sni-router
 ```
 
-Backend services should listen for QUIC on their configured UDP port and keep their own certificates, client CA policy, and mTLS enforcement. The router forwards original QUIC datagrams unchanged after SNI-based backend selection.
+### Watch out for Service load balancing
 
-If a route points at a normal Kubernetes `Service`, Kubernetes may load-balance UDP traffic across the Service endpoints. QUIC requires all datagrams for a connection to reach the same backend pod that owns that QUIC connection state. Use a stable per-pod endpoint, a headless Service with explicit pod DNS names, or configure Service affinity when routing to a Service:
+QUIC needs every datagram of a connection to reach the pod that holds that connection's state. A plain `Service` will happily spread UDP across endpoints and break exactly that. Route to pod endpoints directly, use a headless Service with per-pod DNS names, or set affinity:
 
 ```yaml
 apiVersion: v1
@@ -160,86 +216,54 @@ spec:
     targetPort: 8443
 ```
 
-`sessionAffinity: ClientIP` can keep UDP packets from one router pod pinned to one backend pod, but it is not QUIC-aware and may collapse balancing if many client sessions arrive through the same router pod IP. For predictable per-connection distribution, prefer routing directly to pod endpoints or placing a QUIC-aware load balancer behind the router.
+`sessionAffinity: ClientIP` pins packets from one router pod to one backend pod, but it is not QUIC-aware and collapses balancing when many client sessions arrive through the same router pod IP. Per-pod endpoints are the predictable choice.
 
-## Performance Builds
+## Build tuning
 
-Production containers configure CMake with `-DCMAKE_BUILD_TYPE=Release` and build with `clang`. For Clang/GCC this already enables the toolchain's Release defaults, typically `-O3 -DNDEBUG`. Linux builds use `epoll` plus `recvmmsg`/`sendmmsg`; an earlier `io_uring` path was removed because its `submit; wait_cqe`-per-packet pattern was strictly slower than batched `recvmmsg`/`sendmmsg`.
+Published images are `-DCMAKE_BUILD_TYPE=Release` built with clang, which gets you `-O3 -DNDEBUG` and little else worth configuring. An earlier `io_uring` path was removed: its submit-then-wait-per-packet shape was strictly slower than batched `recvmmsg`/`sendmmsg`. See [docs/benchmarks.md](docs/benchmarks.md) for numbers.
 
-Useful build toggles:
+| Option | Effect |
+| --- | --- |
+| `QSR_ENABLE_SANITIZERS=ON` | ASAN/UBSAN test build |
+| `QSR_BUILD_FUZZERS=ON` | libFuzzer harnesses |
+| `QSR_BUILD_BENCHMARKS=ON` | synthetic dataplane benchmarks |
+| `QSR_CPU_TARGET=native` | tune Release for the build host's CPU |
+| `QSR_CPU_TARGET=znver3` or `znver4` | tune Release for a known Ryzen generation |
+| `QSR_ENABLE_LTO=ON` | interprocedural optimization, where the toolchain supports it |
+| `QSR_ENABLE_PACKET_DEBUG=ON` | compile in packet decision logging |
+| `BASE_IMAGE=<ref>` | container base image, defaults to `docker.io/library/ubuntu:24.04` |
 
-- `-DQSR_ENABLE_SANITIZERS=ON`: ASAN/UBSAN test build.
-- `-DQSR_BUILD_FUZZERS=ON`: libFuzzer harnesses.
-- `-DQSR_BUILD_BENCHMARKS=ON`: synthetic dataplane benchmarks.
-- `-DQSR_CPU_TARGET=native`: tune Release builds for the local CPU.
-- `-DQSR_CPU_TARGET=znver3` or `znver4`: tune Release builds for a known Ryzen generation.
-- `-DQSR_ENABLE_LTO=ON`: enable Release interprocedural optimization when supported by the compiler/linker.
-- `-DQSR_ENABLE_PACKET_DEBUG=ON`: compile packet decision logging support. Published images use a separate `-debug` tag for this and still require `QSR_DEBUG_PACKETS=1` at runtime before logging packets.
-
-For Ryzen-only hosts, benchmark the portable Release build against a native-tuned build:
+To see whether CPU tuning buys you anything on a homogeneous fleet, compare:
 
 ```sh
 make benchmark
 make benchmark-native
 ```
 
-For a host-specific container image on the same Ryzen fleet, build with:
+and if it does, bake it in with `make docker-build QSR_CPU_TARGET=native QSR_ENABLE_LTO=ON`. Only do that when every host running the image is compatible with the build host. Published images leave `QSR_CPU_TARGET` empty.
 
-```sh
-make docker-build QSR_CPU_TARGET=native QSR_ENABLE_LTO=ON
-```
+## Tests
 
-Use `native` only when the image will run on CPUs compatible with the build host. For published portable images, leave `QSR_CPU_TARGET` empty. The image workflow publishes paired multi-arch manifests (`linux/amd64` and `linux/arm64`): the default tag has packet debug logging compiled out, and the matching `-debug` tag compiles it in for production diagnosis.
+| Target | What it covers |
+| --- | --- |
+| `make test` | unit tests, including the RFC 9001 and RFC 9369 Initial-key vectors |
+| `make sanitize` | the same tests under ASAN/UBSAN |
+| `make fuzz-smoke` | short libFuzzer runs over the Initial, frame, and ClientHello parsers |
+| `make test-e2e` | HTTP/3 SNI routing to two aioquic backends, v1 and v2 |
+| `make test-e2e-flows` | per-flow upstream isolation |
+| `make test-e2e-fragmented` | ClientHello split across out-of-order Initials |
+| `make test-e2e-rebind` | NAT rebind on a connection aged past `idleTimeout` |
+| `make test-e2e-idle` | backend idle timeout handling |
+| `make test-e2e-reverse` | reverse-tuple routing of stale resets |
+| `make test-e2e-reload` | inotify hot reload picks up a new route |
+| `make test-loadtest` | 10 backends under sustained concurrent handshakes, asserting zero misroutes |
 
-## Config
+`make test-loadtest` takes `QSR_LOADTEST_DIRECT=1` to bypass the router for a baseline, and `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.
 
-```yaml
-listen:
-  udp: ":443"
-sessions:
-  idleTimeout: 60s         # 1..86400, applied with CLOCK_MONOTONIC
-  maxSessions: 100000      # session-table entries; one QUIC connection uses multiple aliases
-routes:
-  rvr-a.flightdeck.tower.peinser.com:
-    host: flightdeck-rvr-a.tower-system.svc.cluster.local
-    port: 8443             # 1..65535
-logging:
-  connections: false       # optional; one stderr line per backend flow open/close
-```
+## Prior work
 
-The parser uses [libyaml](https://github.com/yaml/libyaml) (YAML 1.1) so the full input surface — block and flow style, single- and double-quoted scalars, multi-line scalars, comments anywhere, anchors and aliases — is accepted. The schema, however, is intentionally strict:
-
-- Top-level keys must be one of `listen`, `sessions`, `routes`, `cidEncoding`, `logging`. An unknown key (typo) is rejected rather than silently ignored.
-- `listen.udp`, `sessions.idleTimeout` (optional `s` suffix, range `1..86400`), `sessions.maxSessions` (range `1..1000000`) are scalar.
-- Each route has exactly `host:` and `port:` (range `1..65535`); other per-route keys are rejected.
-- SNI keys are normalized to lower-case ASCII DNS names and label-validated (no leading hyphen, no empty labels, max 255 chars).
-- `logging.connections` (boolean, default `false`) emits one stderr line when a backend flow is established and one when it is torn down, e.g. `conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443` and the matching `conn: close ... reason=idle duration=63s` (reasons: `idle`, `evicted`, `reload`, `shutdown`, `reroute`, `error`). Logging happens only at connection open/close, never per packet, so it is safe to leave on in production. Hot-reloadable.
-- Empty file = use defaults.
-
-More examples are in `docs/examples.md`, including devcontainer backend services and route/session lookup design notes.
-
-See `examples/mtls-backends/` for a Docker Compose demo with two HTTP/3 mTLS backends routed by SNI.
-
-## Testing
-
-- `make test`: C unit tests.
-- `make sanitize`: C unit tests under ASAN/UBSAN.
-- `make fuzz-smoke`: short libFuzzer smoke tests where libFuzzer is available.
-- `make test-e2e`: Docker HTTP/3 SNI routing test using aioquic mock backends (covers v1 and v2).
-- `make test-e2e-rebind`: Docker NAT-rebind test: age a connection past `sessions.idleTimeout` under continuous traffic, switch the client to a new source port, assert the connection keeps working (guards the flow-keepalive of learned CID aliases).
-- `make test-e2e-reload`: Docker hot-reload test — start with one route, `docker cp` a new config in, assert inotify drove a reload and the new route works.
-- `make test-loadtest`: Docker correctness-under-load test using many fresh QUIC handshakes. Set `QSR_LOADTEST_DIRECT=1` to bypass the router for baseline comparison, or `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.
-- `make benchmark`: synthetic CPU benchmarks for route lookup, session lookup, and CRYPTO frame extraction.
-
-## References
-
-- `dlundquist/sniproxy` for separation of listener, parser, route table, and forwarding responsibilities.
-- `AGWA/snid` for a minimal SNI demux philosophy and backend safety constraints.
-- `HyBuildNet/quic-relay` for a Go QUIC reverse proxy with SNI routing, handler-chain extensibility, load balancing, hot reload, and optional QUIC TLS termination for Hytale protocol inspection.
-- See `docs/inspirations.md` for what is and is not portable from TCP SNI proxies.
+`dlundquist/sniproxy` for the separation of listener, parser, route table, and forwarder. `AGWA/snid` for a minimal SNI demux philosophy and its backend safety constraints. `HyBuildNet/quic-relay` for a Go take with handler chains, load balancing, and optional TLS termination. [docs/inspirations.md](docs/inspirations.md) covers what does and does not carry over from TCP SNI proxies.
 
 ## License
 
-Copyright 2026 Peinser BV.
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE) for third-party attributions.
+Copyright 2026 Peinser BV. Apache 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).

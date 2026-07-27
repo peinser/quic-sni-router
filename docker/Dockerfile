@@ -1,4 +1,8 @@
-FROM harbor.peinser.com/dockerhub/ubuntu:24.04 AS build
+# Base for both stages. Defaults to the public image so the Dockerfile builds
+# anywhere; CI overrides it with an internal pull-through mirror.
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG QSR_CPU_TARGET=
@@ -29,7 +33,7 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=c
     && cmake --build build \
     && ctest --test-dir build --output-on-failure
 
-FROM harbor.peinser.com/dockerhub/ubuntu:24.04 AS production
+FROM ${BASE_IMAGE} AS production
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=unknown

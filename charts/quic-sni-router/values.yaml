@@ -4,7 +4,7 @@
 # empty routes map otherwise and the router will drop every Initial.
 
 image:
-  repository: harbor.peinser.com/library/quic-sni-router
+  repository: ghcr.io/peinser/quic-sni-router
   # If empty, defaults to .Chart.appVersion (set by the publish pipeline to a
   # pinned <version>-<sha> for reproducibility).
   tag: ""
