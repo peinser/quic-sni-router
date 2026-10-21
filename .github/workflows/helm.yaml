@@ -6,13 +6,7 @@ permissions:
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/helm.yaml
-      - charts/quic-sni-router/**
-      - CMakeLists.txt
+  workflow_call:
 
 jobs:
 
@@ -45,6 +39,13 @@ jobs:
         # so every push produces a unique, immutable chart artifact.
         BASE="$(awk '/VERSION/ && /quic-sni-router/ { print $3; exit }' CMakeLists.txt)"
         echo "value=${BASE}-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+    - name: Verify the pinned image exists
+      env:
+        OWNER: ${{ github.repository_owner }}
+        TAG: ${{ steps.version.outputs.value }}
+      run: |
+        crane manifest "ghcr.io/${OWNER,,}/quic-sni-router:${TAG}" > /dev/null
 
     - name: Set chart version and appVersion
       run: |

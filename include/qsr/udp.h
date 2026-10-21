@@ -2,7 +2,8 @@
  * qsr/udp.h:dataplane entry point. Binds the listen socket, sets up
  * SO_REUSEPORT (Linux) for multi-process scaling, drives the recvmmsg/
  * sendmmsg loop, and delegates lifecycle (config load, session table,
- * hot reload) to qsr/runtime.h. SIGINT/SIGTERM trigger a graceful drain.
+ * hot reload) to qsr/runtime.h. SIGINT/SIGTERM flush and close immediately;
+ * SIGUSR2 stops new admission and drains flows; SIGUSR1 reports counters.
  */
 #ifndef QSR_UDP_H
 #define QSR_UDP_H

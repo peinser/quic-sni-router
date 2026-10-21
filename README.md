@@ -13,7 +13,7 @@ client UDP 443 -> quic-sni-router -> backend pod UDP 8443
 
 The router reads incoming UDP datagrams, decrypts just enough of a QUIC Initial packet to recover the TLS ClientHello, extracts the SNI, looks up a backend, and forwards the original datagrams byte-for-byte. It never loads a certificate or a private key. Backends keep terminating their own TLS or mTLS, and they see a genuine QUIC handshake rather than a re-originated one.
 
-Both QUIC v1 (RFC 9000) and v2 (RFC 9369) Initials are supported. Anything else is dropped at the parser, which makes clients fall back through version negotiation.
+Both QUIC v1 (RFC 9000) and v2 (RFC 9369) Initials are supported. Unsupported versions are dropped; the router does not emit Version Negotiation packets, so clients must support a configured version or perform their own fallback.
 
 ## Get the image
 
@@ -52,12 +52,12 @@ Backend hostnames are resolved once before the packet loop starts, and again on 
 
 ## Before you put this on the internet
 
-- **Keep backends off the WAN.** Return traffic is accepted on per-flow ephemeral ports, so an attacker who can both spoof a backend's source address and guess a live flow's port can inject packets toward that client. QUIC's AEAD makes that a nuisance rather than a compromise, but an unroutable backend network removes the problem entirely.
-- **Amplification is handled.** Initial datagrams shorter than 1200 bytes from unknown sources are dropped per RFC 9000 §14.1, so the router cannot be used as a UDP amplifier. BCP 38 / uRPF upstream is still worth having.
+- **Keep backends private.** Connected upstream sockets accept return packets only from the configured backend endpoint. This filters unrelated sources; QUIC authentication and upstream anti-spoofing remain necessary against spoofed backend traffic.
+- **Backends enforce anti-amplification.** The router drops unknown Initial datagrams shorter than 1200 bytes. This is a protocol minimum, not a no-amplification guarantee: a QUIC backend may send up to three times received bytes before address validation. Use BCP 38 / uRPF upstream.
 - **Rate limiting is not.** There is no per-source limit in the process. Put eBPF, nftables, or a cloud load balancer in front of it before exposing it to untrusted networks.
 - **Size the session table.** A new QUIC connection creates roughly four to five entries (forward tuple, DCID alias, server SCID alias, DCID+SCID pair, plus a reverse tuple once a rebind happens). Budget `connections_per_second × idleTimeout_seconds × 5`; at 1000 conn/s with the default 60s timeout that is about 300k. When `maxSessions` is reached the least recently seen entry is evicted, which breaks live connections if you are under-provisioned.
-- **Size the file descriptors.** One UDP socket per concurrent flow, with the flow table capped at `maxSessions / 4`. The process raises `RLIMIT_NOFILE` to its hard limit at startup and warns if that is still not enough; past the cap, the oldest flow is recycled. Set the container's `ulimit -n` above your expected concurrency.
-- **One core per process.** The dataplane is single-threaded on purpose. Run several processes instead: `SO_REUSEPORT` is set automatically and the kernel hashes flows across them.
+- **Size descriptors and source ports.** There is one connected, explicitly bound UDP socket per client tuple. Flow capacity is `maxSessions / 4` (minimum 256). The process raises `RLIMIT_NOFILE` and reports the Linux ephemeral-port range; a common range has only 28,232 ports shared with other processes in that network namespace. Descriptor or port exhaustion recycles a flow and retries once. Raising `ulimit` alone cannot provide more ports. Partition network namespaces/source capacity for larger deployments.
+- **One dataplane core per process.** `SO_REUSEPORT` hashes tuples between processes sharing a network namespace. State is not shared: NAT rebinding or changing the worker set can select a worker without the connection's aliases. Kubernetes replicas instead have independent namespaces and rely on Service/LB flow affinity. Keep worker ownership stable or use coordinated CID-aware steering; scaling is not automatically migration-safe.
 - **ECH shows you the cover name.** With Encrypted ClientHello the router only ever sees the outer SNI (`cloudflare-ech.com` and friends). Routing works if that cover name is a configured route, and drops otherwise. The inner name is unreachable without terminating TLS, which is exactly what this thing refuses to do.
 
 [docs/threat-model.md](docs/threat-model.md) has the full analysis.
@@ -73,7 +73,7 @@ make benchmark      # synthetic route/session/parser benchmarks
 make test-e2e       # Docker HTTP/3 routing test
 ```
 
-Dependencies are OpenSSL libcrypto, libyaml, CMake 3.25+, and a C23 compiler. The end-to-end targets need Docker and outbound network access to build the aioquic test image. [.devcontainer/](.devcontainer/) has a container with everything preinstalled.
+Dependencies are OpenSSL 3.0+ libcrypto, libyaml, POSIX threads, CMake 3.25+, and a C23 compiler (Clang 18+ or GCC 14+). The end-to-end targets need Docker and outbound network access to build the aioquic test image. [.devcontainer/](.devcontainer/) has a container with everything preinstalled.
 
 ## Run
 
@@ -113,7 +113,7 @@ logging:
 Parsing is done by [libyaml](https://github.com/yaml/libyaml), so the whole YAML 1.1 surface is accepted: block and flow style, quoted and multi-line scalars, comments, anchors, aliases. The schema on top of it is deliberately unforgiving:
 
 - The only top-level keys are `listen`, `sessions`, `routes`, `cidEncoding`, and `logging`. Anything else is an error rather than a silently ignored typo.
-- Each route takes exactly `host` and `port`. Extra keys are rejected.
+- Each route requires `host` and `port`, with optional `serverId` for authenticated CID routing. Other keys are rejected.
 - SNI keys are lower-cased and validated as DNS names: no empty labels, no leading hyphens, 255 characters max.
 - An empty file means defaults.
 
@@ -124,13 +124,25 @@ conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.
 conn: close src=203.0.113.7:51820 sni=rvr-a.example reason=idle duration=63s
 ```
 
-Close reasons are `idle`, `evicted`, `reload`, `shutdown`, `reroute`, and `error`. Nothing is logged per packet, so this is safe to leave on in production. Like the rest of the config, it is hot-reloadable.
+Close reasons are `idle`, `evicted`, `reload`, `shutdown`, and `error` (including backend rerouting). Lifecycle records pass through a bounded nonblocking pipe to a logging thread; a slow collector drops records rather than blocking forwarding. `log_drops` reports queue losses. Shutdown may discard queued records. Logging is hot-reloadable.
 
 ### Hot reload
 
-The directory holding `config.yaml` is watched with `inotify`. Editing the file, or Kubernetes swapping a ConfigMap symlink, triggers a re-parse, a DNS re-resolve, and an atomic swap with no packet loss. Sessions whose backend vanished from the new config are evicted; everything else keeps running. Changes to `listen.udp` and `sessions.maxSessions` are logged and ignored until restart.
+The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp` and `sessions.maxSessions` require restart.
 
-One caveat: the reload's DNS resolution happens synchronously on the dataplane thread, so packets queue in the kernel buffer while `getaddrinfo` runs. That is sub-millisecond with IP literals or a healthy local resolver, but an unreachable DNS server can stall forwarding for its full timeout. Use IP backends or a local caching resolver if reload latency matters to you.
+DNS timeouts no longer stall packet forwarding; failed candidates retain the previous configuration. Startup still resolves synchronously, and process shutdown waits for an outstanding resolver worker. Prefer atomic rename for config updates: completed-write notifications cannot make arbitrary concurrent in-place writers transactional.
+
+### Linux I/O and operational signals
+
+Wildcard listeners prefer dual-stack IPv6 with IPv4 fallback. Explicit IPv6 addresses use `[::1]:8443`. Replies preserve the local destination address/interface via packet-info ancillary data. Routing state remains per client tuple; concurrent connections from one client tuple to different local VIPs/backends need separate router instances/listeners.
+
+The receive path reserves 64 KiB per GRO slot and rejects payload/ancillary truncation. Compatible same-destination batches use UDP GSO with per-datagram fallback. Individual datagrams remain capped at 1500 bytes; jumbo QUIC datagrams are not supported. Startup logs effective kernel socket buffers and port capacity.
+
+- `SIGUSR1`: emit live counters, including kernel drops, send errno counts, truncations, allocation failures, evictions, GSO batches, and log drops.
+- `SIGUSR2`: stop admitting unknown connections, continue routing existing state/authenticated CIDs, and exit once flows expire. Keep the LB delivering established traffic while draining; encrypted QUIC close frames cannot be observed, so idle expiry determines completion.
+- `SIGTERM` / `SIGINT`: flush queued sends and close immediately. They do not preserve active connections. A Kubernetes grace period or `maxUnavailable: 0` alone does not make rollouts connection-preserving.
+
+Authenticated CID routing has a new, incompatible format; see [docs/cid-routing.md](docs/cid-routing.md) before upgrading backends using `cidEncoding`.
 
 More examples are in [docs/examples.md](docs/examples.md), and [examples/mtls-backends/](examples/mtls-backends/) is a Compose demo with two HTTP/3 mTLS backends routed by SNI.
 
@@ -182,8 +194,7 @@ spec:
           protocol: UDP
         volumeMounts:
         - name: config
-          mountPath: /config/router.yaml
-          subPath: router.yaml
+          mountPath: /config
           readOnly: true
       volumes:
       - name: config

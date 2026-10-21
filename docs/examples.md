@@ -66,9 +66,9 @@ The earlier `io_uring` path was synchronous (submit-then-wait per packet) and sl
 
 ## Scaling and Operations
 
-- The dataplane is single-threaded. To use more cores, run multiple router processes bound to the same address; the kernel hashes flows across them via `SO_REUSEPORT` (set automatically on Linux). On Kubernetes this is typically a Deployment with `replicas > 1` plus a Service routing to the host port.
+- The dataplane is single-threaded. Processes in one namespace can share a port with `SO_REUSEPORT`, but state is local and NAT rebinding or worker changes can select a different owner. Kubernetes pods have independent namespaces and are balanced by the Service/LB. Stable tuple affinity is necessary; CID-aware steering requires deployment-level coordination.
 - Idle expiry uses `CLOCK_MONOTONIC`, so an NTP step or wall-clock adjustment will not flush sessions.
-- `SIGINT` and `SIGTERM` trigger a graceful shutdown: the loop drains, sender flushes, sockets close. Kubernetes' default `SIGTERM` plus `terminationGracePeriodSeconds` is sufficient.
+- `SIGUSR1` reports counters. `SIGUSR2` stops unknown connection admission and exits after flows expire; keep established traffic routed to the process during this phase. `SIGINT`/`SIGTERM` flush the send queue and immediately close connections. Kubernetes grace periods alone do not preserve connections.
 - Backends are resolved at startup AND on every hot reload (see below). If only the *IP* behind a stable hostname changes (no config edit), restart the router (`kubectl rollout restart deploy/quic-sni-router`).
 
 ## Hot reloading the route config

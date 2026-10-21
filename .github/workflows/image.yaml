@@ -20,6 +20,8 @@ on:
     - include/**
     - src/**
     - tests/**
+    - charts/quic-sni-router/**
+    - .github/workflows/helm.yaml
 
 env:
   # Build target. Per-arch images are pushed here by digest and the tagged
@@ -252,3 +254,9 @@ jobs:
 
         publish "${BUILD_IMAGE}"
         publish "${GHCR_IMAGE}"
+
+  publish-chart:
+    needs: merge
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/helm.yaml
+    secrets: inherit

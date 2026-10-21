@@ -13,7 +13,7 @@ Initial deprotection uses OpenSSL libcrypto HKDF (SHA-256), AES-128-ECB for QUIC
 | Long-header type bits for Initial | `0b00` (`0x00`) | `0b01` (`0x10`) |
 | HKDF labels | `"quic key"`, `"quic iv"`, `"quic hp"` | `"quicv2 key"`, `"quicv2 iv"`, `"quicv2 hp"` |
 
-The parser reads the version field first, then validates the type bits against that version's table. A v2-versioned packet with v1 type bits (or vice versa) is rejected as `INVALID` rather than fed to the wrong deprotection path. Any other version returns `UNSUPPORTED` (clients will then fall back via version negotiation).
+The parser reads the version field first, then validates the type bits against that version's table. A v2-versioned packet with v1 type bits (or vice versa) is rejected as `INVALID`. Other versions return `UNSUPPORTED`; silent dropping does not perform version negotiation.
 
 Key derivation is validated against the published Appendix A test vectors in both RFCs (see [tests/unit/test_quic_crypto.c](../tests/unit/test_quic_crypto.c)).
 
@@ -47,7 +47,7 @@ If a fresh client Initial decrypts cleanly but does not yet contain enough conti
 
 ## Session pinning, flows, and rebinding
 
-- Each client tuple gets a **flow**: a dedicated unconnected UDP socket toward its backend. The backend therefore sees one router source port per client, and its return datagrams arrive on the flow's own fd. Return-path demultiplexing is exact (the fd identifies the client) for any number of concurrent QUIC connections to the same backend, including clients that use zero-length connection IDs or rotate CIDs after the handshake. The client side never sees this: forwarded backend packets are always sent from the listen socket, so the client's peer tuple stays the router's `:443`.
+- Each client tuple gets a **flow**: a dedicated, explicitly bound and connected UDP socket toward its backend. The kernel filters unrelated source endpoints; the receiving fd identifies the client even with zero-length or rotated CIDs. Replies leave the listen socket with the original local address/interface selected using packet-info ancillary data. The source-port space, descriptor limit, and configured flow capacity all bound concurrency. Replacing a backend creates a new connected socket and generation after flushing the old socket's queued sends.
 - Tuple alias (client `(addr,port)` -> backend) is the fast path for client-to-backend classification.
 - Long-header DCID and (DCID, SCID) pair aliases are learned from client Initials, and the server-chosen SCID is learned from backend long-header responses (Initial, Handshake, Retry). A NAT rebinding that lands on a learned CID can recover the session; backend return traffic needs no CID inspection at all.
 - Short-header rebinding is best-effort: QUIC short headers do not self-describe the DCID length, so the router tries learned CID-length candidates from longest to shortest. On match the new client tuple is bound to the backend, and the next client packet flows through a fresh upstream socket (the backend sees a path migration and validates it per RFC 9000 section 9).

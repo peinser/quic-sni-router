@@ -10,8 +10,8 @@ spec:
   selector:
     matchLabels:
       {{- include "quic-sni-router.selectorLabels" . | nindent 6 }}
-  # maxUnavailable: 0 means no in-flight session loss during rollout, at the
-  # cost of needing room for one extra replica during the upgrade window.
+  # Keeps replica availability during rollout, but does not preserve the
+  # terminating pod's QUIC connections (state is local to each process).
   strategy:
     type: RollingUpdate
     rollingUpdate:

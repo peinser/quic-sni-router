@@ -1,5 +1,16 @@
 # Benchmarks
 
+The current synthetic benchmark randomizes route and flow lookups and uses
+50,000 live session keys in a 100,000-slot table. Historical hot-key measurements
+below are not directly comparable. Use Release builds; sanitizer timings are not
+performance results. ARM64 tuning uses `-mcpu`, x86 uses `-march`.
+
+For deployment decisions, run both fresh and persistent connection loadtests,
+then measure bidirectional packet loss and p99 latency at realistic connection
+counts and table pressure. Include GSO/GRO bursts, config reloads, CPU contention,
+and actual NIC RSS/NUMA placement. The synthetic lookup rate is not forwarding
+throughput and does not justify an io_uring rewrite by itself.
+
 Run the synthetic dataplane CPU benchmark with:
 
 ```sh

@@ -4,8 +4,8 @@ What's planned, why it's worth doing, and what would block someone from picking 
 
 ## Near term (0.x)
 
-- **RFC 9484 QUIC-LB CID-encoded routing**. The proper fix for the NEW_CONNECTION_ID gap: when backend QUIC stacks encode a server-id into the CIDs they issue, the router can route short-header packets statelessly via DCID decode, with no session-table lookup at all. Requires a config option to declare the encoding (offset, length, optional XOR/Block cipher) per route. Eliminates the NAT-rebind-plus-CID-rotation failure mode that the operational keepalive workaround currently has to paper over. Cost: ~200 lines of routing code, ~100 lines of test, schema additions to values.yaml + JSON Schema.
-- **Metrics endpoint (Prometheus exposition format)**. The `qsr_metrics_t` struct in [include/qsr/metrics.h](include/qsr/metrics.h) exists but is never populated. Wire counters in the dataplane (datagrams in/out, parse_failures, unknown_sni, sessions_active) and expose them on a small admin HTTP port. Unlocks `ServiceMonitor` and HPA in the Helm chart.
+- **Standard QUIC-LB interoperability**. A qsr-specific authenticated CID codec is implemented; see [docs/cid-routing.md](docs/cid-routing.md). Standard wire-format support and CID-aware worker steering remain future work. Neither shared flow state nor seamless worker replacement follows from CID decoding alone.
+- **Metrics endpoint (Prometheus exposition format)**. Dataplane counters are populated and available through SIGUSR1 and shutdown logs. An admin HTTP endpoint would enable `ServiceMonitor` and HPA integration.
 - **Periodic backend DNS re-resolve**. Today resolution happens at startup and on config reload; an IP change behind a stable hostname requires a kick. A 60s re-resolver that swaps the route's `backend_addr` atomically would close this gap. Watch out for race with the hot-reload path — the new periodic re-resolver should call into the runtime module, not edit the route table directly.
 - **Per-source rate limit**. CPU-DoS shield independent of upstream BCP 38. Token bucket per `/24` (or `/64` for v6), bounded LRU map. Drop Initials over budget before HKDF/AES. Default: very generous (e.g., 1000 Initials/s per /24).
 - **Wildcard / suffix SNI routes**. `*.example.com` → backend. Compile-time: change route lookup from exact `strcmp` to a two-pass (exact, then longest suffix). Bounded cost since route count is ≤ 1024.
@@ -14,7 +14,7 @@ What's planned, why it's worth doing, and what would block someone from picking 
 ## Mid term
 
 - **io_uring fast path, done properly**. The earlier synchronous io_uring path was strictly slower than `recvmmsg`/`sendmmsg` and got removed. A real rewrite uses multishot recv (`IORING_RECV_MULTISHOT`), registered buffers, and zero-copy send. Worth doing once we have benchmarks that show user-space lookup is no longer the bottleneck.
-- **GSO/GRO (segmentation offload)**. Linux UDP supports send-side `UDP_SEGMENT` and recv-side `UDP_GRO`. For high-rate flows this is a 2-3x throughput win. Requires kernel ≥5.0 and `setsockopt(UDP_GRO, 1)`.
+- **Offload benchmarking**. GRO with 64 KiB receive slots and same-destination GSO batches are implemented with fallback. Measure throughput, loss, and p99 on physical NICs and virtual networking before claiming a specific speedup.
 - **HostName / SAN map per route**. SNIs are matched as-is today. For deployments with many SAN-aliased hostnames behind one backend, a `aliases: [a, b, c]` field would avoid repetition.
 - **Native multi-arch image builds (no QEMU)**. The image workflow currently cross-builds arm64 under QEMU. With on-prem arm64 runners + the matrix-and-merge pattern (which we had in an intermediate revision), the arm64 build runs natively at ~3× the speed.
 - **Helm `ServiceMonitor` + HPA templates**. Depends on the metrics endpoint above. Add an opt-in `serviceMonitor.enabled` and an HPA targeting `datagrams_in` rate.

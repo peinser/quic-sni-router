@@ -2,6 +2,7 @@
 
 #include "qsr/cid_codec.h"
 #include "qsr/flow_table.h"
+#include "qsr/metrics.h"
 #include "qsr/quic_crypto.h"
 #include "qsr/quic_frames.h"
 #include "qsr/quic_initial.h"
@@ -12,7 +13,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,8 +44,8 @@ enum : unsigned { QSR_UDP_BATCH_SIZE = 64U };
  * via the SCM_UDP_GRO cmsg. Without GRO, only the first QSR_MAX_DATAGRAM_SIZE
  * bytes are used.
  */
-enum : size_t { QSR_UDP_RECV_BUFFER_SIZE = 16U * 1024U };
-enum : size_t { QSR_UDP_RECV_CMSG_SIZE = 64U };
+enum : size_t { QSR_UDP_RECV_BUFFER_SIZE = 65536U };
+enum : size_t { QSR_UDP_RECV_CMSG_SIZE = 256U };
 enum : size_t { QSR_SESSION_EXPIRE_MIN_SCAN = 1024U };
 enum : size_t { QSR_SESSION_EXPIRE_MAX_SCAN = 16384U };
 enum : size_t { QSR_PENDING_INITIAL_CAPACITY = 64U };
@@ -76,11 +79,17 @@ typedef struct qsr_udp_send_item {
   struct sockaddr_storage dest;
   socklen_t dest_len;
   int fd;
+  struct sockaddr_storage local_addr;
+  unsigned local_ifindex;
 } qsr_udp_send_item_t;
 
 typedef struct qsr_udp_sender {
   qsr_udp_send_item_t items[QSR_UDP_BATCH_SIZE];
   size_t count;
+  qsr_metrics_t *metrics;
+#if defined(__linux__) && defined(UDP_SEGMENT)
+  bool gso_disabled;
+#endif
 } qsr_udp_sender_t;
 
 typedef struct qsr_pending_initial {
@@ -114,7 +123,100 @@ typedef struct qsr_dataplane {
   qsr_udp_sender_t sender;
   int main_fd;
   int epoll_fd; /* -1 on platforms without epoll */
+  struct sockaddr_storage local_addr;
+  unsigned local_ifindex;
+  qsr_metrics_t metrics;
+#ifdef __linux__
+  uint32_t rx_overflow;
+#endif
+  int log_read_fd;
+  int log_write_fd;
+  pthread_t log_thread;
+  bool log_started;
+  uint64_t log_drops;
 } qsr_dataplane_t;
+
+/* Bounded kernel pipe: slow stderr drops lifecycle logs instead of blocking
+ * forwarding. A dedicated reader is necessary because stderr may be a pipe
+ * or a regular file; O_NONBLOCK on a regular file does not prevent stalls. */
+static void *connection_log_writer(void *userdata) {
+  const qsr_dataplane_t *dp = userdata;
+  char buffer[4096];
+  for (;;) {
+    const ssize_t n = read(dp->log_read_fd, buffer, sizeof(buffer));
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      return nullptr;
+    }
+    ssize_t offset = 0;
+    while (offset < n) {
+      const ssize_t written = write(STDERR_FILENO, buffer + offset, (size_t)(n - offset));
+      if (written < 0 && errno == EINTR) {
+        continue;
+      }
+      if (written <= 0) {
+        return nullptr;
+      }
+      offset += written;
+    }
+  }
+}
+
+static void connection_log_start(qsr_dataplane_t *dp) {
+  int fds[2];
+  if (pipe(fds) < 0) {
+    return;
+  }
+  (void)fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+  (void)fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+  if (fcntl(fds[1], F_SETFL, O_NONBLOCK) < 0) {
+    (void)close(fds[0]);
+    (void)close(fds[1]);
+    return;
+  }
+  dp->log_read_fd = fds[0];
+  dp->log_write_fd = fds[1];
+  if (pthread_create(&dp->log_thread, nullptr, connection_log_writer, dp) != 0) {
+    (void)close(fds[0]);
+    (void)close(fds[1]);
+    return;
+  }
+  dp->log_started = true;
+}
+
+static void connection_log_stop(qsr_dataplane_t *dp) {
+  if (dp->log_started) {
+    /* write(2) is a cancellation point: shutdown must not wait on a stalled
+     * collector. Pending lifecycle records are best-effort on termination. */
+    (void)pthread_cancel(dp->log_thread);
+    (void)pthread_join(dp->log_thread, nullptr);
+    (void)close(dp->log_read_fd);
+    (void)close(dp->log_write_fd);
+    dp->log_started = false;
+  }
+}
+
+static void connection_log(qsr_dataplane_t *dp, const char *format, ...) {
+  char line[1024]; /* Below Linux PIPE_BUF: all-or-nothing nonblocking writes. */
+  va_list args;
+  va_start(args, format);
+  const int n = vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  if (n <= 0) {
+    return;
+  }
+  const size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1U;
+  line[len - 1U] = '\n';
+  ssize_t written;
+  do {
+    written = dp->log_started ? write(dp->log_write_fd, line, len) : -1;
+  } while (written < 0 && dp->log_started && errno == EINTR);
+  if (written != (ssize_t)len) {
+    dp->log_drops++;
+  }
+}
 
 /*
  * Set by SIGINT/SIGTERM handler; the dataplane loop checks it between
@@ -122,10 +224,17 @@ typedef struct qsr_dataplane {
  * acceptable here because the dataplane is single-process.
  */
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_report = 0;
+static volatile sig_atomic_t g_drain = 0;
 
 static void handle_signal(int sig) {
-  (void)sig;
-  g_stop = 1;
+  if (sig == SIGUSR1) {
+    g_report = 1;
+  } else if (sig == SIGUSR2) {
+    g_drain = 1;
+  } else {
+    g_stop = 1;
+  }
 }
 
 static void install_signal_handlers(void) {
@@ -134,6 +243,8 @@ static void install_signal_handlers(void) {
   sa.sa_flags = 0;
   (void)sigaction(SIGINT, &sa, nullptr);
   (void)sigaction(SIGTERM, &sa, nullptr);
+  (void)sigaction(SIGUSR1, &sa, nullptr);
+  (void)sigaction(SIGUSR2, &sa, nullptr);
   /*
    * Ignore SIGPIPE: a backend reset of an unrelated TCP connection on the
    * same process (e.g., DNS resolver bug) should not kill the dataplane.
@@ -200,6 +311,9 @@ static void sender_flush(qsr_udp_sender_t *sender) {
 #ifdef __linux__
   struct iovec iovecs[QSR_UDP_BATCH_SIZE] = {0};
   struct mmsghdr messages[QSR_UDP_BATCH_SIZE] = {0};
+  alignas(struct cmsghdr)
+      /* cppcheck-suppress constVariable ; CMSG aliases mutate this ancillary buffer. */
+      uint8_t controls[QSR_UDP_BATCH_SIZE][CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(uint16_t))] = {0};
   size_t start = 0U;
   while (start < sender->count) {
     size_t end = start + 1U;
@@ -212,9 +326,76 @@ static void sender_flush(qsr_udp_sender_t *sender) {
       iovecs[i].iov_len = sender->items[i].packet_len;
       messages[i].msg_hdr.msg_iov = &iovecs[i];
       messages[i].msg_hdr.msg_iovlen = 1U;
-      messages[i].msg_hdr.msg_name = &sender->items[i].dest;
+      messages[i].msg_hdr.msg_name = sender->items[i].dest_len == 0 ? nullptr : &sender->items[i].dest;
       messages[i].msg_hdr.msg_namelen = sender->items[i].dest_len;
+      const qsr_udp_send_item_t *item = &sender->items[i];
+      if (item->local_addr.ss_family == AF_INET || item->local_addr.ss_family == AF_INET6) {
+        struct msghdr *msg = &messages[i].msg_hdr;
+        msg->msg_control = controls[i];
+        msg->msg_controllen = item->local_addr.ss_family == AF_INET ? CMSG_SPACE(sizeof(struct in_pktinfo))
+                                                                    : CMSG_SPACE(sizeof(struct in6_pktinfo));
+        struct cmsghdr *cm = CMSG_FIRSTHDR(msg);
+        if (item->local_addr.ss_family == AF_INET) {
+          cm->cmsg_level = IPPROTO_IP;
+          cm->cmsg_type = IP_PKTINFO;
+          cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+          const struct in_pktinfo info = {.ipi_spec_dst = ((const struct sockaddr_in *)&item->local_addr)->sin_addr,
+                                          .ipi_ifindex = (int)item->local_ifindex};
+          memcpy(CMSG_DATA(cm), &info, sizeof(info));
+        } else {
+          cm->cmsg_level = IPPROTO_IPV6;
+          cm->cmsg_type = IPV6_PKTINFO;
+          cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+          const struct in6_pktinfo info = {.ipi6_addr = ((const struct sockaddr_in6 *)&item->local_addr)->sin6_addr,
+                                           .ipi6_ifindex = item->local_ifindex};
+          memcpy(CMSG_DATA(cm), &info, sizeof(info));
+        }
+      }
     }
+#ifdef UDP_SEGMENT
+    bool compatible = !sender->gso_disabled && end - start > 1U;
+    size_t total = 0;
+    for (size_t i = start; i < end && compatible; i++) {
+      const qsr_udp_send_item_t *a = &sender->items[start];
+      const qsr_udp_send_item_t *b = &sender->items[i];
+      compatible = a->packet_len == b->packet_len && a->dest_len == b->dest_len &&
+                   memcmp(&a->dest, &b->dest, a->dest_len) == 0 &&
+                   memcmp(&a->local_addr, &b->local_addr, sizeof(a->local_addr)) == 0 &&
+                   a->local_ifindex == b->local_ifindex;
+      total += b->packet_len;
+    }
+    if (compatible && total <= 65507U) {
+      struct msghdr msg = messages[start].msg_hdr;
+      const size_t original_control_len = msg.msg_controllen;
+      msg.msg_control = controls[start];
+      msg.msg_controllen += CMSG_SPACE(sizeof(uint16_t));
+      struct cmsghdr *cm = (struct cmsghdr *)(controls[start] + original_control_len);
+      cm->cmsg_level = SOL_UDP;
+      cm->cmsg_type = UDP_SEGMENT;
+      cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+      const uint16_t segment = (uint16_t)sender->items[start].packet_len;
+      memcpy(CMSG_DATA(cm), &segment, sizeof(segment));
+      msg.msg_iov = &iovecs[start];
+      msg.msg_iovlen = end - start;
+      ssize_t result;
+      do {
+        result = sendmsg(sender->items[start].fd, &msg, MSG_DONTWAIT);
+      } while (result < 0 && errno == EINTR);
+      if (result >= 0) {
+        if (sender->metrics != nullptr) {
+          sender->metrics->datagrams_out += end - start;
+          sender->metrics->gso_batches++;
+        }
+        start = end;
+        continue;
+      }
+      if (errno == ENOPROTOOPT || errno == EINVAL || errno == EIO || errno == EOPNOTSUPP) {
+        sender->gso_disabled = true;
+      }
+      /* Unsupported offload, MTU restrictions, or queue pressure: retain the
+       * original per-datagram messages and let sendmmsg report final errors. */
+    }
+#endif
     size_t sent = start;
     while (sent < end) {
       const int result = sendmmsg(sender->items[start].fd, &messages[sent], (unsigned int)(end - sent), MSG_DONTWAIT);
@@ -226,28 +407,36 @@ static void sender_flush(qsr_udp_sender_t *sender) {
          * EAGAIN/ENOBUFS on a saturated send queue is best treated as a drop:
          * QUIC has its own loss recovery and retransmits.
          */
+        if (sender->metrics != nullptr) {
+          sender->metrics->send_drops += end - sent;
+          sender->metrics->send_errors[errno < 256 ? errno : 255]++;
+        }
         break;
       }
       if (result == 0) {
         break;
       }
       sent += (size_t)result;
+      if (sender->metrics != nullptr) {
+        sender->metrics->datagrams_out += (unsigned)result;
+      }
     }
     start = end;
   }
 #else
   for (size_t i = 0U; i < sender->count; i++) {
     (void)sendto(sender->items[i].fd, sender->items[i].packet, sender->items[i].packet_len, 0,
-                 (const struct sockaddr *)&sender->items[i].dest, sender->items[i].dest_len);
+                 sender->items[i].dest_len == 0 ? nullptr : (const struct sockaddr *)&sender->items[i].dest,
+                 sender->items[i].dest_len);
   }
 #endif
   sender->count = 0U;
 }
 
-static void sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *packet, size_t packet_len,
-                           const struct sockaddr_storage *dest, socklen_t dest_len) {
+static qsr_udp_send_item_t *sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *packet, size_t packet_len,
+                                           const struct sockaddr_storage *dest, socklen_t dest_len) {
   if (packet_len > QSR_MAX_DATAGRAM_SIZE) {
-    return;
+    return nullptr;
   }
   if (sender->count >= QSR_UDP_BATCH_SIZE) {
     sender_flush(sender);
@@ -255,9 +444,16 @@ static void sender_enqueue(qsr_udp_sender_t *sender, int fd, const uint8_t *pack
   qsr_udp_send_item_t *item = &sender->items[sender->count++];
   item->packet = packet;
   item->packet_len = packet_len;
-  memcpy(&item->dest, dest, sizeof(*dest));
+  if (dest != nullptr) {
+    item->dest = *dest;
+  } else {
+    memset(&item->dest, 0, sizeof(item->dest));
+  }
   item->dest_len = dest_len;
   item->fd = fd;
+  memset(&item->local_addr, 0, sizeof(item->local_addr));
+  item->local_ifindex = 0;
+  return item;
 }
 
 static void format_addr(const struct sockaddr_storage *addr, socklen_t addr_len, char *out, size_t out_len) {
@@ -390,18 +586,18 @@ static void format_cid(const uint8_t *cid, size_t cid_len, char *out, size_t out
   out[cid_len * 2U] = '\0';
 }
 
-static void conn_log_open(const qsr_flow_t *flow) {
+static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   char src[INET6_ADDRSTRLEN + 16];
   char backend[INET6_ADDRSTRLEN + 16];
   char scid[QSR_MAX_QUIC_CID_LEN * 2U + 1U];
   format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
-  (void)fprintf(stderr, "conn: open src=%s sni=%s scid=%s backend=%s\n", src, flow->sni[0] != '\0' ? flow->sni : "?",
-                scid, backend);
+  connection_log(dp, "conn: open src=%s sni=%s scid=%s backend=%s\n", src, flow->sni[0] != '\0' ? flow->sni : "?", scid,
+                 backend);
 }
 
-static void conn_log_close(const qsr_flow_t *flow, const char *reason, time_t now) {
+static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const char *reason, time_t now) {
   char src[INET6_ADDRSTRLEN + 16];
   char backend[INET6_ADDRSTRLEN + 16];
   char scid[QSR_MAX_QUIC_CID_LEN * 2U + 1U];
@@ -409,18 +605,23 @@ static void conn_log_close(const qsr_flow_t *flow, const char *reason, time_t no
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
   const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
-  (void)fprintf(stderr, "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
-                flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
+  connection_log(dp, "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
+                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
 }
 
 /* Registered as the flow table's on_close hook; fires for idle expiry,
  * eviction, reload cutover, and shutdown. */
 static void conn_close_callback(const qsr_flow_t *flow, qsr_flow_close_reason_t reason, void *userdata) {
-  const qsr_dataplane_t *dp = userdata;
+  qsr_dataplane_t *dp = userdata;
+  /* The close hook runs before close(2): no queued descriptor may outlive it. */
+  sender_flush(&dp->sender);
+  if (reason == QSR_FLOW_CLOSE_EVICTED) {
+    dp->metrics.flow_evictions++;
+  }
   if (!dp->runtime->config.log_connections) {
     return;
   }
-  conn_log_close(flow, flow_close_reason_name(reason), monotonic_now());
+  conn_log_close(dp, flow, flow_close_reason_name(reason), monotonic_now());
 }
 
 /*
@@ -536,7 +737,13 @@ static void pending_initial_append_packet(qsr_pending_initial_t *entry, const ui
   if (prefix_len >= host_len || strlen(colon + 1) >= port_len) {
     return QSR_ERR_INVALID;
   }
-  if (prefix_len == 0U) {
+  if (listen[0] == '[') {
+    if (prefix_len < 3U || listen[prefix_len - 1U] != ']') {
+      return QSR_ERR_INVALID;
+    }
+    memcpy(host, listen + 1U, prefix_len - 2U);
+    host[prefix_len - 2U] = '\0';
+  } else if (prefix_len == 0U) {
     host[0] = '\0';
   } else {
     memcpy(host, listen, prefix_len);
@@ -545,6 +752,12 @@ static void pending_initial_append_packet(qsr_pending_initial_t *entry, const ui
   const size_t port_str_len = strlen(colon + 1);
   memcpy(port, colon + 1, port_str_len);
   port[port_str_len] = '\0';
+  char *end;
+  errno = 0;
+  const unsigned long number = strtoul(port, &end, 10);
+  if (port[0] < '0' || port[0] > '9' || errno != 0 || *end != '\0' || number == 0 || number > 65535) {
+    return QSR_ERR_INVALID;
+  }
   return QSR_OK;
 }
 
@@ -588,17 +801,57 @@ route_initial_datagram(const qsr_config_t *config, qsr_pending_initial_table_t *
     *cid_key = qsr_session_cid_key(initial->dcid, initial->dcid_len, initial->scid, initial->scid_len);
   }
 
-  qsr_quic_plaintext_t plaintext;
-  qsr_status_t status = qsr_quic_decrypt_initial(packet, packet_len, initial, &plaintext);
-  if (status != QSR_OK) {
-    return status;
-  }
-
   qsr_crypto_stream_t crypto;
   qsr_crypto_stream_init(&crypto);
-  status = qsr_quic_extract_crypto(plaintext.data, plaintext.len, &crypto);
-  if (status != QSR_OK) {
-    return status;
+  size_t offset = 0;
+  qsr_quic_initial_t current = *initial;
+  while (offset < packet_len) {
+    if (offset != 0) {
+      const qsr_status_t parsed = qsr_quic_parse_initial(packet + offset, packet_len - offset, &current);
+      if (parsed != QSR_OK) {
+        qsr_quic_long_header_t header;
+        if (qsr_quic_parse_long_header(packet + offset, packet_len - offset, &header) != QSR_OK) {
+          break; /* Short headers have no length and must be last. */
+        }
+        const uint8_t initial_type = header.version == QSR_QUIC_V1 ? 0x00 : 0x10;
+        const uint8_t retry_type = header.version == QSR_QUIC_V1 ? 0x30 : 0x00;
+        if (header.type_bits == initial_type) {
+          return parsed;
+        }
+        if (header.type_bits == retry_type) {
+          break; /* Retry is not length-delimited. */
+        }
+        if (header.version != initial->version || header.dcid_len != initial->dcid_len ||
+            memcmp(header.dcid, initial->dcid, initial->dcid_len) != 0) {
+          return QSR_ERR_INVALID;
+        }
+        uint64_t payload_len;
+        size_t consumed;
+        const size_t remaining = packet_len - offset - header.remainder_offset;
+        if (qsr_quic_parse_varint(packet + offset + header.remainder_offset, remaining,
+                                  &payload_len, &consumed) != QSR_OK || payload_len > remaining - consumed) {
+          return QSR_ERR_TRUNCATED;
+        }
+        offset += header.remainder_offset + consumed + (size_t)payload_len;
+        continue; /* Skip opaque 0-RTT/Handshake, then examine the next packet. */
+      }
+    }
+    if (current.version != initial->version || current.dcid_len != initial->dcid_len ||
+        current.scid_len != initial->scid_len || memcmp(current.dcid, initial->dcid, initial->dcid_len) != 0 ||
+        memcmp(current.scid, initial->scid, initial->scid_len) != 0) {
+      return QSR_ERR_INVALID;
+    }
+    const size_t size = current.packet_number_offset + current.payload_len;
+    qsr_quic_plaintext_t plaintext;
+    qsr_status_t status = qsr_quic_decrypt_initial(packet + offset, size, &current, &plaintext);
+    if (status != QSR_OK) {
+      return status;
+    }
+    status = qsr_quic_extract_crypto(plaintext.data, plaintext.len, &crypto);
+    if (status != QSR_OK && status != QSR_ERR_NOT_FOUND) {
+      return status;
+    }
+    offset += size;
   }
 
   qsr_pending_initial_t *entry = pending_initial_get(pending_initials, source, source_len, initial, now);
@@ -745,10 +998,10 @@ static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_k
 
 /*
  * Try to decode an encoded server_id out of the packet's destination CID.
- * Returns QSR_OK when the codec is enabled AND the DCID is a 16-byte encoded
- * CID that passes the magic check. Long headers carry an explicit DCID length;
+ * Returns QSR_OK when the codec is enabled AND the DCID is an authenticated
+ * encoded CID. Long headers carry an explicit DCID length;
  * short headers do not, so we read exactly QSR_CID_ENCODED_LEN bytes and let
- * the magic check reject everything else.
+ * authentication reject everything else.
  */
 [[nodiscard]] static qsr_status_t try_decode_dcid_server_id(const qsr_cid_codec_t *codec, const uint8_t *packet,
                                                             size_t packet_len, uint8_t *server_id) {
@@ -768,7 +1021,7 @@ static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_k
     return qsr_cid_codec_decode(codec, &packet[6], dcid_len, server_id);
   }
   /* Short header: no explicit DCID length. Try at the codec's fixed length;
-   * the magic check rejects unrelated CIDs. */
+   * authentication rejects unrelated CIDs. */
   if ((packet[0] & 0x40U) == 0U || packet_len < 1U + QSR_CID_ENCODED_LEN) {
     return QSR_ERR_INVALID;
   }
@@ -825,7 +1078,9 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
  * evicted (closing its fd) and the open is retried once, so a flood of new
  * connections degrades to LRU flow recycling instead of hard failure.
  */
-[[nodiscard]] static int flow_socket_open(qsr_flow_table_t *flows, sa_family_t family) {
+[[nodiscard]] static int flow_socket_open(qsr_flow_table_t *flows, const struct sockaddr_storage *backend,
+                                          socklen_t backend_len) {
+  const sa_family_t family = backend->ss_family;
   for (int attempt = 0; attempt < 2; attempt++) {
 #ifdef __linux__
     const int fd = socket(family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -840,11 +1095,29 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
       }
       (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
 #endif
+      /* Bind before publishing the flow: implicit-bind port exhaustion must
+       * not masquerade as transient send EAGAIN. No REUSEADDR: unique ports
+       * are essential to exact return-path demultiplexing. */
+      struct sockaddr_storage local = {0};
+      local.ss_family = family;
+      const socklen_t local_len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      if (bind(fd, (const struct sockaddr *)&local, local_len) < 0 ||
+          connect(fd, (const struct sockaddr *)backend, backend_len) < 0) {
+        const int saved = errno;
+        (void)close(fd);
+        if ((saved == EADDRINUSE || saved == EADDRNOTAVAIL) && attempt == 0 &&
+            qsr_flow_table_evict_oldest(flows) == 1U) {
+          continue;
+        }
+        errno = saved;
+        return -1;
+      }
 #if defined(__linux__) && defined(UDP_GRO)
       /* Backend return traffic is the bulk direction; let the kernel coalesce
        * its bursts the same way the listen socket does. Best-effort. */
       int one = 1;
       (void)setsockopt(fd, IPPROTO_UDP, UDP_GRO, &one, sizeof(one));
+      (void)setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof(one));
 #endif
       return fd;
     }
@@ -857,7 +1130,7 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
 }
 
 /*
- * Find or create the upstream flow for a client tuple. The flow's unconnected
+ * Find or create the upstream flow for a client tuple. The flow's connected
  * socket gives this client a router source port of its own toward the backend,
  * which is what makes concurrent QUIC connections to one backend demux exactly
  * on the return path (the fd identifies the client; no CID inspection needed).
@@ -871,25 +1144,22 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
   qsr_flow_t *flow = qsr_flow_table_get(flows, client, client_len);
   if (flow != nullptr) {
     if (flow->backend_addr_len != backend_len || memcmp(&flow->backend_addr, backend, backend_len) != 0) {
-      /* Same client tuple, different backend: kernel source-port reuse after
-       * a close, or a reload re-pointed the route. The socket is unconnected,
-       * so re-aiming it is just a destination update. The old backend session
-       * effectively ends here, so log a close/open pair for it. */
-      if (log_connections) {
-        conn_log_close(flow, "reroute", now);
-      }
-      memcpy(&flow->backend_addr, backend, sizeof(*backend));
-      flow->backend_addr_len = backend_len;
-      flow_set_conn_metadata(flow, sni, scid, scid_len, now);
-      if (log_connections) {
-        conn_log_open(flow);
-      }
+      /* A fresh backend requires a fresh connected socket and generation,
+       * including when its address family differs. The close hook flushes
+       * borrowed sends before the old descriptor can be reused. */
+      qsr_flow_table_remove(flows, flow);
+      flow = nullptr;
     }
-    flow->last_seen = now;
-    return flow;
+    if (flow != nullptr) {
+      flow->last_seen = now;
+      flow->local_addr = dp->local_addr;
+      flow->local_ifindex = dp->local_ifindex;
+      return flow;
+    }
   }
-  const int fd = flow_socket_open(flows, backend->ss_family);
+  const int fd = flow_socket_open(flows, backend, backend_len);
   if (fd < 0) {
+    dp->metrics.flow_open_failures++;
     return nullptr;
   }
   flow = qsr_flow_table_put(flows, client, client_len, backend, backend_len, fd, now);
@@ -898,6 +1168,8 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
     return nullptr;
   }
   flow_set_conn_metadata(flow, sni, scid, scid_len, now);
+  flow->local_addr = dp->local_addr;
+  flow->local_ifindex = dp->local_ifindex;
 #ifdef __linux__
   struct epoll_event event = {.events = EPOLLIN, .data.u64 = (uint64_t)qsr_flow_table_slot_of(flows, flow)};
   if (epoll_ctl(dp->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
@@ -906,7 +1178,7 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
   }
 #endif
   if (log_connections) {
-    conn_log_open(flow);
+    conn_log_open(dp, flow);
   }
   return flow;
 }
@@ -938,10 +1210,11 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
     qsr_flow_t *fast_flow = qsr_flow_table_get(&dp->runtime->flows, source, source_len);
     if (fast_flow != nullptr) {
       fast_flow->last_seen = now;
+      fast_flow->local_addr = dp->local_addr;
+      fast_flow->local_ifindex = dp->local_ifindex;
       QSR_PACKET_DEBUG("flow_fast_path", packet, packet_len, source, source_len, &fast_flow->backend_addr,
                        fast_flow->backend_addr_len, false, 0);
-      sender_enqueue(&dp->sender, fast_flow->fd, packet, packet_len, &fast_flow->backend_addr,
-                     fast_flow->backend_addr_len);
+      sender_enqueue(&dp->sender, fast_flow->fd, packet, packet_len, nullptr, 0);
       return;
     }
   }
@@ -976,7 +1249,7 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
   qsr_quic_initial_t initial;
   const qsr_status_t initial_status = qsr_quic_parse_initial(packet, packet_len, &initial);
   const bool is_initial = initial_status == QSR_OK;
-  if (is_initial) {
+  if (is_initial && session == nullptr) {
     qsr_session_key_t pair_key = qsr_session_cid_key(initial.dcid, initial.dcid_len, initial.scid, initial.scid_len);
     session = qsr_session_table_get(sessions, &pair_key);
     if (session != nullptr) {
@@ -1031,6 +1304,9 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
     }
   }
   if (session == nullptr) {
+    if (g_drain) {
+      return; /* Existing tuples and learned/authenticated CIDs still route. */
+    }
     /*
      * Anti-amplification floor (RFC 9000 14.1): real clients pad Initial
      * datagrams to >= 1200 bytes. Anything shorter from an unknown source
@@ -1059,6 +1335,11 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
                                                  source, source_len, now, &backend, &backend_len, &cid_key,
                                                  &pending_entry, &sni);
     if (status != QSR_OK) {
+      if (status == QSR_ERR_NOT_FOUND) {
+        dp->metrics.unknown_sni++;
+      } else if (status != QSR_ERR_TRUNCATED) {
+        dp->metrics.parse_failures++;
+      }
       QSR_PACKET_DEBUG("buffer_initial", packet, packet_len, source, source_len, nullptr, 0, false, (int)status);
       return;
     }
@@ -1094,8 +1375,7 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
       for (size_t i = 0U; i < pending_entry->packet_count; i++) {
         QSR_PACKET_DEBUG("fresh_sni", pending_entry->packets[i], pending_entry->packet_lens[i], source, source_len,
                          &backend, backend_len, false, 0);
-        sender_enqueue(&dp->sender, flow->fd, pending_entry->packets[i], pending_entry->packet_lens[i], &backend,
-                       backend_len);
+        sender_enqueue(&dp->sender, flow->fd, pending_entry->packets[i], pending_entry->packet_lens[i], nullptr, 0);
       }
       /* The enqueued payloads point into the pending entry; flush before the
        * entry is zeroed. Fresh-connection rate, so the early flush is cheap. */
@@ -1106,22 +1386,23 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
   }
 
   session->last_seen = now;
-  const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &session->backend_addr, session->backend_addr_len, now,
-                                        nullptr, nullptr, 0U);
+  /* Alias insertion can evict or relocate this session. Borrow no table
+   * storage across a mutating operation. */
+  const struct sockaddr_storage backend = session->backend_addr;
+  const socklen_t backend_len = session->backend_addr_len;
+  const qsr_flow_t *flow = flow_acquire(dp, source, source_len, &backend, backend_len, now, nullptr, nullptr, 0U);
   if (flow == nullptr) {
-    QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &session->backend_addr,
-                     session->backend_addr_len, false, 0);
+    QSR_PACKET_DEBUG("drop_no_flow", packet, packet_len, source, source_len, &backend, backend_len, false, 0);
     return;
   }
   /*
    * Learning is cheap and idempotent: re-running here picks up CID rotations
    * on coalesced Initial+Handshake datagrams.
    */
-  learn_client_long_header_cids(sessions, packet, packet_len, &session->backend_addr, session->backend_addr_len, now,
+  learn_client_long_header_cids(sessions, packet, packet_len, &backend, backend_len, now,
                                 qsr_flow_table_slot_of(&dp->runtime->flows, flow), flow->id);
-  QSR_PACKET_DEBUG(QSR_PACKET_DECISION, packet, packet_len, source, source_len, &session->backend_addr,
-                   session->backend_addr_len, false, 0);
-  sender_enqueue(&dp->sender, flow->fd, packet, packet_len, &session->backend_addr, session->backend_addr_len);
+  QSR_PACKET_DEBUG(QSR_PACKET_DECISION, packet, packet_len, source, source_len, &backend, backend_len, false, 0);
+  sender_enqueue(&dp->sender, flow->fd, packet, packet_len, nullptr, 0);
 }
 
 /*
@@ -1142,7 +1423,12 @@ static void handle_backend_packet(qsr_dataplane_t *dp, qsr_flow_t *flow, const u
   (void)source;
   (void)source_len;
 #endif
-  sender_enqueue(&dp->sender, dp->main_fd, packet, packet_len, &flow->client_addr, flow->client_addr_len);
+  qsr_udp_send_item_t *item =
+      sender_enqueue(&dp->sender, dp->main_fd, packet, packet_len, &flow->client_addr, flow->client_addr_len);
+  if (item != nullptr) {
+    item->local_addr = flow->local_addr;
+    item->local_ifindex = flow->local_ifindex;
+  }
 }
 
 static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
@@ -1160,6 +1446,26 @@ static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
   pending_initial_expire(dp->pending_initials, now);
 }
 
+static void report_live_metrics(qsr_dataplane_t *dp) {
+  connection_log(dp,
+                 "metrics: received=%llu sent=%llu flows=%zu sessions=%zu kernel_drops=%llu truncated=%llu "
+                 "send_drops=%llu flow_open_failures=%llu flow_evictions=%llu session_evictions=%llu "
+                 "parse_failures=%llu unknown_sni=%llu gso_batches=%llu log_drops=%llu draining=%d\n",
+                 (unsigned long long)dp->metrics.datagrams_in, (unsigned long long)dp->metrics.datagrams_out,
+                 dp->runtime->flows.count, dp->runtime->sessions.count,
+                 (unsigned long long)dp->metrics.kernel_drops, (unsigned long long)dp->metrics.receive_truncations,
+                 (unsigned long long)dp->metrics.send_drops, (unsigned long long)dp->metrics.flow_open_failures,
+                 (unsigned long long)dp->metrics.flow_evictions, (unsigned long long)dp->runtime->sessions.evictions,
+                 (unsigned long long)dp->metrics.parse_failures, (unsigned long long)dp->metrics.unknown_sni,
+                 (unsigned long long)dp->metrics.gso_batches, (unsigned long long)dp->log_drops, (int)g_drain);
+  for (unsigned error = 0; error < 256; error++) {
+    if (dp->metrics.send_errors[error] != 0) {
+      connection_log(dp, "metrics: send_errno=%u count=%llu\n", error,
+                     (unsigned long long)dp->metrics.send_errors[error]);
+    }
+  }
+}
+
 #ifdef __linux__
 [[nodiscard]] static qsr_status_t configure_socket(int fd, const struct addrinfo *ai) {
   int one = 1;
@@ -1169,6 +1475,7 @@ static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
   const int buffer_size = 4 * 1024 * 1024;
   (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
   (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+  (void)setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &one, sizeof(one));
   /*
    * SO_REUSEPORT lets an operator scale by launching multiple router processes
    * bound to the same UDP port; the kernel hashes incoming flows across them.
@@ -1185,7 +1492,12 @@ static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
      * Allow the IPv6 listener to receive IPv4-mapped traffic as well; without
      * this, an IPv6 bind only handles v6. Best-effort.
      */
-    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero)) < 0 ||
+        setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)) < 0) {
+      return QSR_ERR_INVALID;
+    }
+  } else if (setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one)) < 0) {
+    return QSR_ERR_INVALID;
   }
   /*
    * UDP_GRO asks the kernel to coalesce consecutive same-flow datagrams into
@@ -1220,7 +1532,7 @@ static void recv_batch_free(qsr_recv_batch_t *batch) {
   /*
    * Heap-allocated so the receive buffers can be sized larger than one
    * Ethernet MTU to give UDP_GRO room to coalesce same-flow bursts; stack
-   * allocation at QSR_UDP_BATCH_SIZE * QSR_UDP_RECV_BUFFER_SIZE = ~1 MiB
+   * allocation at QSR_UDP_BATCH_SIZE * QSR_UDP_RECV_BUFFER_SIZE = 4 MiB
    * is too large to rely on across host environments.
    */
   batch->recv_buffers = calloc(QSR_UDP_BATCH_SIZE, QSR_UDP_RECV_BUFFER_SIZE);
@@ -1276,24 +1588,54 @@ static void drain_socket(qsr_dataplane_t *dp, qsr_recv_batch_t *batch, int fd, q
        * buffer. Splitting a truncated GRO burst would misalign the segments,
        * so drop the slot and rely on QUIC's loss recovery to retransmit.
        */
-      if ((batch->messages[i].msg_hdr.msg_flags & MSG_TRUNC) != 0) {
+      if ((batch->messages[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+        dp->metrics.receive_truncations++;
         continue;
       }
       const uint8_t *slot = &batch->recv_buffers[(size_t)i * QSR_UDP_RECV_BUFFER_SIZE];
       size_t segment_size = msg_len;
-#ifdef UDP_GRO
+      memset(&dp->local_addr, 0, sizeof(dp->local_addr));
+      dp->local_ifindex = 0;
       for (struct cmsghdr *cm = CMSG_FIRSTHDR(&batch->messages[i].msg_hdr); cm != nullptr;
            cm = CMSG_NXTHDR(&batch->messages[i].msg_hdr, cm)) {
+#ifdef UDP_GRO
         if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
-          uint16_t gso = 0U;
-          memcpy(&gso, CMSG_DATA(cm), sizeof(gso));
-          if (gso > 0U) {
-            segment_size = gso;
+          int gso = 0;
+          if (cm->cmsg_len < CMSG_LEN(sizeof(gso))) {
+            continue;
           }
-          break;
+          memcpy(&gso, CMSG_DATA(cm), sizeof(gso));
+          if (gso > 0) {
+            segment_size = (size_t)gso;
+          }
+        }
+#endif
+        if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO &&
+            cm->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+          struct in_pktinfo info;
+          memcpy(&info, CMSG_DATA(cm), sizeof(info));
+          struct sockaddr_in *local = (struct sockaddr_in *)&dp->local_addr;
+          local->sin_family = AF_INET;
+          local->sin_addr = info.ipi_addr;
+          dp->local_ifindex = (unsigned)info.ipi_ifindex;
+        } else if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_PKTINFO &&
+                   cm->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+          struct in6_pktinfo info;
+          memcpy(&info, CMSG_DATA(cm), sizeof(info));
+          struct sockaddr_in6 *local = (struct sockaddr_in6 *)&dp->local_addr;
+          local->sin6_family = AF_INET6;
+          local->sin6_addr = info.ipi6_addr;
+          dp->local_ifindex = info.ipi6_ifindex;
+        } else if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_RXQ_OVFL &&
+                   cm->cmsg_len >= CMSG_LEN(sizeof(uint32_t))) {
+          uint32_t total;
+          memcpy(&total, CMSG_DATA(cm), sizeof(total));
+          uint32_t *previous = flow == nullptr ? &dp->rx_overflow : &flow->rx_overflow;
+          const uint32_t dropped = total - *previous; /* Counter wraps modulo 2^32. */
+          dp->metrics.kernel_drops += dropped;
+          *previous = total;
         }
       }
-#endif
       /* Whether GRO applied or not, a single segment must fit a UDP datagram. */
       if (segment_size > QSR_MAX_DATAGRAM_SIZE) {
         continue;
@@ -1301,6 +1643,7 @@ static void drain_socket(qsr_dataplane_t *dp, qsr_recv_batch_t *batch, int fd, q
       for (size_t offset = 0U; offset < msg_len;) {
         const size_t remaining = msg_len - offset;
         const size_t chunk = remaining < segment_size ? remaining : segment_size;
+        dp->metrics.datagrams_in++;
         if (flow == nullptr) {
           handle_client_packet(dp, slot + offset, chunk, &batch->sources[i], batch->messages[i].msg_hdr.msg_namelen,
                                now);
@@ -1368,26 +1711,35 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   }
 
   int fd = -1;
-  for (const struct addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
-    fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
-    if (fd < 0) {
-      continue;
-    }
+  /* Wildcard: try dual-stack IPv6 before IPv4, independent of resolver order. */
+  for (int pass = 0; pass < 2 && fd < 0; pass++) {
+    for (const struct addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
+      if (host[0] == '\0' && ((pass == 0) != (ai->ai_family == AF_INET6))) {
+        continue;
+      }
+      if (host[0] != '\0' && pass != 0) {
+        break;
+      }
+      fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+      if (fd < 0) {
+        continue;
+      }
 #ifdef __linux__
-    if (configure_socket(fd, ai) != QSR_OK) {
+      if (configure_socket(fd, ai) != QSR_OK) {
+        (void)close(fd);
+        fd = -1;
+        continue;
+      }
+#else
+      int one = 1;
+      (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
+      if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+        break;
+      }
       (void)close(fd);
       fd = -1;
-      continue;
     }
-#else
-    int one = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-#endif
-    if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-      break;
-    }
-    (void)close(fd);
-    fd = -1;
   }
   freeaddrinfo(res);
 
@@ -1417,6 +1769,36 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
       .epoll_fd = -1,
   };
   sender_init(&dp.sender);
+  dp.sender.metrics = &dp.metrics;
+  int receive_buffer = 0;
+  int send_buffer = 0;
+  socklen_t option_len = sizeof(int);
+  (void)getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, &option_len);
+  option_len = sizeof(int);
+  (void)getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, &option_len);
+  (void)fprintf(stderr, "socket: effective SO_RCVBUF=%d SO_SNDBUF=%d (kernel accounting bytes)\n",
+                receive_buffer, send_buffer);
+#ifdef __linux__
+  FILE *range = fopen("/proc/sys/net/ipv4/ip_local_port_range", "re");
+  if (range != nullptr) {
+    char text[64];
+    char *end = nullptr;
+    if (fgets(text, sizeof(text), range) != nullptr) {
+      errno = 0;
+      const unsigned long low = strtoul(text, &end, 10);
+      const unsigned long high = strtoul(end, nullptr, 10);
+      if (errno == 0 && low > 0 && high >= low && high <= 65535) {
+        (void)fprintf(stderr, "socket: ephemeral ports=%lu..%lu (%lu shared per namespace); flow capacity=%zu\n", low,
+                      high, high - low + 1U, runtime.flows.capacity);
+        if (runtime.flows.capacity >= high - low + 1U) {
+          (void)fprintf(stderr, "socket: flow capacity exceeds ephemeral port budget; partition source namespaces or "
+                                "lower maxSessions\n");
+        }
+      }
+    }
+    (void)fclose(range);
+  }
+#endif
   /* Terminations (idle expiry, eviction, reload cutover, shutdown) surface
    * through the flow table's close hook; opens are logged in flow_acquire. */
   runtime.flows.on_close = conn_close_callback;
@@ -1477,7 +1859,15 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     return QSR_ERR_FULL;
   }
 
+  connection_log_start(&dp);
   while (!g_stop) {
+    if (g_report) {
+      g_report = 0;
+      report_live_metrics(&dp);
+    }
+    if (g_drain && runtime.flows.count == 0) {
+      break;
+    }
     qsr_runtime_poll(&runtime);
     struct epoll_event events[QSR_EPOLL_MAX_EVENTS];
     const int ready = epoll_wait(epoll_fd, events, QSR_EPOLL_MAX_EVENTS, 1000);
@@ -1486,6 +1876,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         continue;
       }
       perror("epoll_wait");
+      status = QSR_ERR_INVALID;
       break;
     }
     for (int e = 0; e < ready; e++) {
@@ -1535,7 +1926,15 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
     return QSR_ERR_FULL;
   }
 
+  connection_log_start(&dp);
   while (!g_stop) {
+    if (g_report) {
+      g_report = 0;
+      report_live_metrics(&dp);
+    }
+    if (g_drain && runtime.flows.count == 0) {
+      break;
+    }
     qsr_runtime_poll(&runtime);
     nfds_t nfds = 1;
     pfds[0].fd = fd;
@@ -1557,6 +1956,7 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
         continue;
       }
       perror("poll");
+      status = QSR_ERR_INVALID;
       break;
     }
     const time_t now = monotonic_now();
@@ -1611,8 +2011,25 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
 
   sender_flush(&dp.sender);
   fprintf(stderr, "quic-sni-router: shutting down\n");
+  (void)fprintf(stderr,
+                "metrics: received=%llu sent=%llu kernel_drops=%llu truncated=%llu send_drops=%llu "
+                "flow_open_failures=%llu flow_evictions=%llu session_evictions=%llu parse_failures=%llu "
+                "unknown_sni=%llu gso_batches=%llu log_drops=%llu\n",
+                (unsigned long long)dp.metrics.datagrams_in, (unsigned long long)dp.metrics.datagrams_out,
+                (unsigned long long)dp.metrics.kernel_drops, (unsigned long long)dp.metrics.receive_truncations,
+                (unsigned long long)dp.metrics.send_drops, (unsigned long long)dp.metrics.flow_open_failures,
+                (unsigned long long)dp.metrics.flow_evictions, (unsigned long long)runtime.sessions.evictions,
+                (unsigned long long)dp.metrics.parse_failures, (unsigned long long)dp.metrics.unknown_sni,
+                (unsigned long long)dp.metrics.gso_batches, (unsigned long long)dp.log_drops);
+  for (unsigned error = 0; error < 256; error++) {
+    if (dp.metrics.send_errors[error] != 0) {
+      (void)fprintf(stderr, "metrics: send_errno=%u count=%llu\n", error,
+                    (unsigned long long)dp.metrics.send_errors[error]);
+    }
+  }
   free(pending_initials);
   qsr_runtime_free(&runtime);
+  connection_log_stop(&dp);
   (void)close(fd);
-  return QSR_OK;
+  return status;
 }

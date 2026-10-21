@@ -41,7 +41,7 @@ WAN UDP/443 -> Service (LoadBalancer)
 ```
 
 - `service.externalTrafficPolicy` defaults to `Cluster`. This is the standard kube-proxy behaviour — client traffic is SNAT'd to the receiving node's IP before reaching the router pod. Session pinning still works (each client→router flow gets a unique kube-proxy source port), but the router's logs will show node IPs instead of real client IPs. Set this to `Local` if you need real source IPs and your LB supports it; be aware that `Local` skips nodes without a router pod, which interacts with PodDisruptionBudget during rollouts.
-- Multiple replicas share the listening port via `SO_REUSEPORT`. The chart deploys a `Deployment` with `replicas: 2` by default.
+- The chart defaults to two independent pods. The Service/LB balances UDP flows; pods do not share a `SO_REUSEPORT` group or connection state. NAT rebinding and replica replacement can lose routing state.
 - Backends are resolved at pod startup and on every hot reload. To pick up an IP change behind a stable hostname without a config edit, run `helm upgrade --recreate-pods` or `kubectl rollout restart`.
 
 ## Hot reload
@@ -51,7 +51,7 @@ This chart's `ConfigMap` is rendered from `.Values.config`. A `helm upgrade` tha
 - Existing sessions to a route whose backend is **still in the new config** keep going untouched.
 - Existing sessions to a route whose backend **disappeared** from the new config are evicted immediately (hard cutover).
 - A parse failure or DNS-resolution failure on the new file is logged and the previous config keeps serving traffic (fail-closed).
-- The reload's DNS resolution runs synchronously on the dataplane thread; packets queue in kernel buffers while it completes. With in-cluster Services and a healthy CoreDNS this is negligible, but a degraded resolver can stall forwarding for its timeout, so keep cluster DNS healthy or use IP backends where reload latency matters.
+- Reload parsing and DNS resolution run in one background worker; the dataplane publishes a successful candidate. Only completed writes and atomic replacements trigger reloads. Removed backends terminate associated flows. Startup and shutdown can still wait for the resolver.
 
 To force a pod rotation on every `helm upgrade` instead (drops live QUIC sessions):
 
@@ -70,7 +70,7 @@ Highlights:
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `replicaCount` | `2` | Multiple replicas share UDP/443 via `SO_REUSEPORT`. |
+| `replicaCount` | `2` | Independent pods behind the UDP Service; connection state is not shared. |
 | `image.repository` | `ghcr.io/peinser/quic-sni-router` | Override for a fork or local mirror. |
 | `image.tag` | `""` (uses `.Chart.appVersion`) | The publish pipeline pins this to `<version>-<sha>`. |
 | `config.routes` | `{}` | Map of SNI to `{host, port}`. Empty is valid but causes every Initial to be dropped. |

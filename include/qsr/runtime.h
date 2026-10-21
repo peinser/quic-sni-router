@@ -4,9 +4,8 @@
  * mutates them. Hiding this behind a module lets qsr/udp.h stay focused on
  * packet I/O.
  *
- * Single-threaded by design: every mutator (poll, reload, eviction) and every
- * reader (packet routing) runs on the dataplane thread, so the route-table
- * swap during reload is a single struct assignment with no concurrent reader.
+ * Live state has a single owner: the dataplane thread. A resolver worker builds
+ * an independent candidate; the dataplane joins it before publishing the result.
  */
 #ifndef QSR_RUNTIME_H
 #define QSR_RUNTIME_H
@@ -38,6 +37,8 @@ typedef struct qsr_runtime {
   qsr_flow_table_t flows;
   const char *config_path; /* nullptr = no hot reload */
   int inotify_fd;          /* -1 = no watch (defaults-only run, or setup failed) */
+  struct qsr_reload_job *reload_job;
+  bool reload_pending;
 } qsr_runtime_t;
 
 /*
@@ -56,8 +57,8 @@ void qsr_runtime_free(qsr_runtime_t *runtime);
 /*
  * Called every dataplane iteration. Cheap no-op when nothing changed.
  *
- * If inotify reports a config-directory change, re-reads the file, validates
- * and DNS-resolves the new config, evicts sessions whose backend disappeared
+ * Completed config writes and atomic replacements start a bounded background
+ * load/resolve. On completion the dataplane evicts sessions whose backend disappeared
  * (hard cutover), and atomically swaps in the new routes + idle timeout.
  * `listen.udp` and `sessions.maxSessions` changes are ignored with a logged
  * warning — they require a process restart.

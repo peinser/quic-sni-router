@@ -127,6 +127,7 @@ qsr_status_t qsr_session_table_init(qsr_session_table_t *table, size_t capacity)
   }
   table->capacity = capacity;
   table->count = 0U;
+  table->evictions = 0U;
   table->expire_cursor = 0U;
   table->evict_cursor = 0U;
   table->cid_len_mask = 0U;
@@ -237,6 +238,7 @@ static void evict_oldest(qsr_session_table_t *table) {
     return;
   }
   (void)table_delete_at(table, victim);
+  table->evictions++;
 }
 
 static bool pressure_evict_needed(const qsr_session_table_t *table) {
@@ -269,7 +271,6 @@ static qsr_status_t session_table_put_internal(qsr_session_table_t *table, const
       qsr_session_t *session = &table->sessions[index];
       if (!session->used) {
         if (allow_pressure_evict && attempt == 0 && pressure_evict_needed(table)) {
-          evict_oldest(table);
           break;
         }
         session->used = true;

@@ -12,8 +12,8 @@ image:
   # Names of image-pull secrets in this namespace.
   pullSecrets: []
 
-# Replica count for the Deployment. Multiple replicas share the listening
-# port via SO_REUSEPORT (set by the router automatically on Linux).
+# Replica count for the Deployment. Each pod has its own network namespace;
+# the Service/LB distributes UDP flows. State is not shared between replicas.
 replicaCount: 2
 
 # Routing configuration. Mirrors src/config.c schema 1:1.
@@ -131,8 +131,9 @@ startupProbe: {}
 livenessProbe: {}
 readinessProbe: {}
 
-# Graceful shutdown: SIGTERM tells the router to drain its in-flight send
-# batch and close sockets. 30s is plenty.
+# SIGTERM flushes the current batch and closes active connections. The grace
+# period is not a connection drain. For coordinated draining, send SIGUSR2
+# before removing the pod from routing; established traffic must still arrive.
 terminationGracePeriodSeconds: 30
 
 priorityClassName: ""

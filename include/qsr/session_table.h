@@ -50,6 +50,7 @@ typedef struct qsr_session {
 } qsr_session_t;
 
 typedef struct qsr_session_table {
+  uint64_t evictions;
   qsr_session_t *sessions;
   size_t capacity;
   size_t count;

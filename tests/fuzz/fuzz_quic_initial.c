@@ -24,6 +24,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return 0;
   }
   qsr_sni_t sni;
-  (void)qsr_tls_client_hello_sni(stream.data, stream.len, &sni);
+  (void)qsr_tls_client_hello_sni(stream.data, qsr_crypto_stream_contiguous_len(&stream), &sni);
   return 0;
 }

@@ -25,7 +25,7 @@
         "listen": {
           "type": "object",
           "required": ["udp"],
-          "properties": { "udp": { "type": "string", "pattern": "^[^:]*:[0-9]+$" } }
+            "properties": { "udp": { "type": "string", "pattern": "^(\\[[0-9a-fA-F:.%a-zA-Z0-9_-]+\\]|[^:]*):[0-9]+$" } }
         },
         "sessions": {
           "type": "object",
@@ -42,9 +42,16 @@
             "required": ["host", "port"],
             "properties": {
               "host": { "type": "string", "minLength": 1, "maxLength": 255 },
-              "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "serverId": { "type": "integer", "minimum": 1, "maximum": 255 }
             }
           }
+        },
+        "cidEncoding": {
+          "type": "object",
+          "required": ["key"],
+          "additionalProperties": false,
+          "properties": { "key": { "type": "string", "pattern": "^[0-9a-fA-F]{32}$" } }
         },
         "logging": {
           "type": "object",

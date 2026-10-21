@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.25)
 
 project(quic-sni-router VERSION 0.1.0 LANGUAGES C)
 
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBYAML REQUIRED IMPORTED_TARGET yaml-0.1)
 
@@ -20,7 +21,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 function(qsr_apply_release_optimizations target_name)
   if(QSR_CPU_TARGET AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(${target_name} PRIVATE $<$<CONFIG:Release>:-march=${QSR_CPU_TARGET}>)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+      target_compile_options(${target_name} PRIVATE $<$<CONFIG:Release>:-mcpu=${QSR_CPU_TARGET}>)
+    else()
+      target_compile_options(${target_name} PRIVATE $<$<CONFIG:Release>:-march=${QSR_CPU_TARGET}>)
+    endif()
   endif()
 endfunction()
 
@@ -51,7 +56,7 @@ add_library(qsr_core
 )
 
 target_include_directories(qsr_core PUBLIC include)
-target_link_libraries(qsr_core PUBLIC OpenSSL::Crypto PkgConfig::LIBYAML)
+target_link_libraries(qsr_core PUBLIC OpenSSL::Crypto PkgConfig::LIBYAML Threads::Threads)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_compile_definitions(qsr_core PRIVATE _GNU_SOURCE)
@@ -98,7 +103,20 @@ target_compile_options(qsr_unit_tests PRIVATE
 )
 add_test(NAME unit COMMAND qsr_unit_tests)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(qsr_dataplane_tests tests/unit/test_dataplane.c)
+  target_link_libraries(qsr_dataplane_tests PRIVATE qsr_core)
+  target_compile_definitions(qsr_dataplane_tests PRIVATE _GNU_SOURCE)
+  target_compile_options(qsr_dataplane_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
+  if(QSR_ENABLE_SANITIZERS OR QSR_BUILD_FUZZERS)
+    target_compile_options(qsr_dataplane_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  endif()
+  add_test(NAME dataplane COMMAND qsr_dataplane_tests)
+endif()
+
 if(QSR_BUILD_FUZZERS AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(qsr_core PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+  target_link_options(qsr_core PUBLIC -fsanitize=fuzzer-no-link,address,undefined)
   foreach(fuzzer fuzz_quic_initial fuzz_quic_frames fuzz_tls_client_hello)
     add_executable(${fuzzer} tests/fuzz/${fuzzer}.c)
     target_link_libraries(${fuzzer} PRIVATE qsr_core)

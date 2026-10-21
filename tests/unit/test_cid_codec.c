@@ -31,12 +31,23 @@ static void test_encode_decode_roundtrip(void) {
   uint8_t nonce[QSR_CID_NONCE_LEN] = {1, 2, 3, 4, 5, 6, 7};
   uint8_t cid[QSR_CID_ENCODED_LEN] = {0};
   ASSERT_TRUE(qsr_cid_codec_encode(&codec, 42U, nonce, cid) == QSR_OK);
+  /* Independent Python hmac/hashlib reference vector, also pins wire layout. */
+  const uint8_t expected[] = {0x50,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x2a,0xcb,
+                              0xd4,0x31,0x35,0xb0,0xf2,0x03,0x8e,0xbf,0x11,0x00};
+  ASSERT_TRUE(sizeof(expected) == sizeof(cid) && memcmp(cid, expected, sizeof(cid)) == 0);
   /* Version byte and nonce stay in cleartext. */
   ASSERT_TRUE(cid[0] == QSR_CID_ENCODED_VERSION);
   ASSERT_TRUE(memcmp(&cid[1], nonce, QSR_CID_NONCE_LEN) == 0);
   uint8_t server_id = 0U;
   ASSERT_TRUE(qsr_cid_codec_decode(&codec, cid, sizeof(cid), &server_id) == QSR_OK);
   ASSERT_TRUE(server_id == 42U);
+  /* Every routing-prefix and tag byte must be authenticated, including the
+   * server-id byte that was malleable in the old CTR format. */
+  for (size_t i = 0; i < sizeof(cid); i++) {
+    cid[i] ^= 1;
+    ASSERT_TRUE(qsr_cid_codec_decode(&codec, cid, sizeof(cid), &server_id) == QSR_ERR_INVALID);
+    cid[i] ^= 1;
+  }
 }
 
 /*
@@ -54,7 +65,7 @@ static void test_different_nonces_yield_same_server_id(void) {
   uint8_t cid_b[QSR_CID_ENCODED_LEN] = {0};
   ASSERT_TRUE(qsr_cid_codec_encode(&codec, 17U, nonce_a, cid_a) == QSR_OK);
   ASSERT_TRUE(qsr_cid_codec_encode(&codec, 17U, nonce_b, cid_b) == QSR_OK);
-  /* Different nonces must produce different ciphertexts (no fixed-IV reuse). */
+  /* The nonce is authenticated; changing it changes the tag. */
   ASSERT_TRUE(memcmp(&cid_a[1U + QSR_CID_NONCE_LEN], &cid_b[1U + QSR_CID_NONCE_LEN], QSR_CID_PAYLOAD_LEN) != 0);
   uint8_t sid_a = 0U;
   uint8_t sid_b = 0U;
@@ -92,10 +103,7 @@ static void test_decode_rejects_wrong_version_byte(void) {
 }
 
 /*
- * Magic check: corrupt one byte of the encrypted payload. The magic now
- * mismatches with overwhelming probability and decode must fail. Without
- * the magic check, the corrupted CID would silently re-route to a random
- * server_id.
+ * Corrupt a tag byte: authentication must reject it.
  */
 static void test_decode_rejects_corrupt_ciphertext(void) {
   qsr_cid_codec_t codec;
@@ -125,8 +133,8 @@ static void test_decode_rejects_wrong_key(void) {
 }
 
 /*
- * Random 16-byte buffers (whose first byte happens to match the version)
- * should not decode. With 7-byte magic the false-positive rate is ~2^-56;
+ * Random 20-byte buffers (whose first byte happens to match the version)
+ * should not decode. With an 11-byte tag the false-positive rate is ~2^-88;
  * a few hundred trials is a sanity check, not a statistical guarantee.
  */
 static void test_decode_rejects_random_cids(void) {

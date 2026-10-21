@@ -71,7 +71,7 @@ test-loadtest: ## Run Docker loadtest (10 backends, sustained concurrent QUIC)
 	tests/e2e/loadtest/run.sh
 
 fuzz-smoke: ## Build fuzzers and run a short smoke test
-	@if ! printf '%s\n' 'int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { (void)data; (void)size; return 0; }' | $(CLANG) -fsanitize=fuzzer -x c - -o /tmp/qsr-fuzzer-check >/dev/null 2>&1; then \
+	@set -e; if ! printf '%s\n' 'int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { (void)data; (void)size; return 0; }' | $(CLANG) -fsanitize=fuzzer -x c - -o /tmp/qsr-fuzzer-check >/dev/null 2>&1; then \
 		echo "libFuzzer runtime is unavailable for $(CLANG); run this target in the devcontainer or CI"; \
 		if [ -n "$$GITHUB_ACTIONS" ]; then exit 1; fi; \
 	else \
@@ -81,9 +81,11 @@ fuzz-smoke: ## Build fuzzers and run a short smoke test
 		fi; \
 		cmake -S . -B $(BUILD_DIR)-fuzz $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=Debug -DQSR_BUILD_FUZZERS=ON -DCMAKE_C_COMPILER=$(CLANG); \
 		cmake --build $(BUILD_DIR)-fuzz; \
-		$(BUILD_DIR)-fuzz/fuzz_quic_initial -runs=100; \
-		$(BUILD_DIR)-fuzz/fuzz_quic_frames -runs=100; \
-		$(BUILD_DIR)-fuzz/fuzz_tls_client_hello -runs=100; \
+		mkdir -p $(BUILD_DIR)-fuzz/corpus/initial $(BUILD_DIR)-fuzz/corpus/frames $(BUILD_DIR)-fuzz/corpus/tls; \
+		$(BUILD_DIR)-fuzz/qsr_dataplane_tests $(BUILD_DIR)-fuzz/corpus; \
+		$(BUILD_DIR)-fuzz/fuzz_quic_initial -runs=1000 $(BUILD_DIR)-fuzz/corpus/initial; \
+		$(BUILD_DIR)-fuzz/fuzz_quic_frames -runs=1000 $(BUILD_DIR)-fuzz/corpus/frames; \
+		$(BUILD_DIR)-fuzz/fuzz_tls_client_hello -runs=1000 $(BUILD_DIR)-fuzz/corpus/tls; \
 	fi
 
 sanitize: ## Run unit tests under ASAN/UBSAN

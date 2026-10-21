@@ -95,6 +95,8 @@ jobs:
       run: make test-e2e-idle
     - name: Docker reverse-tuple e2e
       run: make test-e2e-reverse
+    - name: Docker NAT-rebind e2e
+      run: make test-e2e-rebind
     - name: Docker hot-reload e2e
       run: make test-e2e-reload
 

@@ -1,6 +1,6 @@
 /*
  * qsr/flow_table.h: bounded table of per-client upstream flows. Each flow owns
- * an unconnected UDP socket used exclusively for one client tuple's traffic
+ * a connected UDP socket used exclusively for one client tuple's traffic
  * toward its backend, so the backend sees a distinct router source port per
  * client and return datagrams arrive on the flow's own fd. That makes
  * backend-to-client demultiplexing exact for any number of concurrent QUIC
@@ -27,9 +27,12 @@
 
 typedef struct qsr_flow {
   bool used;
-  int fd; /* unconnected UDP socket toward the backend; -1 when unused */
+  int fd; /* connected UDP socket toward the backend; -1 when unused */
   struct sockaddr_storage client_addr;
   socklen_t client_addr_len;
+  struct sockaddr_storage local_addr; /* listener destination used by this client */
+  unsigned local_ifindex;
+  uint32_t rx_overflow;
   struct sockaddr_storage backend_addr;
   socklen_t backend_addr_len;
   time_t last_seen;

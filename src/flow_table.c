@@ -161,14 +161,20 @@ size_t qsr_flow_table_evict_oldest(qsr_flow_table_t *table) {
   size_t victim = SIZE_MAX;
   time_t oldest = 0;
   const size_t scans = table->capacity < QSR_FLOW_EVICT_SCAN_BUDGET ? table->capacity : QSR_FLOW_EVICT_SCAN_BUDGET;
-  for (size_t i = 0U; i < scans; i++) {
-    const size_t slot = (table->evict_cursor + i) % table->capacity;
-    if (table->flows[slot].used && (victim == SIZE_MAX || table->flows[slot].last_seen < oldest)) {
-      victim = slot;
-      oldest = table->flows[slot].last_seen;
+  size_t examined = 0;
+  do {
+    for (size_t i = 0U; i < scans; i++) {
+      const size_t slot = (table->evict_cursor + i) % table->capacity;
+      if (table->flows[slot].used && (victim == SIZE_MAX || table->flows[slot].last_seen < oldest)) {
+        victim = slot;
+        oldest = table->flows[slot].last_seen;
+      }
     }
-  }
-  table->evict_cursor = (table->evict_cursor + scans) % table->capacity;
+    table->evict_cursor = (table->evict_cursor + scans) % table->capacity;
+    examined += scans;
+    /* Sparse tables still need to reclaim a descriptor under EMFILE. This
+     * rare fallback is O(capacity); use an active-slot list if it becomes hot. */
+  } while (victim == SIZE_MAX && examined < table->capacity);
   if (victim == SIZE_MAX) {
     return 0U;
   }
@@ -186,6 +192,9 @@ qsr_flow_t *qsr_flow_table_put(qsr_flow_table_t *table, const struct sockaddr_st
   if (pos != SIZE_MAX && table->index[pos] != 0U) {
     qsr_flow_t *flow = &table->flows[table->index[pos] - 1U];
     if (flow->fd >= 0 && flow->fd != fd) {
+      if (table->on_close != nullptr) {
+        table->on_close(flow, QSR_FLOW_CLOSE_REMOVED, table->on_close_userdata);
+      }
       (void)close(flow->fd);
     }
     flow->fd = fd;

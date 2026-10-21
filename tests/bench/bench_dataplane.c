@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,10 +35,16 @@ static bool bench_route_lookup(void) {
     (void)snprintf(host, sizeof(host), "127.0.0.%zu", (i % 250U) + 1U);
     (void)qsr_route_table_add(&table, sni, host, 8443U, 0U);
   }
+  char names[256][64];
+  for (size_t i = 0; i < 256; i++) {
+    (void)snprintf(names[i], sizeof(names[i]), "rvr-%zu.flightdeck.example.com", i);
+  }
+  uint32_t random = 1;
   const uint64_t start = nanos();
   size_t hits = 0U;
   for (size_t i = 0U; i < BENCH_ITERS; i++) {
-    if (qsr_route_table_lookup(&table, "rvr-128.flightdeck.example.com") != NULL) {
+    random = random * 1664525U + 1013904223U;
+    if (qsr_route_table_lookup(&table, names[random >> 24U]) != NULL) {
       hits++;
     }
   }
@@ -52,33 +59,37 @@ static bool bench_route_lookup(void) {
 
 static bool bench_session_lookup(void) {
   qsr_session_table_t table;
-  if (qsr_session_table_init(&table, 4096U) != QSR_OK) {
+  if (qsr_session_table_init(&table, 100000U) != QSR_OK) {
     fprintf(stderr, "session benchmark init failed\n");
     return false;
   }
   struct sockaddr_storage backend;
   memset(&backend, 0, sizeof(backend));
   backend.ss_family = AF_INET;
-  qsr_session_key_t target;
-  memset(&target, 0, sizeof(target));
-  for (size_t i = 0U; i < 2048U; i++) {
+  qsr_session_key_t *keys = calloc(50000U, sizeof(*keys));
+  if (keys == NULL) {
+    qsr_session_table_free(&table);
+    return false;
+  }
+  for (size_t i = 0U; i < 50000U; i++) {
     uint8_t cid[8] = {0};
     cid[0] = (uint8_t)i;
     cid[1] = (uint8_t)(i >> 8U);
     qsr_session_key_t key = qsr_session_single_cid_key(cid, sizeof(cid));
-    if (i == 1024U) {
-      target = key;
-    }
+    keys[i] = key;
     if (qsr_session_table_put(&table, &key, &backend, sizeof(struct sockaddr_in), 1) != QSR_OK) {
       fprintf(stderr, "session benchmark insert failed\n");
       qsr_session_table_free(&table);
+      free(keys);
       return false;
     }
   }
+  uint32_t random = 1;
   const uint64_t start = nanos();
   size_t hits = 0U;
   for (size_t i = 0U; i < BENCH_ITERS; i++) {
-    if (qsr_session_table_get(&table, &target) != NULL) {
+    random = random * 1664525U + 1013904223U;
+    if (qsr_session_table_get(&table, &keys[random % 50000U]) != NULL) {
       hits++;
     }
   }
@@ -86,10 +97,12 @@ static bool bench_session_lookup(void) {
   if (hits != BENCH_ITERS) {
     fprintf(stderr, "session benchmark sanity check failed\n");
     qsr_session_table_free(&table);
+    free(keys);
     return false;
   }
-  print_rate("session cid lookup", elapsed, BENCH_ITERS);
+  print_rate("session random 50k", elapsed, BENCH_ITERS);
   qsr_session_table_free(&table);
+  free(keys);
   return true;
 }
 
@@ -132,8 +145,7 @@ static bool bench_flow_lookup(void) {
   struct sockaddr_storage backend;
   memset(&backend, 0, sizeof(backend));
   backend.ss_family = AF_INET;
-  struct sockaddr_storage target;
-  memset(&target, 0, sizeof(target));
+  struct sockaddr_storage targets[512];
   const int fd = open("/dev/null", 0);
   if (fd < 0) {
     fprintf(stderr, "flow benchmark open failed\n");
@@ -147,9 +159,7 @@ static bool bench_flow_lookup(void) {
     sin->sin_family = AF_INET;
     sin->sin_addr.s_addr = (uint32_t)(0x0a000001U + i);
     sin->sin_port = (uint16_t)(40000U + i);
-    if (i == 256U) {
-      target = client;
-    }
+    targets[i] = client;
     /* dup so every flow owns a distinct closable fd */
     if (qsr_flow_table_put(&table, &client, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in), dup(fd),
                            1) == NULL) {
@@ -160,10 +170,12 @@ static bool bench_flow_lookup(void) {
     }
   }
   (void)close(fd);
+  uint32_t random = 1;
   const uint64_t start = nanos();
   size_t hits = 0U;
   for (size_t i = 0U; i < BENCH_ITERS; i++) {
-    if (qsr_flow_table_get(&table, &target, sizeof(struct sockaddr_in)) != NULL) {
+    random = random * 1664525U + 1013904223U;
+    if (qsr_flow_table_get(&table, &targets[random >> 23U], sizeof(struct sockaddr_in)) != NULL) {
       hits++;
     }
   }

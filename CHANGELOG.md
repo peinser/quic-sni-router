@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Security and Linux reliability
+
+- Replaced malleable CTR CIDs with version `0x50` 20-byte HMAC-authenticated CIDs. This is a breaking wire-format change; coordinate backend upgrades and key rotation as described in `docs/cid-routing.md`.
+- Upstream sockets are explicitly bound and connected: unrelated return sources are filtered, port exhaustion is detected before publishing a flow, and backend-family changes create a new socket. Flow closure flushes queued descriptors before reuse.
+- Snapshotted session destinations across alias insertion and removed duplicate pressure eviction.
+- Reload only on completed config writes/atomic replacements; parse and DNS resolution use one background worker with bounded pending work.
+- Added 64 KiB GRO slots, ancillary-truncation rejection, GSO with fallback, dual-stack listener preference, bracketed IPv6 parsing, and reply-source/interface preservation.
+- Added effective socket/port diagnostics, SIGUSR1 counters, bounded asynchronous lifecycle logs, and SIGUSR2 connection draining. SIGTERM still closes active connections immediately.
+- Instrumented the fuzzed library, added protected v1/v2 seeds and packet-path regressions, randomized synthetic lookups, and ordered Helm publication after successful image publication.
+
 ### Changed (packaging)
 
 - **Container images are published to GitHub Container Registry.** The image workflow still builds per-arch images by digest into the on-prem registry and assembles the multi-arch manifests there, then copies the finished manifests to `ghcr.io/<owner>/quic-sni-router` in the same `imagetools create` invocation. Both registries carry the same `<version>-<sha>` and `<version>-<sha>-debug` tags; pushes to `main` additionally get `latest` and `latest-debug`. GHCR is the public location and is now the default in the Helm chart (`image.repository`) and in `make docker-build` (`IMAGE_REPO`).

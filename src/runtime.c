@@ -1,5 +1,6 @@
 #include "qsr/runtime.h"
 
+#include "qsr/hash.h"
 #include "qsr/route_table.h"
 
 #include <arpa/inet.h>
@@ -7,11 +8,24 @@
 #include <libgen.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __linux__
+typedef struct qsr_reload_job {
+  pthread_t thread;
+  atomic_bool done;
+  const char *path;
+  qsr_status_t status;
+  qsr_config_t config;
+  struct timespec started;
+} qsr_reload_job_t;
+
 #include <sys/inotify.h>
 #endif
 
@@ -117,12 +131,9 @@ static void log_route_diff(const qsr_route_table_t *old_routes, const qsr_route_
 
 #ifdef __linux__
 /*
- * Watch the directory containing the config file with inotify. The mask is
- * deliberately broad: Kubernetes ConfigMap updates atomically swap a `..data`
- * symlink in the mount directory (generating IN_MOVED_TO), while an editor
- * tends to atomic-rewrite via tmp + rename (IN_MOVED_TO) or truncate-and-write
- * (IN_MODIFY + IN_CLOSE_WRITE). We react to any of these, see drain_inotify
- * below for why we don't try to decode which file actually moved.
+ * Watch completed writes and atomic replacements, including Kubernetes' ..data
+ * swap. IN_MODIFY is deliberately excluded: a truncate-before-write is not a
+ * completed configuration and an empty intermediate file would remove routes.
  */
 [[nodiscard]] static int setup_inotify_watch(const char *config_path) {
   if (config_path == nullptr) {
@@ -141,7 +152,7 @@ static void log_route_diff(const qsr_route_table_t *old_routes, const qsr_route_
   }
   memcpy(path_copy, config_path, path_len + 1U);
   const char *dir = dirname(path_copy); /* POSIX: may modify the buffer in place */
-  const uint32_t mask = IN_MOVED_TO | IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE;
+  const uint32_t mask = IN_MOVED_TO | IN_CLOSE_WRITE;
   if (inotify_add_watch(ifd, dir, mask) < 0) {
     (void)fprintf(stderr, "inotify_add_watch(%s): %s\n", dir, strerror(errno));
     (void)close(ifd);
@@ -153,20 +164,32 @@ static void log_route_diff(const qsr_route_table_t *old_routes, const qsr_route_
 
 /*
  * Drain queued inotify events without blocking. Returns true if any events
- * were consumed (caller should trigger reload). We don't inspect event names:
- * the directory mask is narrow enough that any event there warrants a
- * re-read of the config file, and reading the actual file is cheap.
+ * matched the config filename or Kubernetes' ..data replacement. Unrelated
+ * files in the directory must not trigger DNS work or configuration changes.
  */
-[[nodiscard]] static bool drain_inotify(int inotify_fd) {
+[[nodiscard]] static bool drain_inotify(int inotify_fd, const char *config_path) {
   if (inotify_fd < 0) {
     return false;
   }
   alignas(struct inotify_event) uint8_t buf[4096];
   bool any = false;
+  const char *name = strrchr(config_path, '/');
+  name = name == nullptr ? config_path : name + 1;
   for (;;) {
     const ssize_t n = read(inotify_fd, buf, sizeof(buf));
     if (n > 0) {
-      any = true;
+      for (size_t offset = 0; offset < (size_t)n;) {
+        const struct inotify_event *event = (const struct inotify_event *)(buf + offset);
+        if (event->len > 0 && (event->mask & (IN_MOVED_TO | IN_CLOSE_WRITE)) != 0 &&
+            (strcmp(event->name, name) == 0 ||
+             ((event->mask & IN_MOVED_TO) != 0 && strcmp(event->name, "..data") == 0))) {
+          any = true;
+        }
+        if ((event->mask & IN_Q_OVERFLOW) != 0) {
+          (void)fprintf(stderr, "reload: inotify overflow; keeping config until next completed update\n");
+        }
+        offset += sizeof(*event) + event->len;
+      }
       continue;
     }
     /* EAGAIN/EWOULDBLOCK: no more events. Anything else: stop, log on next read. */
@@ -198,18 +221,8 @@ static bool should_evict_on_reload(const qsr_session_t *session, void *userdata)
          !qsr_route_table_has_backend(sets->new_routes, &session->backend_addr, session->backend_addr_len);
 }
 
-static void reload_from_path(qsr_runtime_t *runtime) {
-  qsr_config_t new_config;
-  qsr_status_t status = qsr_config_load(runtime->config_path, &new_config);
-  if (status != QSR_OK) {
-    (void)fprintf(stderr, "reload: parse failed (%d) — keeping previous config\n", (int)status);
-    return;
-  }
-  status = qsr_route_table_resolve(&new_config.routes);
-  if (status != QSR_OK) {
-    (void)fprintf(stderr, "reload: backend resolve failed (%d) — keeping previous config\n", (int)status);
-    return;
-  }
+static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) {
+  const qsr_config_t new_config = *candidate;
   if (strcmp(new_config.listen_udp, runtime->config.listen_udp) != 0) {
     (void)fprintf(stderr, "reload: listen.udp change ignored (requires restart): %s -> %s\n",
                   runtime->config.listen_udp, new_config.listen_udp);
@@ -246,6 +259,16 @@ static void reload_from_path(qsr_runtime_t *runtime) {
   runtime->config.log_connections = new_config.log_connections;
   (void)fprintf(stderr, "reload: ok (%zu routes total)\n", runtime->config.routes.count);
 }
+
+static void *load_candidate(void *userdata) {
+  qsr_reload_job_t *job = userdata;
+  job->status = qsr_config_load(job->path, &job->config);
+  if (job->status == QSR_OK) {
+    job->status = qsr_route_table_resolve(&job->config.routes);
+  }
+  atomic_store_explicit(&job->done, true, memory_order_release);
+  return nullptr;
+}
 #endif /* __linux__ */
 
 /*
@@ -262,8 +285,13 @@ qsr_status_t qsr_runtime_init(qsr_runtime_t *runtime, const qsr_config_t *config
     return QSR_ERR_INVALID;
   }
   runtime->config = *config;
+  runtime->sessions = (qsr_session_table_t){0};
+  runtime->flows = (qsr_flow_table_t){0};
   runtime->config_path = config_path;
   runtime->inotify_fd = -1;
+  runtime->reload_job = nullptr;
+  runtime->reload_pending = false;
+  (void)qsr_hash_bytes("", 0); /* Seed before the resolver worker can hash routes. */
   qsr_status_t status = qsr_session_table_init(&runtime->sessions, runtime->config.max_sessions);
   if (status != QSR_OK) {
     return status;
@@ -290,6 +318,11 @@ void qsr_runtime_free(qsr_runtime_t *runtime) {
     return;
   }
 #ifdef __linux__
+  if (runtime->reload_job != nullptr) {
+    (void)pthread_join(runtime->reload_job->thread, nullptr);
+    free(runtime->reload_job);
+    runtime->reload_job = nullptr;
+  }
   if (runtime->inotify_fd >= 0) {
     (void)close(runtime->inotify_fd);
     runtime->inotify_fd = -1;
@@ -316,7 +349,7 @@ bool qsr_runtime_session_keepalive(const qsr_session_t *session, void *userdata)
 }
 
 /*
- * Conceptually a mutator (drives reload_from_path which writes runtime
+ * Conceptually a mutator (publishes a candidate which writes runtime
  * fields), but on non-Linux platforms the body short-circuits and the compiler
  * only sees reads silence the resulting constness warning.
  */
@@ -329,8 +362,42 @@ void qsr_runtime_poll(qsr_runtime_t *runtime) {
   if (runtime->inotify_fd < 0 || runtime->config_path == nullptr) {
     return;
   }
-  if (drain_inotify(runtime->inotify_fd)) {
-    reload_from_path(runtime);
+  runtime->reload_pending |= drain_inotify(runtime->inotify_fd, runtime->config_path);
+  qsr_reload_job_t *job = runtime->reload_job;
+  if (job != nullptr && atomic_load_explicit(&job->done, memory_order_acquire)) {
+    (void)pthread_join(job->thread, nullptr);
+    if (!runtime->reload_pending) {
+      if (job->status == QSR_OK) {
+        apply_reload(runtime, &job->config);
+      } else {
+        (void)fprintf(stderr, "reload: load/resolve failed (%d); keeping previous config\n", (int)job->status);
+      }
+    }
+    struct timespec finished;
+    (void)clock_gettime(CLOCK_MONOTONIC, &finished);
+    (void)fprintf(stderr, "reload: candidate completed in %.3fs\n",
+                  (double)(finished.tv_sec - job->started.tv_sec) +
+                      (double)(finished.tv_nsec - job->started.tv_nsec) / 1e9);
+    free(job);
+    runtime->reload_job = nullptr;
+  }
+  if (runtime->reload_pending && runtime->reload_job == nullptr) {
+    qsr_reload_job_t *next = calloc(1, sizeof(*next));
+    if (next == nullptr) {
+      /* cppcheck-suppress memleak ; next is nullptr: calloc failed, nothing to free. */
+      return;
+    }
+    next->path = runtime->config_path;
+    atomic_init(&next->done, false);
+    (void)clock_gettime(CLOCK_MONOTONIC, &next->started);
+    const int error = pthread_create(&next->thread, nullptr, load_candidate, next);
+    if (error != 0) {
+      (void)fprintf(stderr, "reload: worker start failed: %s\n", strerror(error));
+      free(next);
+      return;
+    }
+    runtime->reload_job = next;
+    runtime->reload_pending = false;
   }
 #endif
 }
