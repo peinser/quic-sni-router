@@ -13,6 +13,7 @@
 #define QSR_ROUTE_TABLE_H
 
 #include "qsr/common.h"
+#include "qsr/quic_lb.h"
 
 #include <netinet/in.h>
 
@@ -28,6 +29,7 @@ typedef struct qsr_route {
    * docs/cid-routing.md.
    */
   uint8_t server_id;
+  qsr_quic_lb_server_id_t quic_lb_ids[QSR_QUIC_LB_CONFIGS];
   bool backend_resolved;
   struct sockaddr_storage backend_addr;
   socklen_t backend_addr_len;
@@ -43,6 +45,7 @@ typedef struct qsr_route_table {
    * hot path for encoded-CID routing.
    */
   size_t server_id_index[256];
+  size_t quic_lb_index[QSR_QUIC_LB_CONFIGS][QSR_ROUTE_BUCKETS];
   size_t count;
 } qsr_route_table_t;
 
@@ -52,6 +55,10 @@ void qsr_route_table_init(qsr_route_table_t *table);
 [[nodiscard]] const qsr_route_t *qsr_route_table_lookup(const qsr_route_table_t *table, const char *sni);
 [[nodiscard]] const qsr_route_t *qsr_route_table_lookup_by_server_id(const qsr_route_table_t *table, uint8_t server_id);
 [[nodiscard]] qsr_status_t qsr_route_table_resolve(qsr_route_table_t *table);
+[[nodiscard]] qsr_status_t qsr_route_table_set_quic_lb_id(qsr_route_table_t *table, size_t route_index,
+                                                         uint8_t config_id, const qsr_quic_lb_server_id_t *id);
+[[nodiscard]] const qsr_route_t *qsr_route_table_lookup_quic_lb(const qsr_route_table_t *table, uint8_t config_id,
+                                                               const qsr_quic_lb_server_id_t *id);
 
 /*
  * Returns true iff `addr` (of length `addr_len`) is a resolved backend of

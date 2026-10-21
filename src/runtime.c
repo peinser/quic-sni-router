@@ -256,6 +256,7 @@ static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) 
   runtime->config.routes = new_config.routes;
   runtime->config.idle_timeout_seconds = new_config.idle_timeout_seconds;
   runtime->config.cid_codec = new_config.cid_codec;
+  runtime->config.quic_lb = new_config.quic_lb;
   runtime->config.log_connections = new_config.log_connections;
   (void)fprintf(stderr, "reload: ok (%zu routes total)\n", runtime->config.routes.count);
 }

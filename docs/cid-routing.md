@@ -1,5 +1,9 @@
 # Authenticated CID routing
 
+This page describes the qsr-specific authenticated format. For interoperable
+QUIC-LB wire formats, see [quic-lb.md](quic-lb.md). Select one mode per router;
+the formats have different security properties and are not auto-detected.
+
 `cidEncoding` lets cooperating backends encode a route's `serverId` in every
 server-issued CID. The router can then route migration to an unobserved CID
 without decrypting `NEW_CONNECTION_ID` frames. This is a qsr-specific format,

@@ -81,11 +81,12 @@ fuzz-smoke: ## Build fuzzers and run a short smoke test
 		fi; \
 		cmake -S . -B $(BUILD_DIR)-fuzz $(if $(CMAKE_GENERATOR),-G $(CMAKE_GENERATOR),) -DCMAKE_BUILD_TYPE=Debug -DQSR_BUILD_FUZZERS=ON -DCMAKE_C_COMPILER=$(CLANG); \
 		cmake --build $(BUILD_DIR)-fuzz; \
-		mkdir -p $(BUILD_DIR)-fuzz/corpus/initial $(BUILD_DIR)-fuzz/corpus/frames $(BUILD_DIR)-fuzz/corpus/tls; \
+		mkdir -p $(BUILD_DIR)-fuzz/corpus/initial $(BUILD_DIR)-fuzz/corpus/frames $(BUILD_DIR)-fuzz/corpus/tls $(BUILD_DIR)-fuzz/corpus/quic_lb; \
 		$(BUILD_DIR)-fuzz/qsr_dataplane_tests $(BUILD_DIR)-fuzz/corpus; \
 		$(BUILD_DIR)-fuzz/fuzz_quic_initial -runs=1000 $(BUILD_DIR)-fuzz/corpus/initial; \
 		$(BUILD_DIR)-fuzz/fuzz_quic_frames -runs=1000 $(BUILD_DIR)-fuzz/corpus/frames; \
 		$(BUILD_DIR)-fuzz/fuzz_tls_client_hello -runs=1000 $(BUILD_DIR)-fuzz/corpus/tls; \
+		$(BUILD_DIR)-fuzz/fuzz_quic_lb -runs=1000 $(BUILD_DIR)-fuzz/corpus/quic_lb; \
 	fi
 
 sanitize: ## Run unit tests under ASAN/UBSAN

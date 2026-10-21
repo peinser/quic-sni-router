@@ -1,10 +1,10 @@
 # Roadmap
 
-What's planned, why it's worth doing, and what would block someone from picking it up. PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). This list is intentionally opinionated; "no" entries are as important as "yes" entries.
+What's planned, why it's worth doing, and what would block someone from picking it up. PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). This list is intentionally opinionated; "no" entries are as important as "yes" entries.
 
 ## Near term (0.x)
 
-- **Standard QUIC-LB interoperability**. A qsr-specific authenticated CID codec is implemented; see [docs/cid-routing.md](docs/cid-routing.md). Standard wire-format support and CID-aware worker steering remain future work. Neither shared flow state nor seamless worker replacement follows from CID decoding alone.
+- **CID-aware router-worker steering**. QUIC-LB draft-21 wire decoding, configuration rotation, and per-configuration backend/worker endpoint mappings are implemented; see [docs/quic-lb.md](docs/quic-lb.md). Steering between router processes still needs an initial-handshake dispatch and worker-ownership design. Neither shared flow state nor seamless worker replacement follows from CID decoding alone.
 - **Metrics endpoint (Prometheus exposition format)**. Dataplane counters are populated and available through SIGUSR1 and shutdown logs. An admin HTTP endpoint would enable `ServiceMonitor` and HPA integration.
 - **Periodic backend DNS re-resolve**. Today resolution happens at startup and on config reload; an IP change behind a stable hostname requires a kick. A 60s re-resolver that swaps the route's `backend_addr` atomically would close this gap. Watch out for race with the hot-reload path — the new periodic re-resolver should call into the runtime module, not edit the route table directly.
 - **Per-source rate limit**. CPU-DoS shield independent of upstream BCP 38. Token bucket per `/24` (or `/64` for v6), bounded LRU map. Drop Initials over budget before HKDF/AES. Default: very generous (e.g., 1000 Initials/s per /24).

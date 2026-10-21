@@ -15,7 +15,6 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -198,16 +197,13 @@ static void connection_log_stop(qsr_dataplane_t *dp) {
   }
 }
 
-static void connection_log(qsr_dataplane_t *dp, const char *format, ...) {
-  char line[1024]; /* Below Linux PIPE_BUF: all-or-nothing nonblocking writes. */
-  va_list args;
-  va_start(args, format);
-  const int n = vsnprintf(line, sizeof(line), format, args);
-  va_end(args);
-  if (n <= 0) {
+/* Callers format into 1024-byte buffers, below Linux PIPE_BUF. Keeping the
+ * writer non-variadic also avoids C23 va_start analyzer/toolchain mismatches. */
+static void connection_log(qsr_dataplane_t *dp, char *line) {
+  const size_t len = strlen(line);
+  if (len == 0) {
     return;
   }
-  const size_t len = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1U;
   line[len - 1U] = '\n';
   ssize_t written;
   do {
@@ -593,8 +589,10 @@ static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
-  connection_log(dp, "conn: open src=%s sni=%s scid=%s backend=%s\n", src, flow->sni[0] != '\0' ? flow->sni : "?", scid,
-                 backend);
+  char line[1024];
+  (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s\n", src,
+                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend);
+  connection_log(dp, line);
 }
 
 static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const char *reason, time_t now) {
@@ -605,8 +603,10 @@ static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const ch
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
   const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
-  connection_log(dp, "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
+  char line[1024];
+  (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
                  flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
+  connection_log(dp, line);
 }
 
 /* Registered as the flow table's on_close hook; fires for idle expiry,
@@ -1036,14 +1036,36 @@ static void bind_client_tuple(qsr_session_table_t *sessions, const qsr_session_k
                                                        qsr_session_table_t *sessions, const uint8_t *packet,
                                                        size_t packet_len, const qsr_session_key_t *tuple_key,
                                                        time_t now) {
-  if (!runtime_config->cid_codec.enabled) {
-    return nullptr;
+  const qsr_route_t *route = nullptr;
+  if (runtime_config->quic_lb.enabled) {
+    if (packet_len < 2U) {
+      return nullptr;
+    }
+    const uint8_t *dcid = packet + 1U;
+    size_t dcid_len = packet_len - 1U;
+    if ((packet[0] & 0x80U) != 0) {
+      /* RFC 8999 invariant fields: no version-specific type/fixed-bit check. */
+      if (packet_len < 7U || packet[5] > QSR_MAX_QUIC_CID_LEN || 6U + (size_t)packet[5] >= packet_len) {
+        return nullptr;
+      }
+      dcid = packet + 6U;
+      dcid_len = packet[5];
+    } else if (dcid_len > QSR_MAX_QUIC_CID_LEN) {
+      dcid_len = QSR_MAX_QUIC_CID_LEN;
+    }
+    uint8_t rotation;
+    qsr_quic_lb_server_id_t server_id;
+    if (qsr_quic_lb_decode(&runtime_config->quic_lb, dcid, dcid_len, &rotation, &server_id) != QSR_OK) {
+      return nullptr;
+    }
+    route = qsr_route_table_lookup_quic_lb(&runtime_config->routes, rotation, &server_id);
+  } else {
+    uint8_t server_id = 0U;
+    if (try_decode_dcid_server_id(&runtime_config->cid_codec, packet, packet_len, &server_id) != QSR_OK) {
+      return nullptr;
+    }
+    route = qsr_route_table_lookup_by_server_id(&runtime_config->routes, server_id);
   }
-  uint8_t server_id = 0U;
-  if (try_decode_dcid_server_id(&runtime_config->cid_codec, packet, packet_len, &server_id) != QSR_OK) {
-    return nullptr;
-  }
-  const qsr_route_t *route = qsr_route_table_lookup_by_server_id(&runtime_config->routes, server_id);
   if (route == nullptr || !route->backend_resolved) {
     return nullptr;
   }
@@ -1204,9 +1226,10 @@ static void handle_client_packet(qsr_dataplane_t *dp, const uint8_t *packet, siz
    * classification, and other long headers want CID learning. Disabled when
    * encoded-CID routing is on, because that mode is contracted to route by
    * decoded server_id before any tuple state so active migration keeps
-   * working (see docs/cid-routing.md).
+   * working (see docs/cid-routing.md and docs/quic-lb.md).
    */
-  if (!runtime_config->cid_codec.enabled && packet_len > 0U && (packet[0] & 0x80U) == 0U) {
+  if (!runtime_config->cid_codec.enabled && !runtime_config->quic_lb.enabled && packet_len > 0U &&
+      (packet[0] & 0x80U) == 0U) {
     qsr_flow_t *fast_flow = qsr_flow_table_get(&dp->runtime->flows, source, source_len);
     if (fast_flow != nullptr) {
       fast_flow->last_seen = now;
@@ -1447,7 +1470,8 @@ static void run_expiry_sweeps(qsr_dataplane_t *dp, time_t now) {
 }
 
 static void report_live_metrics(qsr_dataplane_t *dp) {
-  connection_log(dp,
+  char line[1024];
+  (void)snprintf(line, sizeof(line),
                  "metrics: received=%llu sent=%llu flows=%zu sessions=%zu kernel_drops=%llu truncated=%llu "
                  "send_drops=%llu flow_open_failures=%llu flow_evictions=%llu session_evictions=%llu "
                  "parse_failures=%llu unknown_sni=%llu gso_batches=%llu log_drops=%llu draining=%d\n",
@@ -1458,10 +1482,12 @@ static void report_live_metrics(qsr_dataplane_t *dp) {
                  (unsigned long long)dp->metrics.flow_evictions, (unsigned long long)dp->runtime->sessions.evictions,
                  (unsigned long long)dp->metrics.parse_failures, (unsigned long long)dp->metrics.unknown_sni,
                  (unsigned long long)dp->metrics.gso_batches, (unsigned long long)dp->log_drops, (int)g_drain);
+  connection_log(dp, line);
   for (unsigned error = 0; error < 256; error++) {
     if (dp->metrics.send_errors[error] != 0) {
-      connection_log(dp, "metrics: send_errno=%u count=%llu\n", error,
+      (void)snprintf(line, sizeof(line), "metrics: send_errno=%u count=%llu\n", error,
                      (unsigned long long)dp->metrics.send_errors[error]);
+      connection_log(dp, line);
     }
   }
 }

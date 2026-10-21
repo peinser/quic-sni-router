@@ -69,6 +69,9 @@ void qsr_route_table_init(qsr_route_table_t *table) {
   for (size_t i = 0U; i < QSR_ROUTE_BUCKETS; i++) {
     table->buckets[i] = SIZE_MAX;
     table->backend_buckets[i] = SIZE_MAX;
+    for (size_t c = 0; c < QSR_QUIC_LB_CONFIGS; c++) {
+      table->quic_lb_index[c][i] = SIZE_MAX;
+    }
   }
   for (size_t i = 0U; i < sizeof(table->server_id_index) / sizeof(table->server_id_index[0]); i++) {
     table->server_id_index[i] = SIZE_MAX;
@@ -155,6 +158,51 @@ const qsr_route_t *qsr_route_table_lookup_by_server_id(const qsr_route_table_t *
     return nullptr;
   }
   return &table->routes[route_index];
+}
+
+qsr_status_t qsr_route_table_set_quic_lb_id(qsr_route_table_t *table, size_t route_index,
+                                           uint8_t config_id, const qsr_quic_lb_server_id_t *id) {
+  if (table == nullptr || route_index >= table->count || config_id >= QSR_QUIC_LB_CONFIGS || id == nullptr ||
+      id->len == 0 || id->len > QSR_QUIC_LB_MAX_SERVER_ID || table->routes[route_index].quic_lb_ids[config_id].len != 0) {
+    return QSR_ERR_INVALID;
+  }
+  size_t bucket = (size_t)(qsr_hash_bytes(id->bytes, id->len) % QSR_ROUTE_BUCKETS);
+  for (size_t probes = 0; probes < QSR_ROUTE_BUCKETS; probes++) {
+    const size_t existing = table->quic_lb_index[config_id][bucket];
+    if (existing == SIZE_MAX) {
+      table->quic_lb_index[config_id][bucket] = route_index;
+      table->routes[route_index].quic_lb_ids[config_id] = *id;
+      return QSR_OK;
+    }
+    const qsr_quic_lb_server_id_t *other = &table->routes[existing].quic_lb_ids[config_id];
+    if (other->len == id->len && memcmp(other->bytes, id->bytes, id->len) == 0) {
+      return QSR_ERR_INVALID;
+    }
+    bucket = (bucket + 1U) % QSR_ROUTE_BUCKETS;
+  }
+  return QSR_ERR_FULL;
+}
+
+const qsr_route_t *qsr_route_table_lookup_quic_lb(const qsr_route_table_t *table, uint8_t config_id,
+                                                 const qsr_quic_lb_server_id_t *id) {
+  if (table == nullptr || config_id >= QSR_QUIC_LB_CONFIGS || id == nullptr || id->len == 0 ||
+      id->len > QSR_QUIC_LB_MAX_SERVER_ID) {
+    return nullptr;
+  }
+  size_t bucket = (size_t)(qsr_hash_bytes(id->bytes, id->len) % QSR_ROUTE_BUCKETS);
+  for (size_t probes = 0; probes < QSR_ROUTE_BUCKETS; probes++) {
+    const size_t index = table->quic_lb_index[config_id][bucket];
+    if (index == SIZE_MAX) {
+      return nullptr;
+    }
+    const qsr_route_t *route = &table->routes[index];
+    const qsr_quic_lb_server_id_t *candidate = &route->quic_lb_ids[config_id];
+    if (candidate->len == id->len && memcmp(candidate->bytes, id->bytes, id->len) == 0) {
+      return route;
+    }
+    bucket = (bucket + 1U) % QSR_ROUTE_BUCKETS;
+  }
+  return nullptr;
 }
 
 const qsr_route_t *qsr_route_table_lookup(const qsr_route_table_t *table, const char *sni) {

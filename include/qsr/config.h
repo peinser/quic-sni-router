@@ -2,7 +2,7 @@
  * qsr/config.h: runtime configuration loaded from a YAML file (or built from
  * defaults). Schema mirrors the chart's values.yaml 1:1: listen.udp,
  * sessions.idleTimeout, sessions.maxSessions, routes (SNI -> host:port),
- * cidEncoding (optional encrypted-CID routing for stateless QUIC migration).
+ * cidEncoding (qsr-authenticated CIDs) or quicLb (draft-21 wire interoperability).
  * Backed by libyaml; see src/config.c for the loader.
  */
 #ifndef QSR_CONFIG_H
@@ -18,6 +18,7 @@ typedef struct qsr_config {
   bool log_connections; /* logging.connections: one stderr line per flow open/close */
   qsr_route_table_t routes;
   qsr_cid_codec_t cid_codec;
+  qsr_quic_lb_t quic_lb;
 } qsr_config_t;
 
 void qsr_config_default(qsr_config_t *config);

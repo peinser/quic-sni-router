@@ -4,6 +4,14 @@ Deploys [quic-sni-router](https://github.com/Peinser/quic-sni-router) into Kuber
 
 ## Install
 
+For QUIC-LB-capable backends, set `config.quicLb.configurations` and each route's
+`quicLbServerIds` map. Hex IDs must be strings (quote leading zeros). The chart
+validates basic shapes/ranges; the router also validates ID lengths, configuration
+references, duplicate assignments, and rotation settings. `quicLb` and
+`cidEncoding` are mutually exclusive. See [QUIC-LB configuration](../../docs/quic-lb.md)
+for draft revision, key rotation, and the distinction between encryption and CID
+authentication. Router-process steering remains separate work.
+
 ```sh
 helm install qsr oci://harbor.peinser.com/library/charts/quic-sni-router \
   --version <chart-version> \

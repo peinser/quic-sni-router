@@ -48,6 +48,7 @@ add_library(qsr_core
   src/quic_crypto.c
   src/quic_frames.c
   src/quic_initial.c
+  src/quic_lb.c
   src/route_table.c
   src/runtime.c
   src/session_table.c
@@ -92,6 +93,7 @@ add_executable(qsr_unit_tests
   tests/unit/test_quic_crypto.c
   tests/unit/test_quic_frames.c
   tests/unit/test_quic_initial.c
+  tests/unit/test_quic_lb.c
   tests/unit/test_route_table.c
   tests/unit/test_session_table.c
   tests/unit/test_tls_client_hello.c
@@ -117,7 +119,7 @@ endif()
 if(QSR_BUILD_FUZZERS AND CMAKE_C_COMPILER_ID MATCHES "Clang")
   target_compile_options(qsr_core PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
   target_link_options(qsr_core PUBLIC -fsanitize=fuzzer-no-link,address,undefined)
-  foreach(fuzzer fuzz_quic_initial fuzz_quic_frames fuzz_tls_client_hello)
+  foreach(fuzzer fuzz_quic_initial fuzz_quic_frames fuzz_tls_client_hello fuzz_quic_lb)
     add_executable(${fuzzer} tests/fuzz/${fuzzer}.c)
     target_link_libraries(${fuzzer} PRIVATE qsr_core)
     target_compile_options(${fuzzer} PRIVATE -fsanitize=fuzzer,address,undefined)

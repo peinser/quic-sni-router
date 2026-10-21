@@ -112,8 +112,8 @@ logging:
 
 Parsing is done by [libyaml](https://github.com/yaml/libyaml), so the whole YAML 1.1 surface is accepted: block and flow style, quoted and multi-line scalars, comments, anchors, aliases. The schema on top of it is deliberately unforgiving:
 
-- The only top-level keys are `listen`, `sessions`, `routes`, `cidEncoding`, and `logging`. Anything else is an error rather than a silently ignored typo.
-- Each route requires `host` and `port`, with optional `serverId` for authenticated CID routing. Other keys are rejected.
+- The only top-level keys are `listen`, `sessions`, `routes`, `cidEncoding`, `quicLb`, and `logging`. Anything else is an error rather than a silently ignored typo.
+- Each route requires `host` and `port`, with optional `serverId` for qsr-authenticated CIDs or `quicLbServerIds` for QUIC-LB. Other keys are rejected.
 - SNI keys are lower-cased and validated as DNS names: no empty labels, no leading hyphens, 255 characters max.
 - An empty file means defaults.
 
@@ -143,6 +143,13 @@ The receive path reserves 64 KiB per GRO slot and rejects payload/ancillary trun
 - `SIGTERM` / `SIGINT`: flush queued sends and close immediately. They do not preserve active connections. A Kubernetes grace period or `maxUnavailable: 0` alone does not make rollouts connection-preserving.
 
 Authenticated CID routing has a new, incompatible format; see [docs/cid-routing.md](docs/cid-routing.md) before upgrading backends using `cidEncoding`.
+
+For cooperating backends that issue QUIC-LB CIDs, the alternative `quicLb` mode
+supports the encrypted and unencrypted formats of draft-ietf-quic-load-balancers-21,
+multi-byte server IDs, and overlapping configurations for key rotation. See
+[docs/quic-lb.md](docs/quic-lb.md) for configuration and compatibility boundaries.
+QUIC-LB encryption is not CID authentication; this mode is mutually exclusive
+with `cidEncoding`.
 
 More examples are in [docs/examples.md](docs/examples.md), and [examples/mtls-backends/](examples/mtls-backends/) is a Compose demo with two HTTP/3 mTLS backends routed by SNI.
 

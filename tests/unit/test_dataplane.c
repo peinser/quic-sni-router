@@ -292,7 +292,9 @@ static void test_kubernetes_symlink_reload(void) {
     FILE *file = fopen(paths[i], "w");
     ASSERT_TRUE(file != nullptr);
     ASSERT_TRUE(fprintf(file, "sessions: {idleTimeout: %us, maxSessions: 16}\n"
-                             "routes: {example.test: {host: 127.0.0.1, port: 8443}}\n", i * 7) > 0);
+                             "quicLb: {configurations: [{id: %u, serverIdLength: 3, nonceLength: 4}]}\n"
+                             "routes: {example.test: {host: 127.0.0.1, port: 8443, quicLbServerIds: {%u: 'ed793a'}}}\n",
+                        i * 7, i - 1U, i - 1U) > 0);
     ASSERT_TRUE(fclose(file) == 0);
   }
   ASSERT_TRUE(symlink("..data", paths[0]) == 0 && symlink("version1", paths[3]) == 0);
@@ -303,9 +305,14 @@ static void test_kubernetes_symlink_reload(void) {
   ASSERT_TRUE(qsr_runtime_init(runtime, config, paths[0]) == QSR_OK);
   ASSERT_TRUE(qsr_route_table_resolve(&runtime->config.routes) == QSR_OK);
   ASSERT_TRUE(runtime->config.idle_timeout_seconds == 7);
+  ASSERT_TRUE(runtime->config.quic_lb.configs[0].active && !runtime->config.quic_lb.configs[1].active);
   ASSERT_TRUE(symlink("version2", paths[4]) == 0 && rename(paths[4], paths[3]) == 0);
   finish_reload(runtime);
   ASSERT_TRUE(runtime->config.idle_timeout_seconds == 14 && runtime->config.routes.count == 1);
+  ASSERT_TRUE(!runtime->config.quic_lb.configs[0].active && runtime->config.quic_lb.configs[1].active);
+  const qsr_quic_lb_server_id_t sid = {.bytes = {0xed, 0x79, 0x3a}, .len = 3};
+  ASSERT_TRUE(qsr_route_table_lookup_quic_lb(&runtime->config.routes, 0, &sid) == nullptr);
+  ASSERT_TRUE(qsr_route_table_lookup_quic_lb(&runtime->config.routes, 1, &sid) != nullptr);
   qsr_runtime_free(runtime);
   free(runtime);
   free(config);
@@ -423,7 +430,9 @@ static void test_logging_backpressure(void) {
   qsr_dataplane_t dp = {.log_started = true, .log_write_fd = fds[1]};
   /* A stopped collector must not stop forwarding or partially write records. */
   for (unsigned i = 0; i < 10000; i++) {
-    connection_log(&dp, "conn: test backpressure record %u\n", i);
+    char line[1024];
+    (void)snprintf(line, sizeof(line), "conn: test backpressure record %u\n", i);
+    connection_log(&dp, line);
   }
   ASSERT_TRUE(dp.log_drops > 0);
   close(fds[0]);
@@ -555,6 +564,88 @@ static void test_ipv6_listener_and_drain(void) {
   ASSERT_TRUE(routed && exited && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void test_quic_lb_routing(void) {
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr);
+  qsr_config_default(&runtime->config);
+  ASSERT_TRUE(qsr_flow_table_init(&runtime->flows, 16) == QSR_OK);
+  ASSERT_TRUE(qsr_session_table_init(&runtime->sessions, 1024) == QSR_OK);
+  qsr_dataplane_t dp = {.runtime = runtime, .main_fd = -1, .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+  ASSERT_TRUE(dp.epoll_fd >= 0);
+  runtime->flows.on_close = conn_close_callback;
+  runtime->flows.on_close_userdata = &dp;
+  struct sockaddr_storage backend_a;
+  struct sockaddr_storage backend_b;
+  const int a = bound_socket(&backend_a);
+  const int b = bound_socket(&backend_b);
+  ASSERT_TRUE(qsr_route_table_add(&runtime->config.routes, "a.test", "127.0.0.1",
+                                   ntohs(((struct sockaddr_in *)&backend_a)->sin_port), 0) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_add(&runtime->config.routes, "b.test", "127.0.0.1",
+                                   ntohs(((struct sockaddr_in *)&backend_b)->sin_port), 0) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_resolve(&runtime->config.routes) == QSR_OK);
+  qsr_cid_codec_t key;
+  ASSERT_TRUE(qsr_cid_codec_init_from_hex(&key, "8f95f09245765f80256934e50c66207f") == QSR_OK);
+  ASSERT_TRUE(qsr_quic_lb_config_init(&runtime->config.quic_lb, 0, 3, 4, key.key) == QSR_OK);
+  ASSERT_TRUE(qsr_quic_lb_config_init(&runtime->config.quic_lb, 1, 3, 4, nullptr) == QSR_OK);
+  const qsr_quic_lb_server_id_t id_a = {.bytes = {0xed, 0x79, 0x3a}, .len = 3};
+  const qsr_quic_lb_server_id_t id_b = {.len = 3};
+  ASSERT_TRUE(qsr_route_table_set_quic_lb_id(&runtime->config.routes, 0, 0, &id_a) == QSR_OK);
+  ASSERT_TRUE(qsr_route_table_set_quic_lb_id(&runtime->config.routes, 1, 1, &id_b) == QSR_OK);
+  const uint8_t packet_a[] = {0x40, 0x07, 0x20, 0xb1, 0xd0, 0x7b, 0x35, 0x9d, 0x3c, 0xaa};
+  /* No backend CID learning or ClientHello was involved. Rebinding must route
+   * from the encrypted CID alone, preserving the original datagram. */
+  uint8_t received[64];
+  for (unsigned port = 40000; port <= 40001; port++) {
+    const struct sockaddr_storage client = loopback(port);
+    handle_client_packet(&dp, packet_a, sizeof(packet_a), &client, sizeof(struct sockaddr_in), 1);
+    sender_flush(&dp.sender);
+    ASSERT_TRUE(recv(a, received, sizeof(received), 0) == sizeof(packet_a));
+    ASSERT_TRUE(memcmp(packet_a, received, sizeof(packet_a)) == 0);
+  }
+  const struct sockaddr_storage client = loopback(40000);
+  /* Same tuple, another active configuration: CID routing must beat cached
+   * flow/tuple state. Low first-octet bits and QUIC's fixed bit are not gates. */
+  const uint8_t packet_b[] = {0x00, 0x3f, 0, 0, 0, 1, 2, 3, 4, 0xbb};
+  handle_client_packet(&dp, packet_b, sizeof(packet_b), &client, sizeof(struct sockaddr_in), 2);
+  sender_flush(&dp.sender);
+  ASSERT_TRUE(recv(b, received, sizeof(received), 0) == sizeof(packet_b));
+  ASSERT_TRUE(memcmp(packet_b, received, sizeof(packet_b)) == 0);
+  /* Long-header extraction is version independent; SCID length follows DCID. */
+  uint8_t long_packet[15] = {0x80, 0xaa, 0xbb, 0xcc, 0xdd, 8};
+  memcpy(long_packet + 6, packet_a + 1, 8);
+  handle_client_packet(&dp, long_packet, sizeof(long_packet), &client, sizeof(struct sockaddr_in), 3);
+  sender_flush(&dp.sender);
+  ASSERT_TRUE(recv(a, received, sizeof(received), 0) == sizeof(long_packet));
+  ASSERT_TRUE(memcmp(long_packet, received, sizeof(long_packet)) == 0);
+
+  qsr_session_key_t tuple = qsr_session_tuple_key(&client, sizeof(struct sockaddr_in));
+  long_packet[5] = 7; /* Explicit DCID length, not bytes of SCID/payload. */
+  ASSERT_TRUE(lookup_encoded_cid(&runtime->config, &runtime->sessions, long_packet, sizeof(long_packet), &tuple, 4) == nullptr);
+  uint8_t unknown[10];
+  memcpy(unknown, packet_b, sizeof(unknown));
+  unknown[1] = 0xe0;
+  ASSERT_TRUE(lookup_encoded_cid(&runtime->config, &runtime->sessions, unknown, sizeof(unknown), &tuple, 4) == nullptr);
+  unknown[1] = 0x40;
+  ASSERT_TRUE(lookup_encoded_cid(&runtime->config, &runtime->sessions, unknown, sizeof(unknown), &tuple, 4) == nullptr);
+  unknown[1] = 0x20;
+  unknown[2] = 1;
+  ASSERT_TRUE(lookup_encoded_cid(&runtime->config, &runtime->sessions, unknown, sizeof(unknown), &tuple, 4) == nullptr);
+  /* One valid-size seed per decoder branch; ciphertext need not authenticate. */
+  for (unsigned rotation = 0; rotation < 7; rotation++) {
+    uint8_t seed[20] = {0};
+    seed[0] = (uint8_t)(rotation << 5U);
+    char name[32];
+    (void)snprintf(name, sizeof(name), "quic_lb/config-%u", rotation);
+    save_seed(name, seed, sizeof(seed));
+  }
+  qsr_flow_table_free(&runtime->flows);
+  qsr_session_table_free(&runtime->sessions);
+  close(a);
+  close(b);
+  close(dp.epoll_fd);
+  free(runtime);
+}
+
 int main(int argc, char **argv) {
   seed_directory = argc == 2 ? argv[1] : nullptr;
   test_flow_lifetimes_and_sources();
@@ -568,5 +659,6 @@ int main(int argc, char **argv) {
   test_logging_backpressure();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
+  test_quic_lb_routing();
   return 0;
 }

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <yaml.h>
+#include <openssl/crypto.h>
 
 /*
  * libyaml document-API config loader.
@@ -177,6 +178,35 @@ void qsr_config_default(qsr_config_t *config) {
   return QSR_OK;
 }
 
+static qsr_status_t parse_quic_lb_ids(yaml_document_t *doc, const yaml_node_t *node, qsr_route_table_t *routes,
+                                     size_t route_index) {
+  if (node->type != YAML_MAPPING_NODE || node->data.mapping.pairs.start == node->data.mapping.pairs.top) {
+    return QSR_ERR_INVALID;
+  }
+  for (yaml_node_pair_t *pair = node->data.mapping.pairs.start; pair < node->data.mapping.pairs.top; pair++) {
+    char rotation[8];
+    char hex[QSR_QUIC_LB_MAX_SERVER_ID * 2U + 1U];
+    size_t config_id = 0;
+    if (copy_scalar(yaml_document_get_node(doc, pair->key), rotation, sizeof(rotation)) != QSR_OK ||
+        parse_size(rotation, 0, QSR_QUIC_LB_CONFIGS - 1U, &config_id) != QSR_OK ||
+        copy_scalar(yaml_document_get_node(doc, pair->value), hex, sizeof(hex)) != QSR_OK) {
+      return QSR_ERR_INVALID;
+    }
+    const size_t hex_len = strlen(hex);
+    qsr_quic_lb_server_id_t id = {0};
+    size_t len = 0;
+    if (hex_len == 0 || hex_len % 2U != 0 ||
+        OPENSSL_hexstr2buf_ex(id.bytes, sizeof(id.bytes), &len, hex, '\0') != 1 || len != hex_len / 2U) {
+      return QSR_ERR_INVALID;
+    }
+    id.len = (uint8_t)len;
+    if (qsr_route_table_set_quic_lb_id(routes, route_index, (uint8_t)config_id, &id) != QSR_OK) {
+      return QSR_ERR_INVALID;
+    }
+  }
+  return QSR_OK;
+}
+
 [[nodiscard]] static qsr_status_t parse_route_body(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config,
                                                    const char *sni) {
   if (node == nullptr || node->type != YAML_MAPPING_NODE) {
@@ -185,6 +215,7 @@ void qsr_config_default(qsr_config_t *config) {
   char host[QSR_MAX_ADDR_LEN + 1U] = {0};
   uint16_t port = 0U;
   uint8_t server_id = 0U;
+  yaml_node_t *lb_ids = nullptr;
   for (yaml_node_pair_t *pair = node->data.mapping.pairs.start; pair < node->data.mapping.pairs.top; pair++) {
     yaml_node_t *k = yaml_document_get_node(doc, pair->key);
     yaml_node_t *v = yaml_document_get_node(doc, pair->value);
@@ -208,6 +239,11 @@ void qsr_config_default(qsr_config_t *config) {
       if (status != QSR_OK) {
         return status;
       }
+    } else if (strcmp(key, "quicLbServerIds") == 0) {
+      if (lb_ids != nullptr) {
+        return QSR_ERR_INVALID;
+      }
+      lb_ids = v;
     } else if (strcmp(key, "serverId") == 0) {
       char sid_text[8];
       status = copy_scalar(v, sid_text, sizeof(sid_text));
@@ -227,7 +263,11 @@ void qsr_config_default(qsr_config_t *config) {
   if (host[0] == '\0' || port == 0U) {
     return QSR_ERR_INVALID;
   }
-  return qsr_route_table_add(&config->routes, sni, host, port, server_id);
+  const qsr_status_t status = qsr_route_table_add(&config->routes, sni, host, port, server_id);
+  if (status != QSR_OK || lb_ids == nullptr) {
+    return status;
+  }
+  return parse_quic_lb_ids(doc, lb_ids, &config->routes, config->routes.count - 1U);
 }
 
 [[nodiscard]] static qsr_status_t parse_logging(yaml_document_t *doc, yaml_node_t *node, qsr_config_t *config) {
@@ -307,6 +347,68 @@ void qsr_config_default(qsr_config_t *config) {
   return QSR_OK;
 }
 
+static qsr_status_t parse_quic_lb(yaml_document_t *doc, yaml_node_t *node, qsr_quic_lb_t *lb) {
+  if (node->type != YAML_MAPPING_NODE || lb->enabled ||
+      node->data.mapping.pairs.top - node->data.mapping.pairs.start != 1) {
+    return QSR_ERR_INVALID;
+  }
+  const yaml_node_pair_t *pair = node->data.mapping.pairs.start;
+  char key[32];
+  if (copy_scalar(yaml_document_get_node(doc, pair->key), key, sizeof(key)) != QSR_OK ||
+      strcmp(key, "configurations") != 0) {
+    return QSR_ERR_INVALID;
+  }
+  yaml_node_t *list = yaml_document_get_node(doc, pair->value);
+  if (list->type != YAML_SEQUENCE_NODE || list->data.sequence.items.start == list->data.sequence.items.top) {
+    return QSR_ERR_INVALID;
+  }
+  for (yaml_node_item_t *item = list->data.sequence.items.start; item < list->data.sequence.items.top; item++) {
+    yaml_node_t *entry = yaml_document_get_node(doc, *item);
+    if (entry->type != YAML_MAPPING_NODE) {
+      return QSR_ERR_INVALID;
+    }
+    size_t rotation = 0;
+    size_t sid_len = 0;
+    size_t nonce_len = 0;
+    unsigned seen = 0;
+    qsr_cid_codec_t parsed_key = {0};
+    for (yaml_node_pair_t *field = entry->data.mapping.pairs.start; field < entry->data.mapping.pairs.top; field++) {
+      char name[32];
+      char value[33];
+      if (copy_scalar(yaml_document_get_node(doc, field->key), name, sizeof(name)) != QSR_OK ||
+          copy_scalar(yaml_document_get_node(doc, field->value), value, sizeof(value)) != QSR_OK) {
+        return QSR_ERR_INVALID;
+      }
+      unsigned bit;
+      qsr_status_t status;
+      if (strcmp(name, "id") == 0) {
+        bit = 1;
+        status = parse_size(value, 0, 6, &rotation);
+      } else if (strcmp(name, "serverIdLength") == 0) {
+        bit = 2;
+        status = parse_size(value, 1, QSR_QUIC_LB_MAX_SERVER_ID, &sid_len);
+      } else if (strcmp(name, "nonceLength") == 0) {
+        bit = 4;
+        status = parse_size(value, 4, 18, &nonce_len);
+      } else if (strcmp(name, "key") == 0) {
+        bit = 8;
+        status = qsr_cid_codec_init_from_hex(&parsed_key, value);
+      } else {
+        return QSR_ERR_INVALID;
+      }
+      if (status != QSR_OK || (seen & bit) != 0) {
+        return QSR_ERR_INVALID;
+      }
+      seen |= bit;
+    }
+    if ((seen & 7U) != 7U || qsr_quic_lb_config_init(lb, (uint8_t)rotation, (uint8_t)sid_len, (uint8_t)nonce_len,
+                                                    parsed_key.enabled ? parsed_key.key : nullptr) != QSR_OK) {
+      return QSR_ERR_INVALID;
+    }
+  }
+  return QSR_OK;
+}
+
 [[nodiscard]] static qsr_status_t parse_root(yaml_document_t *doc, qsr_config_t *config) {
   yaml_node_t *root = yaml_document_get_root_node(doc);
   if (root == nullptr) {
@@ -332,6 +434,8 @@ void qsr_config_default(qsr_config_t *config) {
       status = parse_routes(doc, v, config);
     } else if (strcmp(key, "cidEncoding") == 0) {
       status = parse_cid_encoding(doc, v, config);
+    } else if (strcmp(key, "quicLb") == 0) {
+      status = parse_quic_lb(doc, v, &config->quic_lb);
     } else if (strcmp(key, "logging") == 0) {
       status = parse_logging(doc, v, config);
     } else {
@@ -339,6 +443,30 @@ void qsr_config_default(qsr_config_t *config) {
     }
     if (status != QSR_OK) {
       return status;
+    }
+  }
+  if (config->quic_lb.enabled && config->cid_codec.enabled) {
+    return QSR_ERR_INVALID; /* Formats overlap: never guess which codec owns a CID. */
+  }
+  bool mapped[QSR_QUIC_LB_CONFIGS] = {false};
+  for (size_t r = 0; r < config->routes.count; r++) {
+    const qsr_route_t *route = &config->routes.routes[r];
+    if (config->quic_lb.enabled && route->server_id != 0) {
+      return QSR_ERR_INVALID;
+    }
+    for (size_t c = 0; c < QSR_QUIC_LB_CONFIGS; c++) {
+      const uint8_t len = route->quic_lb_ids[c].len;
+      if (len != 0) {
+        if (!config->quic_lb.configs[c].active || len != config->quic_lb.configs[c].server_id_len) {
+          return QSR_ERR_INVALID;
+        }
+        mapped[c] = true;
+      }
+    }
+  }
+  for (size_t c = 0; c < QSR_QUIC_LB_CONFIGS; c++) {
+    if (config->quic_lb.configs[c].active && !mapped[c]) {
+      return QSR_ERR_INVALID;
     }
   }
   return QSR_OK;

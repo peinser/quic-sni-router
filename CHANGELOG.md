@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### QUIC-LB wire interoperability
+
+- Added opt-in `quicLb` decoding pinned to draft-ietf-quic-load-balancers-21: unencrypted, single-pass AES, and four-pass Feistel formats, including odd lengths and long server IDs. Configuration IDs 0–6 can coexist for rotation; reserved ID 7 is unroutable.
+- Added per-route `quicLbServerIds` hexadecimal mappings with configuration-scoped hash indexes. Valid decoded mappings take precedence over tuple state and work with QUIC invariant long-header fields. The existing qsr-authenticated codec remains available as a mutually exclusive mode.
+- Added draft/QUICHE vectors, packet/rebind/reload regressions, and a decoder fuzzer. Router-process steering and shared socket state remain separate work.
+- Removed the custom variadic logger: callers format with `snprintf` before invoking the bounded writer, eliminating CI's C23 `va_list` analyzer failure without suppressing it.
+
 ### Security and Linux reliability
 
 - Replaced malleable CTR CIDs with version `0x50` 20-byte HMAC-authenticated CIDs. This is a breaking wire-format change; coordinate backend upgrades and key rotation as described in `docs/cid-routing.md`.
