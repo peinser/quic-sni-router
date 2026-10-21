@@ -101,7 +101,11 @@ static void test_flow_lifetimes_and_sources(void) {
 static void test_socket_marks(void) {
   /* Zero must not even call setsockopt; errors must preserve errno. */
   ASSERT_TRUE(set_socket_mark(-1, 0, "listener") == QSR_OK);
-  ASSERT_TRUE(set_socket_mark(-1, 12345, "listener") == QSR_ERR_INVALID && errno == EBADF);
+  /* QEMU may reject SO_MARK before checking the descriptor. */
+  const uint32_t mark = 12345;
+  ASSERT_TRUE(setsockopt(-1, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1);
+  const int saved = errno;
+  ASSERT_TRUE(set_socket_mark(-1, mark, "listener") == QSR_ERR_INVALID && errno == saved);
   const int families[] = {AF_INET, AF_INET6};
   for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
     int listener = socket(families[i], SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -109,12 +113,16 @@ static void test_socket_marks(void) {
     uint32_t actual = UINT32_MAX;
     socklen_t len = sizeof(actual);
     ASSERT_TRUE(set_socket_mark(listener, 0, "listener") == QSR_OK);
-    ASSERT_TRUE(getsockopt(listener, SOL_SOCKET, SO_MARK, &actual, &len) == 0 && actual == 0);
+    if (getsockopt(listener, SOL_SOCKET, SO_MARK, &actual, &len) == 0) {
+      ASSERT_TRUE(actual == 0);
+    } else {
+      ASSERT_TRUE(errno == ENOPROTOOPT); /* QEMU may not implement SO_MARK. */
+    }
     const qsr_status_t marked = set_socket_mark(listener, UINT32_MAX, "listener");
     if (marked == QSR_OK) {
       ASSERT_TRUE(getsockopt(listener, SOL_SOCKET, SO_MARK, &actual, &len) == 0 && actual == UINT32_MAX);
     } else {
-      ASSERT_TRUE(errno == EPERM || errno == EACCES);
+      ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOPROTOOPT);
     }
     close(listener);
 
