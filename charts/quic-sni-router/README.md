@@ -52,6 +52,40 @@ WAN UDP/443 -> Service (LoadBalancer)
 - The chart defaults to two independent pods. The Service/LB balances UDP flows; pods do not share a `SO_REUSEPORT` group or connection state. NAT rebinding and replica replacement can lose routing state.
 - Backends are resolved at pod startup and on every hot reload. To pick up an IP change behind a stable hostname without a config edit, run `helm upgrade --recreate-pods` or `kubectl rollout restart`.
 
+## Policy routing (Linux)
+
+`config.listen.fwmark` sets `SO_MARK` on the listener and all upstream UDP sockets
+(IPv4 and IPv6). It defaults to `0` (disabled); valid values are decimal integers
+from `0` to `4294967295`. For example:
+
+```yaml
+config:
+  listen:
+    fwmark: 12345
+containerSecurityContext:
+  capabilities:
+    drop: [ALL]
+    add: [NET_ADMIN] # NET_RAW is sufficient on Linux 5.17 and later
+```
+
+The chart does not grant capabilities automatically. The capability must remain
+available for new upstream sockets; failures are logged and traffic is never
+sent through an unmarked fallback socket. Listener marking failure aborts startup.
+
+An administrator must separately configure matching policy rules, for example
+`ip -6 rule add pref 90 fwmark 12345 lookup main` and its `ip -4` equivalent.
+The rules and routes must apply in the network namespace where QSR's route lookup
+occurs. Pods normally have their own network namespaces: a host WARP rule and a
+pod socket mark are not automatically an end-to-end routing solution, and CNIs
+may use or modify packet marks. Coordinate mark values and rules with your CNI.
+The chart does not install routing rules. See the
+[routing semantics and permissions](../../README.md#policy-routing-with-a-socket-mark-linux).
+
+Changing the mark requires a pod restart. With the default
+`configMap.checksumAnnotation: false`, explicitly run `kubectl rollout restart`
+for the Deployment after updating the configuration, or enable checksum-based
+rollouts below.
+
 ## Hot reload
 
 This chart's `ConfigMap` is rendered from `.Values.config`. A `helm upgrade` that changes routes writes a new `ConfigMap` revision. kubelet propagates it into each pod (typically <60s) and the router's `inotify` watch atomically swaps in the new routes:
@@ -68,7 +102,7 @@ configMap:
   checksumAnnotation: true
 ```
 
-The following fields require a process restart and are ignored on reload with a logged warning: `config.listen.udp`, `config.sessions.maxSessions`.
+The following fields require a process restart and are ignored on reload with a logged warning: `config.listen.udp`, `config.listen.fwmark`, `config.sessions.maxSessions`.
 
 ## Values
 
@@ -82,10 +116,11 @@ Highlights:
 | `image.repository` | `ghcr.io/peinser/quic-sni-router` | Override for a fork or local mirror. |
 | `image.tag` | `""` (uses `.Chart.appVersion`) | The publish pipeline pins this to `<version>-<sha>`. |
 | `config.routes` | `{}` | Map of SNI to `{host, port}`. Empty is valid but causes every Initial to be dropped. |
+| `config.listen.fwmark` | `0` | Linux socket mark on all QSR UDP sockets; nonzero requires a capability and matching policy rules. Restart required. |
 | `service.type` | `LoadBalancer` | Use `NodePort` for bare-metal without an LB. |
 | `service.externalTrafficPolicy` | `Cluster` | Standard kube-proxy behaviour. Set to `Local` to preserve the real client source IP (and skip nodes without a router pod). |
 | `podSecurityContext` | runAsNonRoot, uid 10001, RuntimeDefault seccomp | Hardened defaults; override only with reason. |
-| `containerSecurityContext` | `cap drop ALL`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` | The router does not need any capability beyond UDP socket on the pod-side port. |
+| `containerSecurityContext` | `cap drop ALL`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` | Default settings need no additional capabilities. Nonzero `fwmark` requires `NET_ADMIN` or, on Linux 5.17+, `NET_RAW`. |
 | `resources.limits` | memory only | No CPU limit — CFS throttling causes p99 spikes on UDP. |
 | `podDisruptionBudget.enabled` | `true` | Only rendered when `replicaCount > 1`. |
 | `networkPolicy.enabled` | `false` | Cluster-CNI- and namespace-specific; opt in per environment. |

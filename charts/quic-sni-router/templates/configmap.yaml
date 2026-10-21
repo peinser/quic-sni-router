@@ -14,6 +14,7 @@ data:
   router.yaml: |
     listen:
       udp: {{ .Values.config.listen.udp | quote }}
+      fwmark: {{ .Values.config.listen.fwmark | default 0 | int64 }}
     sessions:
       idleTimeout: {{ .Values.config.sessions.idleTimeout | quote }}
       maxSessions: {{ .Values.config.sessions.maxSessions }}

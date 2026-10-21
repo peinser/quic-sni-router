@@ -99,6 +99,7 @@ make docker-build
 ```yaml
 listen:
   udp: ":443"
+  fwmark: 0                # optional Linux SO_MARK; 0 disables, restart required
 sessions:
   idleTimeout: 60s         # 1..86400, measured on CLOCK_MONOTONIC
   maxSessions: 100000      # table entries, not connections; see the sizing note above
@@ -126,9 +127,41 @@ conn: close src=203.0.113.7:51820 sni=rvr-a.example reason=idle duration=63s
 
 Close reasons are `idle`, `evicted`, `reload`, `shutdown`, and `error` (including backend rerouting). Lifecycle records pass through a bounded nonblocking pipe to a logging thread; a slow collector drops records rather than blocking forwarding. `log_drops` reports queue losses. Shutdown may discard queued records. Logging is hot-reloadable.
 
+### Policy routing with a socket mark (Linux)
+
+Set `listen.fwmark` to a decimal integer in `0..4294967295`. Omitted or `0`
+leaves socket marking disabled. A nonzero value applies Linux `SO_MARK` to the
+main UDP listener and every per-flow upstream UDP socket, before bind/connect,
+for both IPv4 and IPv6. It labels QSR's outgoing packets with local kernel
+metadata; the mark is not sent over the network or inherited by backend applications.
+
+For example, with `listen.fwmark: 12345`, an administrator can install:
+
+```sh
+ip -4 rule add pref 90 fwmark 12345 lookup main
+ip -6 rule add pref 90 fwmark 12345 lookup main
+```
+
+Choose a priority ahead of the conflicting policy rule and ensure `main` has
+the desired routes. QSR does not install rules or assume a WireGuard/WARP mark
+or table. A mark alone does not select a route. Reply source-address/interface
+preservation remains active; the selected route must be compatible with it.
+
+Setting a nonzero mark requires `CAP_NET_ADMIN`, or `CAP_NET_RAW` on Linux 5.17
+and later, in the user namespace governing the network namespace. The capability
+must remain available for new upstream sockets throughout the process lifetime.
+Listener marking failure aborts startup; upstream marking failure rejects that
+flow instead of sending unmarked traffic. Both report `SO_MARK`, the socket role,
+mark, and OS error regardless of connection logging. Nonzero marks are rejected
+on non-Linux platforms. Changes require a process restart and are ignored with
+a warning on hot reload, including for subsequently created upstream sockets.
+
+For Kubernetes configuration and capability settings, see the
+[Helm chart policy-routing example](charts/quic-sni-router/README.md#policy-routing-linux).
+
 ### Hot reload
 
-The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp` and `sessions.maxSessions` require restart.
+The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp`, `listen.fwmark`, and `sessions.maxSessions` require restart.
 
 DNS timeouts no longer stall packet forwarding; failed candidates retain the previous configuration. Startup still resolves synchronously, and process shutdown waits for an outstanding resolver worker. Prefer atomic rename for config updates: completed-write notifications cannot make arbitrary concurrent in-place writers transactional.
 

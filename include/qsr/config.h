@@ -1,6 +1,6 @@
 /*
  * qsr/config.h: runtime configuration loaded from a YAML file (or built from
- * defaults). Schema mirrors the chart's values.yaml 1:1: listen.udp,
+ * defaults). Schema mirrors the chart's values.yaml 1:1: listen.udp, listen.fwmark,
  * sessions.idleTimeout, sessions.maxSessions, routes (SNI -> host:port),
  * cidEncoding (qsr-authenticated CIDs) or quicLb (draft-21 wire interoperability).
  * Backed by libyaml; see src/config.c for the loader.
@@ -13,6 +13,7 @@
 
 typedef struct qsr_config {
   char listen_udp[QSR_MAX_LISTEN_ADDR_LEN];
+  uint32_t fwmark; /* Linux SO_MARK on listener and upstream sockets; 0 disables. */
   uint32_t idle_timeout_seconds;
   size_t max_sessions;
   bool log_connections; /* logging.connections: one stderr line per flow open/close */

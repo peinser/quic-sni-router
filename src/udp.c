@@ -1095,13 +1095,33 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
   return budget;
 }
 
+static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
+  if (mark == 0) {
+    return QSR_OK;
+  }
+#ifdef __linux__
+  if (setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == 0) {
+    return QSR_OK;
+  }
+#else
+  (void)fd;
+  errno = ENOTSUP;
+#endif
+  const int saved = errno;
+  (void)fprintf(stderr, "socket: %s SO_MARK failed for listen.fwmark=%lu: %s "
+                        "(requires Linux and CAP_NET_ADMIN or, on Linux 5.17+, CAP_NET_RAW)\n",
+                role, (unsigned long)mark, strerror(saved));
+  errno = saved;
+  return QSR_ERR_INVALID;
+}
+
 /*
  * Open the upstream socket for one flow. On fd exhaustion the oldest flow is
  * evicted (closing its fd) and the open is retried once, so a flood of new
  * connections degrades to LRU flow recycling instead of hard failure.
  */
 [[nodiscard]] static int flow_socket_open(qsr_flow_table_t *flows, const struct sockaddr_storage *backend,
-                                          socklen_t backend_len) {
+                                          socklen_t backend_len, uint32_t fwmark) {
   const sa_family_t family = backend->ss_family;
   for (int attempt = 0; attempt < 2; attempt++) {
 #ifdef __linux__
@@ -1110,6 +1130,12 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
     const int fd = socket(family, SOCK_DGRAM, 0);
 #endif
     if (fd >= 0) {
+      if (set_socket_mark(fd, fwmark, "upstream") != QSR_OK) {
+        const int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return -1;
+      }
 #ifndef __linux__
       if (set_nonblocking(fd) != QSR_OK) {
         (void)close(fd);
@@ -1179,7 +1205,7 @@ static size_t flow_expire_scan_budget(const qsr_flow_table_t *flows) {
       return flow;
     }
   }
-  const int fd = flow_socket_open(flows, backend, backend_len);
+  const int fd = flow_socket_open(flows, backend, backend_len, dp->runtime->config.fwmark);
   if (fd < 0) {
     dp->metrics.flow_open_failures++;
     return nullptr;
@@ -1749,6 +1775,12 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
       fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
       if (fd < 0) {
         continue;
+      }
+      if (set_socket_mark(fd, runtime.config.fwmark, "listener") != QSR_OK) {
+        (void)close(fd);
+        freeaddrinfo(res);
+        qsr_runtime_free(&runtime);
+        return QSR_ERR_INVALID;
       }
 #ifdef __linux__
       if (configure_socket(fd, ai) != QSR_OK) {

@@ -60,7 +60,7 @@ void qsr_runtime_free(qsr_runtime_t *runtime);
  * Completed config writes and atomic replacements start a bounded background
  * load/resolve. On completion the dataplane evicts sessions whose backend disappeared
  * (hard cutover), and atomically swaps in the new routes + idle timeout.
- * `listen.udp` and `sessions.maxSessions` changes are ignored with a logged
+ * `listen.udp`, `listen.fwmark`, and `sessions.maxSessions` changes are ignored with a logged
  * warning — they require a process restart.
  *
  * If parse or resolve fails, the previous config keeps serving traffic.

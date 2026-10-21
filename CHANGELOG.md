@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Policy routing
+
+- Added optional Linux `listen.fwmark` (`0` by default) on the UDP listener and every upstream socket before bind/connect. Marking failures report an explicit error and never fall back to unmarked traffic. Changes require restart.
+- Added Helm values, uint32 schema validation, ConfigMap rendering, example configuration, and routing/capability documentation.
+
 ### QUIC-LB wire interoperability
 
 - Added opt-in `quicLb` decoding pinned to draft-ietf-quic-load-balancers-21: unencrypted, single-pass AES, and four-pass Feistel formats, including odd lengths and long server IDs. Configuration IDs 0–6 can coexist for rotation; reserved ID 7 is unroutable.

@@ -86,6 +86,7 @@ What happens on reload:
 | `routes` (added / removed / changed) | Routes swap atomically. Sessions to a backend that's no longer in the new config are evicted (hard cutover); sessions to surviving backends keep going. New clients see the new routes. |
 | `sessions.idleTimeout` | Updated; takes effect on the next expiry sweep (within 1s). |
 | `listen.udp` | Logged + ignored. Requires process restart. |
+| `listen.fwmark` | Logged + ignored. Requires process restart; retained for new upstream sockets too. |
 | `sessions.maxSessions` | Logged + ignored. Requires process restart. |
 
 Validation is fail-closed: if the new file fails to parse, or any backend hostname fails to resolve, the previous config keeps serving traffic and the reason is logged to stderr.

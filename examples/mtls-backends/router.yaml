@@ -1,5 +1,6 @@
 listen:
   udp: ":443"
+  fwmark: 0 # Optional Linux SO_MARK; nonzero requires capability + policy rules. Restart required.
 sessions:
   idleTimeout: 60s
   maxSessions: 10000

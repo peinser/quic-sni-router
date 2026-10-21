@@ -3,6 +3,7 @@ run-name: ${{ github.actor }} is publishing the quic-sni-router Helm chart
 
 permissions:
   contents: read
+  packages: read
 
 on:
   workflow_dispatch:
@@ -31,6 +32,13 @@ jobs:
         echo '${{ secrets.OCI_REGISTRY_HARBOR_SECRET }}' | crane auth login \
           -u '${{ secrets.OCI_REGISTRY_HARBOR_LOGIN }}' \
           --password-stdin ${{ vars.OCI_REGISTRY }}
+
+    - name: Authenticate with GitHub Container Registry
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Determine chart version
       id: version

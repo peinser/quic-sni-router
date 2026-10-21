@@ -15,6 +15,7 @@
  *
  *   listen:
  *     udp: ":443"
+ *     fwmark: 0           # Linux socket mark; optional, restart required
  *   sessions:
  *     idleTimeout: 60s   # optional "s" suffix
  *     maxSessions: 100000
@@ -132,6 +133,23 @@ void qsr_config_default(qsr_config_t *config) {
     qsr_status_t status = copy_scalar(k, key, sizeof(key));
     if (status != QSR_OK) {
       return status;
+    }
+    if (strcmp(key, "fwmark") == 0) {
+      char value[16];
+      size_t mark;
+      if (copy_scalar(v, value, sizeof(value)) != QSR_OK || strspn(value, "0123456789") != strlen(value) ||
+          parse_size(value, 0, UINT32_MAX, &mark) != QSR_OK) {
+        (void)fprintf(stderr, "config: listen.fwmark must be a decimal integer in 0..4294967295\n");
+        return QSR_ERR_INVALID;
+      }
+      config->fwmark = (uint32_t)mark;
+#ifndef __linux__
+      if (config->fwmark != 0) {
+        (void)fprintf(stderr, "config: nonzero listen.fwmark requires Linux SO_MARK support\n");
+        return QSR_ERR_INVALID;
+      }
+#endif
+      continue;
     }
     if (strcmp(key, "udp") != 0) {
       return QSR_ERR_INVALID;

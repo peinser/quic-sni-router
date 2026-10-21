@@ -28,6 +28,28 @@ static void test_defaults(void) {
   ASSERT_TRUE(config.idle_timeout_seconds == 60U);
   ASSERT_TRUE(config.max_sessions == QSR_MAX_SESSIONS_DEFAULT);
   ASSERT_TRUE(strcmp(config.listen_udp, ":443") == 0);
+  ASSERT_TRUE(config.fwmark == 0);
+}
+
+static void test_fwmark(void) {
+  qsr_config_t config;
+  load_and_unlink("listen: {fwmark: 0}\n", &config, QSR_OK);
+  ASSERT_TRUE(config.fwmark == 0);
+#ifdef __linux__
+  load_and_unlink("listen: {udp: ':8443', fwmark: 12345}\n", &config, QSR_OK);
+  ASSERT_TRUE(config.fwmark == 12345 && strcmp(config.listen_udp, ":8443") == 0);
+  load_and_unlink("listen: {fwmark: 4294967295}\n", &config, QSR_OK);
+  ASSERT_TRUE(config.fwmark == UINT32_MAX);
+#else
+  load_and_unlink("listen: {fwmark: 12345}\n", &config, QSR_ERR_INVALID);
+#endif
+  const char *invalid[] = {"-1", "-0", "+1", "4294967296", "18446744073709551616",
+                           "1s", "1.5", "0xca6c", "' 1'", "'1 '", "''", "true", "[]", "{}", "null"};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    char yaml[128];
+    snprintf(yaml, sizeof(yaml), "listen: {fwmark: %s}\n", invalid[i]);
+    load_and_unlink(yaml, &config, QSR_ERR_INVALID);
+  }
 }
 
 static void test_loads_full_config(void) {
@@ -190,6 +212,7 @@ static void test_quic_lb_config(void) {
 
 void test_config(void) {
   test_defaults();
+  test_fwmark();
   test_loads_full_config();
   test_empty_file_yields_defaults();
   test_rejects_bad_integer();

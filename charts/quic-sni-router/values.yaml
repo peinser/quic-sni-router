@@ -26,6 +26,10 @@ config:
     # so clients still connect to UDP/443. Only change this if you also know
     # to add NET_BIND_SERVICE or set net.ipv4.ip_unprivileged_port_start.
     udp: ":8443"
+    # Linux SO_MARK on listener and upstream sockets; decimal uint32, 0 disables.
+    # Restart required. Nonzero needs NET_ADMIN (or NET_RAW on Linux >=5.17)
+    # in containerSecurityContext.capabilities.add and matching policy rules.
+    fwmark: 0
   sessions:
     idleTimeout: 60s         # 1..86400; CLOCK_MONOTONIC-based expiry.
     # Provision for: expected conn/s × idleTimeout × ~5 (each new connection

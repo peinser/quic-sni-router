@@ -231,6 +231,10 @@ static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) 
     (void)fprintf(stderr, "reload: sessions.maxSessions change ignored (requires restart): %zu -> %zu\n",
                   runtime->config.max_sessions, new_config.max_sessions);
   }
+  if (new_config.fwmark != runtime->config.fwmark) {
+    (void)fprintf(stderr, "reload: listen.fwmark change ignored (requires restart): %lu -> %lu\n",
+                  (unsigned long)runtime->config.fwmark, (unsigned long)new_config.fwmark);
+  }
 
   reload_backend_sets_t sets = {.old_routes = &runtime->config.routes, .new_routes = &new_config.routes};
   const size_t evicted = qsr_session_table_evict_if(&runtime->sessions, should_evict_on_reload, &sets);

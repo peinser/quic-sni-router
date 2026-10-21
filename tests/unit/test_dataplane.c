@@ -98,6 +98,61 @@ static void test_flow_lifetimes_and_sources(void) {
   free(runtime);
 }
 
+static void test_socket_marks(void) {
+  /* Zero must not even call setsockopt; errors must preserve errno. */
+  ASSERT_TRUE(set_socket_mark(-1, 0, "listener") == QSR_OK);
+  ASSERT_TRUE(set_socket_mark(-1, 12345, "listener") == QSR_ERR_INVALID && errno == EBADF);
+  const int families[] = {AF_INET, AF_INET6};
+  for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
+    int listener = socket(families[i], SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    ASSERT_TRUE(listener >= 0);
+    uint32_t actual = UINT32_MAX;
+    socklen_t len = sizeof(actual);
+    ASSERT_TRUE(set_socket_mark(listener, 0, "listener") == QSR_OK);
+    ASSERT_TRUE(getsockopt(listener, SOL_SOCKET, SO_MARK, &actual, &len) == 0 && actual == 0);
+    const qsr_status_t marked = set_socket_mark(listener, UINT32_MAX, "listener");
+    if (marked == QSR_OK) {
+      ASSERT_TRUE(getsockopt(listener, SOL_SOCKET, SO_MARK, &actual, &len) == 0 && actual == UINT32_MAX);
+    } else {
+      ASSERT_TRUE(errno == EPERM || errno == EACCES);
+    }
+    close(listener);
+
+    qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+    ASSERT_TRUE(runtime != nullptr);
+    qsr_config_default(&runtime->config);
+    runtime->config.fwmark = marked == QSR_OK ? UINT32_MAX : 12345;
+    ASSERT_TRUE(qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+    qsr_dataplane_t dp = {.runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+    ASSERT_TRUE(dp.epoll_fd >= 0);
+    struct sockaddr_storage backend = loopback(8443);
+    socklen_t backend_len = sizeof(struct sockaddr_in);
+    if (families[i] == AF_INET6) {
+      memset(&backend, 0, sizeof(backend));
+      struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&backend;
+      v6->sin6_family = AF_INET6;
+      v6->sin6_addr = in6addr_loopback;
+      v6->sin6_port = htons(8443);
+      backend_len = sizeof(*v6);
+    }
+    const struct sockaddr_storage client = loopback(40000);
+    const qsr_flow_t *flow = flow_acquire(&dp, &client, sizeof(struct sockaddr_in), &backend, backend_len,
+                                          1, nullptr, nullptr, 0);
+    if (marked == QSR_OK) {
+      ASSERT_TRUE(flow != nullptr);
+      ASSERT_TRUE(getsockopt(flow->fd, SOL_SOCKET, SO_MARK, &actual, &len) == 0 && actual == UINT32_MAX);
+    } else {
+      ASSERT_TRUE(flow == nullptr && runtime->flows.count == 0 && dp.metrics.flow_open_failures == 1);
+      runtime->config.max_sessions = 4;
+      strcpy(runtime->config.listen_udp, "127.0.0.1:8443");
+      ASSERT_TRUE(qsr_udp_run(&runtime->config, nullptr) == QSR_ERR_INVALID);
+    }
+    qsr_flow_table_free(&runtime->flows);
+    close(dp.epoll_fd);
+    free(runtime);
+  }
+}
+
 static void test_pressure_eviction(void) {
   qsr_session_table_t table;
   ASSERT_TRUE(qsr_session_table_init(&table, 1024) == QSR_OK);
@@ -262,11 +317,13 @@ static void test_completed_reload(void) {
   ASSERT_TRUE(runtime->reload_job == nullptr);
   file = fopen(other, "w");
   ASSERT_TRUE(file != nullptr);
-  ASSERT_TRUE(fputs("sessions: {idleTimeout: 7s}\nroutes: {example.test: {host: 127.0.0.1, port: 8443}}\n", file) >= 0);
+  ASSERT_TRUE(fputs("listen: {fwmark: 12345}\nsessions: {idleTimeout: 7s}\n"
+                    "routes: {example.test: {host: 127.0.0.1, port: 8443}}\n", file) >= 0);
   fclose(file);
   ASSERT_TRUE(rename(other, path) == 0);
   finish_reload(runtime);
   ASSERT_TRUE(runtime->config.idle_timeout_seconds == 7 && runtime->config.routes.count == 1);
+  ASSERT_TRUE(runtime->config.fwmark == 0);
   file = fopen(path, "w");
   ASSERT_TRUE(file != nullptr);
   ASSERT_TRUE(fputs("routes: [broken", file) >= 0);
@@ -471,7 +528,7 @@ static void test_descriptor_exhaustion(void) {
       fillers[count++] = fd;
     }
     ASSERT_TRUE(errno == EMFILE);
-    const int replacement = flow_socket_open(&runtime->flows, &backend, sizeof(struct sockaddr_in));
+    const int replacement = flow_socket_open(&runtime->flows, &backend, sizeof(struct sockaddr_in), 0);
     ASSERT_TRUE(replacement >= 0 && runtime->flows.count == 0 && dp.sender.count == 0);
     uint8_t received[32];
     ASSERT_TRUE(recv(receiver, received, sizeof(received), 0) == sizeof(packet));
@@ -648,6 +705,7 @@ static void test_quic_lb_routing(void) {
 
 int main(int argc, char **argv) {
   seed_directory = argc == 2 ? argv[1] : nullptr;
+  test_socket_marks();
   test_flow_lifetimes_and_sources();
   test_pressure_eviction();
   test_gro_and_gso();
