@@ -501,7 +501,8 @@ static void test_shared_socket_cross_backend(void) {
   ASSERT_TRUE(dp.epoll_fd >= 0);
   runtime->flows.on_close = conn_close_callback;
   runtime->flows.on_close_userdata = &dp;
-  struct sockaddr_storage client, backends[2];
+  struct sockaddr_storage client;
+  struct sockaddr_storage backends[2];
   int client_fd = bound_socket(&client);
   int backend_fds[2] = {bound_socket(&backends[0]), bound_socket(&backends[1])};
   const char *names[] = {"rvr-a.flightdeck.test", "rvr-b.flightdeck.test"};
