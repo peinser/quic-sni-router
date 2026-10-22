@@ -6,22 +6,8 @@ permissions:
   packages: write
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-    - main
-    - development
-    paths:
-    - docker/**
-    - .dockerignore
-    - .github/workflows/image.yaml
-    - CMakeLists.txt
-    - Makefile
-    - include/**
-    - src/**
-    - tests/**
-    - charts/quic-sni-router/**
-    - .github/workflows/helm.yaml
+  # Called by CI only after every validation job succeeds, on that run's SHA.
+  workflow_call:
 
 env:
   # Build target. Per-arch images are pushed here by digest and the tagged

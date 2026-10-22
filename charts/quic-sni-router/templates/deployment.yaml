@@ -24,9 +24,9 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.configMap.checksumAnnotation .Values.podAnnotations }}
+      {{- if or (and .Values.configMap.checksumAnnotation (not .Values.existingSecret)) .Values.podAnnotations }}
       annotations:
-        {{- if .Values.configMap.checksumAnnotation }}
+        {{- if and .Values.configMap.checksumAnnotation (not .Values.existingSecret) }}
         # Forces pod rollout when the ConfigMap contents change. OFF by default
         # because the router does in-process hot reload — see values.yaml.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
@@ -89,10 +89,19 @@ spec:
           {{- end }}
       volumes:
         - name: config
+          {{- if .Values.existingSecret }}
+          secret:
+            secretName: {{ .Values.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: router.yaml
+                path: router.yaml
+          {{- else }}
           configMap:
             name: {{ include "quic-sni-router.configMapName" . }}
             # The router reads /config/router.yaml; defaultMode is the kubelet
             # default 0644, which is fine for our non-root user.
+          {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

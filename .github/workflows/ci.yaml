@@ -13,6 +13,19 @@ on:
   pull_request:
 
 jobs:
+  publish:
+    needs: [helm-test, build-test, release-build-test, sanitize, fuzz-smoke, docker-e2e, loadtest, static-analysis]
+    # Default success() gating includes every matrix leg. Failed or cancelled
+    # validation cannot publish; manual runs must go through this workflow too.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/development')
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yaml
+    secrets: inherit
+
   helm-test:
     runs-on: ubuntu-24.04
     steps:
@@ -28,6 +41,7 @@ jobs:
       run: |
         helm lint charts/quic-sni-router
         /usr/bin/python3 tests/helm/render.py
+        /usr/bin/python3 tests/helm/publication.py
 
   build-test:
     strategy:

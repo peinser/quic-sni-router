@@ -1,10 +1,10 @@
 # quic-sni-router Helm chart
 
-Deploys [quic-sni-router](https://github.com/Peinser/quic-sni-router) into Kubernetes: a QUIC SNI router that accepts QUIC v1 and v2 Initial packets, reads the TLS ClientHello SNI, and forwards original datagrams unchanged to a configured backend. Backends terminate TLS/mTLS; the router holds no private keys.
+Deploys [quic-sni-router](https://github.com/Peinser/quic-sni-router) into Kubernetes: a QUIC SNI router that accepts QUIC v1 and v2 Initial packets, reads the TLS ClientHello SNI, and forwards original datagrams unchanged to a configured backend. Backends terminate TLS/mTLS; the router holds no TLS private keys. Optional CID decoding uses separate symmetric keys.
 
 ## Install
 
-For QUIC-LB-capable backends, set `config.quicLb.configurations` and each route's
+For unencrypted QUIC-LB-capable backends, set `config.quicLb.configurations` and each route's
 `quicLbServerIds` map. Hex IDs must be strings (quote leading zeros). The chart
 validates basic shapes/ranges; the router also validates ID lengths, configuration
 references, duplicate assignments, and rotation settings. `quicLb` and
@@ -40,6 +40,40 @@ helm upgrade qsr oci://harbor.peinser.com/library/charts/quic-sni-router \
   --version <chart-version> --reuse-values \
   --set config.routes.<sni-with\\.escaped\\.dots>.host=...
 ```
+
+## Confidential configuration
+
+For `cidEncoding` or encrypted QUIC-LB, provision an externally managed Kubernetes
+Secret in the release namespace with the **complete** router configuration under
+the key `router.yaml`. Manage it through your secret-management tooling, outside
+Helm. Then set only its name in values:
+
+```yaml
+existingSecret: qsr-router-config
+config:
+  listen:
+    udp: ":8443" # Must match listen.udp in the Secret's router.yaml.
+```
+
+This replaces the generated ConfigMap; Helm neither reads nor creates the Secret.
+The Secret file is mounted read-only at `/config/router.yaml` with mode `0440`,
+readable through the default pod `fsGroup`. If overriding the security context,
+retain a group that can read the mounted file. The router needs no Kubernetes API
+permissions. Restrict Secret access with RBAC and enable encryption at rest in the
+cluster.
+
+The file supplies all runtime settings, including routes, sessions, and CID keys;
+it is not merged with `config` values. Keep `config.listen.udp` aligned with the
+file because the chart uses it for container, Service, and NetworkPolicy ports.
+Secret volume updates use the same hot-reload path as ConfigMaps (no `subPath`
+mount). `configMap.checksumAnnotation` is ignored in Secret mode; restart pods
+explicitly when changing restart-only settings.
+
+Inline `config.cidEncoding` and QUIC-LB `key` fields are rejected, including when
+using an external configuration. This keeps keys out of generated ConfigMaps and
+new Helm release values. When migrating, remove old inline keys from values
+(avoid `--reuse-values`), provision the Secret, and rotate keys previously stored
+in ConfigMaps or Helm release history using the router's key-rotation procedure.
 
 ## How it routes
 
@@ -116,6 +150,7 @@ Highlights:
 | `image.repository` | `ghcr.io/peinser/quic-sni-router` | Override for a fork or local mirror. |
 | `image.tag` | `""` (uses `.Chart.appVersion`) | The publish pipeline pins this to `<version>-<sha>`. |
 | `config.routes` | `{}` | Map of SNI to `{host, port}`. Empty is valid but causes every Initial to be dropped. |
+| `existingSecret` | `""` | Existing Secret containing complete `router.yaml`; overrides ConfigMap settings. Required for confidential CID configuration. |
 | `config.listen.fwmark` | `0` | Linux socket mark on all QSR UDP sockets; nonzero requires a capability and matching policy rules. Restart required. |
 | `service.type` | `LoadBalancer` | Use `NodePort` for bare-metal without an LB. |
 | `service.externalTrafficPolicy` | `Cluster` | Standard kube-proxy behaviour. Set to `Local` to preserve the real client source IP (and skip nodes without a router pod). |

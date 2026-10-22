@@ -95,6 +95,7 @@
         }
       }
     },
+    "existingSecret": { "type": "string" },
     "configMap": {
       "type": "object",
       "properties": {

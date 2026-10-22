@@ -1,4 +1,12 @@
-{{- if .Values.configMap.create }}
+{{- if .Values.config.cidEncoding }}
+{{- fail "CID keys must not be supplied in Helm values; use existingSecret with a complete router.yaml" }}
+{{- end }}
+{{- range (.Values.config.quicLb).configurations }}
+{{- if hasKey . "key" }}
+{{- fail "QUIC-LB keys must not be supplied in Helm values; use existingSecret with a complete router.yaml" }}
+{{- end }}
+{{- end }}
+{{- if and .Values.configMap.create (not .Values.existingSecret) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,10 +28,6 @@ data:
       maxSessions: {{ .Values.config.sessions.maxSessions }}
     {{- with .Values.config.quicLb }}
     quicLb:
-      {{- toYaml . | nindent 6 }}
-    {{- end }}
-    {{- with .Values.config.cidEncoding }}
-    cidEncoding:
       {{- toYaml . | nindent 6 }}
     {{- end }}
     routes:

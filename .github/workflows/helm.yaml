@@ -6,7 +6,7 @@ permissions:
   packages: read
 
 on:
-  workflow_dispatch:
+  # Publication is reached through CI -> Image -> Helm for the same commit.
   workflow_call:
 
 jobs:
