@@ -1182,6 +1182,8 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
  * socket gives this client a router source port of its own toward the backend,
  * which is what makes concurrent QUIC connections to one backend demux exactly
  * on the return path (the fd identifies the client; no CID inspection needed).
+ * Ponytail: one backend per client tuple; cross-backend shared sockets replace
+ * this flow. Supporting them requires connection-aware flow keys and demux.
  */
 [[nodiscard]] static qsr_flow_t *flow_acquire(qsr_dataplane_t *dp, const struct sockaddr_storage *client,
                                               socklen_t client_len, const struct sockaddr_storage *backend,

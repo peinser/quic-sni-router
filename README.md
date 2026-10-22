@@ -46,6 +46,8 @@ Pre-1.0. [ROADMAP.md](ROADMAP.md) has what is planned, [CHANGELOG.md](CHANGELOG.
 
 Each client tuple gets its own upstream UDP socket toward its backend. The backend therefore sees one router source port per client, and return traffic demultiplexes purely by which socket received it, with no table lookup at all in that direction. That is what makes concurrent connections to the same backend work, including clients that use zero-length connection IDs (Chrome does) or rotate them after the handshake.
 
+**Compatibility limit: one backend per client UDP tuple.** Two independent QUIC connections sharing one client UDP socket cannot reliably reach different backends through the same router address. Routing the second connection to a different backend replaces the first connection's upstream socket; in ordinary SNI mode, subsequent short-header packets from either connection go to the latest backend. Encoded-CID modes can select the backend per packet but still replace that shared flow, so they do not remove this limitation. Use distinct client UDP sockets/source ports for cross-backend connections. Connections sharing a tuple and targeting the same backend can share the flow.
+
 Alongside the flows, the router keeps a session table of connection ID aliases learned from long-header packets in both directions. Those aliases are what let a NAT rebind recover: a client that reappears from a new source port is matched by its DCID instead of its tuple. It is best-effort, not guaranteed.
 
 Backend hostnames are resolved once before the packet loop starts, and again on every config reload. On Linux the loop uses `epoll` with `recvmmsg`/`sendmmsg` for batched I/O; elsewhere it falls back to `poll` with `recvfrom`/`sendto`.

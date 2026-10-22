@@ -13,20 +13,36 @@ on:
   pull_request:
 
 jobs:
+  helm-test:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Git Checkout
+      uses: actions/checkout@v6
+    - name: Install Helm
+      uses: azure/setup-helm@v5
+      with:
+        version: "3.17.3"
+    - name: Install YAML parser
+      run: sudo apt-get update && sudo apt-get install -y python3-yaml
+    - name: Lint and test chart rendering
+      run: |
+        helm lint charts/quic-sni-router
+        /usr/bin/python3 tests/helm/render.py
+
   build-test:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [clang, gcc]
-    runs-on:
-      group: on-prem
+        compiler: [clang, gcc-14]
+    # PR code runs only on disposable GitHub-hosted VMs.
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
     - name: Setup dependencies
       uses: ./.github/actions/setup-deps
       with:
-        extras: clang gcc cppcheck clang-tidy
+        extras: clang gcc-14 cppcheck clang-tidy
     - name: Configure
       run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=${{ matrix.compiler }}
     - name: Build
@@ -35,8 +51,7 @@ jobs:
       run: ctest --test-dir build --output-on-failure
 
   release-build-test:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -52,8 +67,7 @@ jobs:
       run: ctest --test-dir build-release --output-on-failure
 
   sanitize:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -65,8 +79,7 @@ jobs:
       run: make sanitize CLANG=clang-18
 
   fuzz-smoke:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -78,8 +91,7 @@ jobs:
       run: make fuzz-smoke CLANG=clang-18
 
   docker-e2e:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -103,8 +115,7 @@ jobs:
       run: make test-e2e-ipv6-routing
 
   loadtest:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6
@@ -119,8 +130,7 @@ jobs:
       run: QSR_LOADTEST_PERSISTENT=1 make test-loadtest
 
   static-analysis:
-    runs-on:
-      group: on-prem
+    runs-on: ubuntu-24.04
     steps:
     - name: Git Checkout
       uses: actions/checkout@v6

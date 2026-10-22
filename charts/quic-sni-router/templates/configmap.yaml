@@ -18,12 +18,27 @@ data:
     sessions:
       idleTimeout: {{ .Values.config.sessions.idleTimeout | quote }}
       maxSessions: {{ .Values.config.sessions.maxSessions }}
+    {{- with .Values.config.quicLb }}
+    quicLb:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.config.cidEncoding }}
+    cidEncoding:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
     routes:
       {{- if .Values.config.routes }}
       {{- range $sni, $route := .Values.config.routes }}
       {{ $sni }}:
         host: {{ required (printf "config.routes.%s.host is required" $sni) $route.host | quote }}
         port: {{ required (printf "config.routes.%s.port is required" $sni) $route.port }}
+        {{- with $route.serverId }}
+        serverId: {{ . }}
+        {{- end }}
+        {{- with $route.quicLbServerIds }}
+        quicLbServerIds:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       {{- end }}
       {{- else }} {}
       {{- end }}

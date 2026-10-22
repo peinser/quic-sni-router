@@ -389,7 +389,7 @@ static void test_kubernetes_symlink_reload(void) {
 
 /* Two protected Initials in one 1200-byte UDP datagram, with SNI split across
  * their CRYPTO frames. Construct real AEAD/header protection, not parser mocks. */
-static void protect_initial(uint8_t packet[600], uint32_t version, uint8_t pn,
+static void protect_initial(uint8_t packet[600], uint32_t version, uint8_t cid_tag, uint8_t pn,
                             const uint8_t *fragment, uint8_t offset, uint8_t len) {
   memset(packet, 0, 600);
   packet[0] = version == QSR_QUIC_V1 ? 0xc3 : 0xd3;
@@ -397,7 +397,7 @@ static void protect_initial(uint8_t packet[600], uint32_t version, uint8_t pn,
     packet[1U + i] = (uint8_t)(version >> (24U - 8U * i));
   }
   packet[5] = 8;
-  const uint8_t dcid[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  const uint8_t dcid[8] = {1, 2, 3, 4, 5, 6, 7, cid_tag};
   memcpy(packet + 6, dcid, sizeof(dcid));
   packet[14] = 8;
   const uint8_t scid[8] = {8, 7, 6, 5, 4, 3, 2, 1};
@@ -451,10 +451,10 @@ static void test_coalesced_initials(void) {
   const uint32_t versions[] = {QSR_QUIC_V1, QSR_QUIC_V2};
   for (size_t v = 0; v < 2; v++) {
     uint8_t packet[1200];
-    protect_initial(packet, versions[v], 0, hello, 0, sizeof(hello));
+    protect_initial(packet, versions[v], 8, 0, hello, 0, sizeof(hello));
     save_seed(v == 0 ? "initial/full-v1" : "initial/full-v2", packet, 600);
-    protect_initial(packet, versions[v], 0, hello, 0, 40);
-    protect_initial(packet + 600, versions[v], 1, hello + 40, 40, 37);
+    protect_initial(packet, versions[v], 8, 0, hello, 0, 40);
+    protect_initial(packet + 600, versions[v], 8, 1, hello + 40, 40, 37);
     save_seed(v == 0 ? "initial/v1" : "initial/v2", packet, sizeof(packet));
     qsr_quic_initial_t initial;
     ASSERT_TRUE(qsr_quic_parse_initial(packet, sizeof(packet), &initial) == QSR_OK);
@@ -487,6 +487,66 @@ static void test_coalesced_initials(void) {
   }
   free(config);
   free(pending);
+}
+
+static void test_shared_socket_cross_backend(void) {
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  qsr_pending_initial_table_t *pending = calloc(1, sizeof(*pending));
+  ASSERT_TRUE(runtime != nullptr && pending != nullptr);
+  qsr_config_default(&runtime->config);
+  ASSERT_TRUE(qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+  ASSERT_TRUE(qsr_session_table_init(&runtime->sessions, 32) == QSR_OK);
+  qsr_dataplane_t dp = {.runtime = runtime, .pending_initials = pending,
+                        .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+  ASSERT_TRUE(dp.epoll_fd >= 0);
+  runtime->flows.on_close = conn_close_callback;
+  runtime->flows.on_close_userdata = &dp;
+  struct sockaddr_storage client, backends[2];
+  int client_fd = bound_socket(&client);
+  int backend_fds[2] = {bound_socket(&backends[0]), bound_socket(&backends[1])};
+  const char *names[] = {"rvr-a.flightdeck.test", "rvr-b.flightdeck.test"};
+  for (size_t i = 0; i < 2; i++) {
+    ASSERT_TRUE(qsr_route_table_add(&runtime->config.routes, names[i], "127.0.0.1",
+                                    ntohs(((struct sockaddr_in *)&backends[i])->sin_port), 0) == QSR_OK);
+  }
+  ASSERT_TRUE(qsr_route_table_resolve(&runtime->config.routes) == QSR_OK);
+  uint8_t hello[77] = {1,0,0,73,3,3};
+  const uint8_t tail[] = {0,0,2,0x13,1,1,0,0,30,0,0,0,26,0,24,0,0,21,
+                          'r','v','r','-','a','.','f','l','i','g','h','t','d','e','c','k','.','t','e','s','t'};
+  memcpy(hello + 38, tail, sizeof(tail));
+  uint64_t first_id = 0;
+  uint8_t buffer[1200];
+  for (uint8_t i = 0; i < 2; i++) {
+    hello[60] = (uint8_t)('a' + i);
+    uint8_t packet[1200];
+    protect_initial(packet, QSR_QUIC_V1, i, 0, hello, 0, 40);
+    protect_initial(packet + 600, QSR_QUIC_V1, i, 1, hello + 40, 40, 37);
+    handle_client_packet(&dp, packet, sizeof(packet), &client, sizeof(struct sockaddr_in), i + 1);
+    ASSERT_TRUE(recv(backend_fds[i], buffer, sizeof(buffer), 0) == sizeof(packet));
+    ASSERT_TRUE(memcmp(buffer, packet, sizeof(packet)) == 0);
+    const qsr_flow_t *flow = qsr_flow_table_get(&runtime->flows, &client, sizeof(struct sockaddr_in));
+    ASSERT_TRUE(flow != nullptr && memcmp(&flow->backend_addr, &backends[i], sizeof(backends[i])) == 0);
+    if (i == 0) {
+      first_id = flow->id;
+    } else {
+      ASSERT_TRUE(flow->id != first_id);
+    }
+  }
+  /* Even a short header carrying the first connection's CID now goes to B. */
+  const uint8_t short_packet[] = {0x40, 1, 2, 3, 4, 5, 6, 7, 0};
+  handle_client_packet(&dp, short_packet, sizeof(short_packet), &client, sizeof(struct sockaddr_in), 3);
+  sender_flush(&dp.sender);
+  ASSERT_TRUE(recv(backend_fds[1], buffer, sizeof(buffer), 0) == sizeof(short_packet));
+  ASSERT_TRUE(memcmp(buffer, short_packet, sizeof(short_packet)) == 0);
+  ASSERT_TRUE(recv(backend_fds[0], buffer, sizeof(buffer), 0) < 0 && errno == EAGAIN);
+  qsr_flow_table_free(&runtime->flows);
+  qsr_session_table_free(&runtime->sessions);
+  close(dp.epoll_fd);
+  close(client_fd);
+  close(backend_fds[0]);
+  close(backend_fds[1]);
+  free(pending);
+  free(runtime);
 }
 
 static void test_logging_backpressure(void) {
@@ -722,6 +782,7 @@ int main(int argc, char **argv) {
   test_completed_reload();
   test_kubernetes_symlink_reload();
   test_coalesced_initials();
+  test_shared_socket_cross_backend();
   test_logging_backpressure();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
