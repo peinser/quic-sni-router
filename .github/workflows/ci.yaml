@@ -99,6 +99,8 @@ jobs:
       run: make test-e2e-rebind
     - name: Docker hot-reload e2e
       run: make test-e2e-reload
+    - name: Docker IPv6 reply-routing e2e (no fwmark)
+      run: make test-e2e-ipv6-routing
 
   loadtest:
     runs-on:

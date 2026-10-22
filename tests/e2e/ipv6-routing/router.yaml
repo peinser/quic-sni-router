@@ -1,0 +1,8 @@
+listen:
+  udp: '[::]:443'
+logging:
+  connections: true
+routes:
+  ipv6.flightdeck.test:
+    host: '::1'
+    port: 8443
