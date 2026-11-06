@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Connection logging
+
+- `conn: open` and `conn: close` records now carry `via=<port>`, the source port of the flow's upstream socket as the backend sees it. Backends only observe the router's address, so this is the one value that joins a backend log line to the client tuple in `src`. Read once per logged event with `getsockname(2)`; forwarding paths are unchanged, and `-` is logged if the port is unavailable.
+
 ### Policy routing
 
 - Added optional Linux `listen.fwmark` (`0` by default) on the UDP listener and every upstream socket before bind/connect. Marking failures report an explicit error and never fall back to unmarked traffic. Changes require restart.

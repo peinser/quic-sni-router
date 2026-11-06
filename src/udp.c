@@ -582,6 +582,40 @@ static void format_cid(const uint8_t *cid, size_t cid_len, char *out, size_t out
   out[cid_len * 2U] = '\0';
 }
 
+/*
+ * Ephemeral source port of this flow's upstream socket -- what the BACKEND sees
+ * as the peer port. The client's own port is already in the log; without this one
+ * the two sides share no key, so a backend access log cannot be traced back to a
+ * client address. One getsockname(2) per logged event, never on the hot path.
+ * Returns 0 when unavailable; the caller prints "-" then.
+ */
+static uint16_t flow_local_port(const qsr_flow_t *flow) {
+  if (flow == nullptr || flow->fd < 0) {
+    return 0U;
+  }
+  struct sockaddr_storage ss = {0};
+  socklen_t len = sizeof(ss);
+  if (getsockname(flow->fd, (struct sockaddr *)&ss, &len) != 0) {
+    return 0U;
+  }
+  if (ss.ss_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+    return ntohs(((const struct sockaddr_in *)&ss)->sin_port);
+  }
+  if (ss.ss_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
+    return ntohs(((const struct sockaddr_in6 *)&ss)->sin6_port);
+  }
+  return 0U;
+}
+
+static void format_local_port(const qsr_flow_t *flow, char *out, size_t out_len) {
+  const uint16_t port = flow_local_port(flow);
+  if (port == 0U) {
+    (void)snprintf(out, out_len, "-");
+    return;
+  }
+  (void)snprintf(out, out_len, "%u", port);
+}
+
 static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   char src[INET6_ADDRSTRLEN + 16];
   char backend[INET6_ADDRSTRLEN + 16];
@@ -589,9 +623,11 @@ static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
+  char via[8];
+  format_local_port(flow, via, sizeof(via));
   char line[1024];
-  (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s\n", src,
-                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend);
+  (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s via=%s\n", src,
+                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via);
   connection_log(dp, line);
 }
 
@@ -603,9 +639,11 @@ static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const ch
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
   const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
+  char via[8];
+  format_local_port(flow, via, sizeof(via));
   char line[1024];
-  (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
-                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
+  (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s via=%s reason=%s duration=%llds\n",
+                 src, flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via, reason, duration);
   connection_log(dp, line);
 }
 
