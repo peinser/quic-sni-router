@@ -582,6 +582,22 @@ static void format_cid(const uint8_t *cid, size_t cid_len, char *out, size_t out
   out[cid_len * 2U] = '\0';
 }
 
+/*
+ * Local address of the flow's connected upstream socket: the peer tuple the
+ * backend sees, and the only key joining a backend log line back to `src`.
+ * connect(2) fixes both the source address and the port, so getsockname(2)
+ * reports the exact tuple. The close hook runs before close(2), so the fd is
+ * valid at both log points. One syscall per logged event, off the packet path.
+ */
+static void format_upstream_addr(const qsr_flow_t *flow, char *out, size_t out_len) {
+  struct sockaddr_storage local = {0};
+  socklen_t local_len = sizeof(local);
+  if (getsockname(flow->fd, (struct sockaddr *)&local, &local_len) != 0) {
+    local_len = 0U; /* format_addr prints "?", like src/backend */
+  }
+  format_addr(&local, local_len, out, out_len);
+}
+
 static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   char src[INET6_ADDRSTRLEN + 16];
   char backend[INET6_ADDRSTRLEN + 16];
@@ -589,9 +605,11 @@ static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
+  char via[INET6_ADDRSTRLEN + 16];
+  format_upstream_addr(flow, via, sizeof(via));
   char line[1024];
-  (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s\n", src,
-                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend);
+  (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s via=%s\n", src,
+                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via);
   connection_log(dp, line);
 }
 
@@ -603,9 +621,11 @@ static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const ch
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
   const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
+  char via[INET6_ADDRSTRLEN + 16];
+  format_upstream_addr(flow, via, sizeof(via));
   char line[1024];
-  (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s reason=%s duration=%llds\n", src,
-                 flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, reason, duration);
+  (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s via=%s reason=%s duration=%llds\n",
+                 src, flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via, reason, duration);
   connection_log(dp, line);
 }
 

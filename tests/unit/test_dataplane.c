@@ -565,6 +565,53 @@ static void test_logging_backpressure(void) {
   close(fds[1]);
 }
 
+static void test_logging_upstream_addr(void) {
+  /* via= must be the source tuple the backend actually observes, on both the
+   * open and the close record, so backend logs can be joined to clients. */
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+  runtime->config.log_connections = true;
+  int fds[2];
+  ASSERT_TRUE(pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0);
+  qsr_dataplane_t dp = {
+      .runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC), .log_started = true, .log_write_fd = fds[1]};
+  runtime->flows.on_close = conn_close_callback;
+  runtime->flows.on_close_userdata = &dp;
+  struct sockaddr_storage backend;
+  const int receiver = bound_socket(&backend);
+  const struct sockaddr_storage client = loopback(40001);
+  const qsr_flow_t *flow = flow_acquire(&dp, &client, sizeof(struct sockaddr_in), &backend, sizeof(struct sockaddr_in),
+                                        1, "via.example", nullptr, 0);
+  ASSERT_TRUE(flow != nullptr);
+  const uint8_t packet[] = {0x40, 1, 2, 3};
+  ASSERT_TRUE(send(flow->fd, packet, sizeof(packet), 0) == (ssize_t)sizeof(packet));
+  uint8_t buffer[16];
+  struct sockaddr_storage peer = {0};
+  socklen_t peer_len = sizeof(peer);
+  ASSERT_TRUE(recvfrom(receiver, buffer, sizeof(buffer), 0, (struct sockaddr *)&peer, &peer_len) == sizeof(packet));
+  char peer_text[INET6_ADDRSTRLEN + 16];
+  format_addr(&peer, peer_len, peer_text, sizeof(peer_text));
+  char expect[INET6_ADDRSTRLEN + 32];
+  (void)snprintf(expect, sizeof(expect), " via=%s", peer_text);
+  const size_t expect_len = strlen(expect);
+  qsr_flow_table_remove(&runtime->flows, flow);
+  char log[2048] = {0};
+  ASSERT_TRUE(read(fds[0], log, sizeof(log) - 1U) > 0);
+  const char *open_line = strstr(log, "conn: open ");
+  const char *close_line = strstr(log, "conn: close ");
+  ASSERT_TRUE(open_line != nullptr && close_line != nullptr && open_line < close_line);
+  const char *open_via = strstr(open_line, expect);
+  const char *close_via = strstr(close_line, expect);
+  ASSERT_TRUE(open_via != nullptr && open_via < close_line && open_via[expect_len] == '\n');
+  ASSERT_TRUE(close_via != nullptr && close_via[expect_len] == ' ');
+  qsr_flow_table_free(&runtime->flows);
+  close(dp.epoll_fd);
+  close(receiver);
+  close(fds[0]);
+  close(fds[1]);
+  free(runtime);
+}
+
 static void test_descriptor_exhaustion(void) {
   /* Restrict only a child, never the test runner's resource limits. */
   const pid_t child = fork();
@@ -785,6 +832,7 @@ int main(int argc, char **argv) {
   test_coalesced_initials();
   test_shared_socket_cross_backend();
   test_logging_backpressure();
+  test_logging_upstream_addr();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
   test_quic_lb_routing();
