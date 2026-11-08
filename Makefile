@@ -70,6 +70,9 @@ test-e2e-reload: ## Run Docker hot-reload end-to-end test
 test-e2e-ipv6-routing: ## Run Docker IPv6 asymmetric reply-routing regression
 	bash tests/e2e/ipv6-routing/run.sh
 
+test-e2e-transparent: build ## Run netns transparent-mode return-path test
+	tests/e2e/transparent/run.sh
+
 test-loadtest: ## Run Docker loadtest (10 backends, sustained concurrent QUIC)
 	tests/e2e/loadtest/run.sh
 

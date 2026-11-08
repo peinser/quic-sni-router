@@ -16,6 +16,7 @@
  *   listen:
  *     udp: ":443"
  *     fwmark: 0           # Linux socket mark; optional, restart required
+ *     transparent: false # Linux transparent source IP/port; restart required
  *   sessions:
  *     idleTimeout: 60s   # optional "s" suffix
  *     maxSessions: 100000
@@ -133,6 +134,20 @@ void qsr_config_default(qsr_config_t *config) {
     qsr_status_t status = copy_scalar(k, key, sizeof(key));
     if (status != QSR_OK) {
       return status;
+    }
+    if (strcmp(key, "transparent") == 0) {
+      char value[16];
+      if (copy_scalar(v, value, sizeof(value)) != QSR_OK || parse_bool(value, &config->transparent) != QSR_OK) {
+        (void)fprintf(stderr, "config: listen.transparent must be true or false\n");
+        return QSR_ERR_INVALID;
+      }
+#ifndef __linux__
+      if (config->transparent) {
+        (void)fprintf(stderr, "config: listen.transparent requires Linux IP_TRANSPARENT\n");
+        return QSR_ERR_INVALID;
+      }
+#endif
+      continue;
     }
     if (strcmp(key, "fwmark") == 0) {
       char value[16];

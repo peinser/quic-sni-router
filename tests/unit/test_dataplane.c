@@ -2,6 +2,7 @@
 #include "../../src/udp.c" // NOLINT(bugprone-suspicious-include): test internal packet handlers.
 #include "test_main.h"
 #include <openssl/evp.h>
+#include <poll.h>
 #include <sys/wait.h>
 
 static const char *seed_directory;
@@ -33,6 +34,99 @@ static int bound_socket(struct sockaddr_storage *addr) {
   socklen_t len = sizeof(*addr);
   ASSERT_TRUE(getsockname(fd, (struct sockaddr *)addr, &len) == 0);
   return fd;
+}
+
+static void test_transparent_client_address(void) {
+  struct sockaddr_storage local = {0};
+  socklen_t local_len = 0;
+  const struct sockaddr_storage client = loopback(43210);
+  ASSERT_TRUE(transparent_client_addr(&client, sizeof(struct sockaddr_in), AF_INET, &local, &local_len) == 0);
+  ASSERT_TRUE(local.ss_family == AF_INET && local_len == sizeof(struct sockaddr_in));
+  ASSERT_TRUE(((struct sockaddr_in *)&local)->sin_port == htons(43210));
+  ASSERT_TRUE(transparent_client_addr(&client, sizeof(struct sockaddr_in) - 1, AF_INET, &local, &local_len) < 0);
+  struct sockaddr_storage mapped = {0};
+  struct sockaddr_in6 *mapped6 = (struct sockaddr_in6 *)&mapped;
+  mapped6->sin6_family = AF_INET6;
+  mapped6->sin6_port = htons(43210);
+  ASSERT_TRUE(inet_pton(AF_INET6, "::ffff:127.0.0.1", &mapped6->sin6_addr) == 1);
+  ASSERT_TRUE(transparent_client_addr(&mapped, sizeof(*mapped6), AF_INET, &local, &local_len) == 0);
+  ASSERT_TRUE(local.ss_family == AF_INET && ((struct sockaddr_in *)&local)->sin_port == htons(43210));
+  ASSERT_TRUE(transparent_client_addr(&mapped, sizeof(*mapped6), AF_INET6, &local, &local_len) < 0);
+  struct sockaddr_storage native6 = {0};
+  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&native6;
+  sin6->sin6_family = AF_INET6;
+  sin6->sin6_addr = in6addr_loopback;
+  sin6->sin6_port = htons(43210);
+  ASSERT_TRUE(transparent_client_addr(&native6, sizeof(*sin6), AF_INET6, &local, &local_len) == 0);
+  ASSERT_TRUE(local.ss_family == AF_INET6 && ((struct sockaddr_in6 *)&local)->sin6_port == htons(43210));
+  ASSERT_TRUE(transparent_client_addr(&native6, sizeof(*sin6), AF_INET, &local, &local_len) < 0);
+  ASSERT_TRUE(transparent_client_addr(&native6, sizeof(*sin6) - 1, AF_INET6, &local, &local_len) < 0);
+}
+
+static void test_transparent_startup_probe(void) {
+#ifdef __linux__
+  qsr_config_t config;
+  qsr_config_default(&config);
+  ASSERT_TRUE(qsr_runtime_check_transparent(&config) == QSR_OK);
+  config.transparent = true;
+  const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(fd >= 0);
+  const int enabled = 1;
+  const bool capable = setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) == 0;
+  close(fd);
+  if (capable) {
+    ASSERT_TRUE(qsr_runtime_check_transparent(&config) == QSR_OK);
+  } else {
+    ASSERT_TRUE(qsr_runtime_check_transparent(&config) != QSR_OK);
+  }
+  if (geteuid() == 0) {
+    const pid_t child = fork();
+    ASSERT_TRUE(child >= 0);
+    if (child == 0) {
+      /* No privileges: startup must reject transparent mode, not silently
+       * accept connections that will all fail later. */
+      if (setgid(65534) != 0 || setuid(65534) != 0) {
+        _exit(77);
+      }
+      _exit(qsr_runtime_check_transparent(&config) == QSR_OK ? 1 : 0);
+    }
+    int status = 0;
+    ASSERT_TRUE(waitpid(child, &status, 0) == child);
+    ASSERT_TRUE(WIFEXITED(status));
+    if (WEXITSTATUS(status) == 77) {
+      (void)fprintf(stderr, "SKIP transparent no-capability negative test: cannot drop UID\n");
+    } else {
+      ASSERT_TRUE(WEXITSTATUS(status) == 0);
+    }
+  } else {
+    (void)fprintf(stderr, "SKIP transparent UID-drop negative test: runner not root\n");
+  }
+#endif
+}
+
+static void test_transparent_fail_closed(void) {
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+  runtime->config.transparent = true;
+  qsr_dataplane_t dp = {.runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+  ASSERT_TRUE(dp.epoll_fd >= 0);
+  struct sockaddr_storage backend = {0};
+  const int receiver = bound_socket(&backend);
+  const struct sockaddr_storage bad_client = loopback(40123);
+  /* A truncated tuple must not silently switch to the router-IP transport. */
+  ASSERT_TRUE(flow_acquire(&dp, &bad_client, sizeof(struct sockaddr_in) - 1, &backend, sizeof(struct sockaddr_in), 1,
+                           nullptr, nullptr, 0) == nullptr);
+  ASSERT_TRUE(runtime->flows.count == 0);
+  ASSERT_TRUE(dp.metrics.flow_open_failures == 1);
+  ASSERT_TRUE(dp.metrics.transparent_family_mismatches == 1);
+  ASSERT_TRUE(flow_acquire(&dp, &bad_client, sizeof(struct sockaddr_in) - 1, &backend, sizeof(struct sockaddr_in), 2,
+                           nullptr, nullptr, 0) == nullptr);
+  ASSERT_TRUE(dp.metrics.transparent_family_mismatches == 2);
+  ASSERT_TRUE(dp.transparent_suppressed[2] == 1);
+  qsr_flow_table_free(&runtime->flows);
+  close(receiver);
+  close(dp.epoll_fd);
+  free(runtime);
 }
 
 static void test_flow_lifetimes_and_sources(void) {
@@ -325,13 +419,15 @@ static void test_completed_reload(void) {
   ASSERT_TRUE(runtime->reload_job == nullptr);
   file = fopen(other, "w");
   ASSERT_TRUE(file != nullptr);
-  ASSERT_TRUE(fputs("listen: {fwmark: 12345}\nsessions: {idleTimeout: 7s}\n"
-                    "routes: {example.test: {host: 127.0.0.1, port: 8443}}\n", file) >= 0);
+  ASSERT_TRUE(fputs("listen: {fwmark: 12345, transparent: true}\nsessions: {idleTimeout: 7s}\n"
+                    "routes: {example.test: {host: 127.0.0.1, port: 8443}}\n",
+                    file) >= 0);
   fclose(file);
   ASSERT_TRUE(rename(other, path) == 0);
   finish_reload(runtime);
   ASSERT_TRUE(runtime->config.idle_timeout_seconds == 7 && runtime->config.routes.count == 1);
   ASSERT_TRUE(runtime->config.fwmark == 0);
+  ASSERT_TRUE(!runtime->config.transparent);
   file = fopen(path, "w");
   ASSERT_TRUE(file != nullptr);
   ASSERT_TRUE(fputs("routes: [broken", file) >= 0);
@@ -612,6 +708,82 @@ static void test_logging_upstream_addr(void) {
   free(runtime);
 }
 
+static void test_transparent_via_and_reroute(void) {
+#ifdef __linux__
+  const int probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(probe >= 0);
+  const int enabled = 1;
+  if (setsockopt(probe, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) < 0) {
+    (void)fprintf(stderr, "SKIP transparent via/reroute: IP_TRANSPARENT capability unavailable\n");
+    close(probe);
+    return;
+  }
+  close(probe);
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+  runtime->config.transparent = true;
+  runtime->config.log_connections = true;
+  int fds[2];
+  ASSERT_TRUE(pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0);
+  qsr_dataplane_t dp = {
+      .runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC), .log_started = true, .log_write_fd = fds[1]};
+  runtime->flows.on_close = conn_close_callback;
+  runtime->flows.on_close_userdata = &dp;
+  struct sockaddr_storage backend_a = {0};
+  struct sockaddr_storage backend_b = {0};
+  const int receiver_a = bound_socket(&backend_a);
+  const int receiver_b = bound_socket(&backend_b);
+  struct sockaddr_storage client = {0};
+  struct sockaddr_in *sin = (struct sockaddr_in *)&client;
+  sin->sin_family = AF_INET;
+  sin->sin_port = htons(41119);
+  ASSERT_TRUE(inet_pton(AF_INET, "198.51.100.19", &sin->sin_addr) == 1);
+  qsr_flow_t *flow =
+      flow_acquire(&dp, &client, sizeof(*sin), &backend_a, sizeof(struct sockaddr_in), 10, "via.example", nullptr, 0);
+  ASSERT_TRUE(flow != nullptr);
+  int old_fd = flow->fd;
+  ASSERT_TRUE(send(flow->fd, "x", 1, 0) == 1);
+  char payload[4] = {0};
+  struct sockaddr_in peer = {0};
+  socklen_t peer_len = sizeof(peer);
+  ASSERT_TRUE(recvfrom(receiver_a, payload, sizeof(payload), 0, (struct sockaddr *)&peer, &peer_len) == 1);
+  ASSERT_TRUE(peer.sin_port == sin->sin_port && peer.sin_addr.s_addr == sin->sin_addr.s_addr);
+  flow =
+      flow_acquire(&dp, &client, sizeof(*sin), &backend_b, sizeof(struct sockaddr_in), 11, "via.example", nullptr, 0);
+  ASSERT_TRUE(flow != nullptr && runtime->flows.count == 1);
+  /* The original FD has been closed before the new bind. FD numbers may be reused. */
+  ASSERT_TRUE(send(flow->fd, "y", 1, 0) == 1);
+  peer_len = sizeof(peer);
+  ASSERT_TRUE(recvfrom(receiver_b, payload, sizeof(payload), 0, (struct sockaddr *)&peer, &peer_len) == 1);
+  ASSERT_TRUE(peer.sin_port == sin->sin_port && peer.sin_addr.s_addr == sin->sin_addr.s_addr);
+  (void)old_fd;
+  qsr_flow_table_remove(&runtime->flows, flow);
+  char log[4096] = {0};
+  ASSERT_TRUE(read(fds[0], log, sizeof(log) - 1U) > 0);
+  /* getsockname(2) on a transparent socket reports the bound client tuple, which is what the backend saw. */
+  ASSERT_TRUE(strstr(log, " via=198.51.100.19:41119\n") != nullptr);
+  ASSERT_TRUE(dp.metrics.transparent_bind_conflicts == 0);
+  /* A different process/socket can still own the spoofed tuple. Reject it
+   * explicitly: no SO_REUSEADDR and no router-source-IP fallback. */
+  const int blocker = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(blocker >= 0 && setsockopt(blocker, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) == 0);
+  ASSERT_TRUE(bind(blocker, (struct sockaddr *)sin, sizeof(*sin)) == 0);
+  ASSERT_TRUE(flow_acquire(&dp, &client, sizeof(*sin), &backend_a, sizeof(struct sockaddr_in), 12, "via.example",
+                           nullptr, 0) == nullptr);
+  ASSERT_TRUE(dp.metrics.transparent_bind_conflicts == 1);
+  ASSERT_TRUE(dp.metrics.flow_open_failures == 1);
+  ASSERT_TRUE(runtime->flows.count == 0);
+  close(blocker);
+  qsr_flow_table_free(&runtime->flows);
+  close(receiver_a);
+  close(receiver_b);
+  close(dp.epoll_fd);
+  close(fds[0]);
+  close(fds[1]);
+  free(runtime);
+#endif
+}
+
 static void test_descriptor_exhaustion(void) {
   /* Restrict only a child, never the test runner's resource limits. */
   const pid_t child = fork();
@@ -644,7 +816,8 @@ static void test_descriptor_exhaustion(void) {
       fillers[count++] = fd;
     }
     ASSERT_TRUE(errno == EMFILE);
-    const int replacement = flow_socket_open(&runtime->flows, &backend, sizeof(struct sockaddr_in), 0);
+    const int replacement = flow_socket_open(&runtime->flows, &backend, sizeof(struct sockaddr_in), 0, false, &client,
+                                             sizeof(struct sockaddr_in));
     ASSERT_TRUE(replacement >= 0 && runtime->flows.count == 0 && dp.sender.count == 0);
     uint8_t received[32];
     ASSERT_TRUE(recv(receiver, received, sizeof(received), 0) == sizeof(packet));
@@ -819,9 +992,73 @@ static void test_quic_lb_routing(void) {
   free(runtime);
 }
 
+/* Invoked by the optional isolated netns integration harness. The backend
+ * and client run in separate network namespaces, while this process owns the
+ * transparent router flow and listener. */
+static int run_transparent_integration(bool expect_reply) {
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
+  runtime->config.transparent = true;
+  ASSERT_TRUE(qsr_runtime_check_transparent(&runtime->config) == QSR_OK);
+  qsr_dataplane_t dp = {.runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+  runtime->flows.on_close = conn_close_callback;
+  runtime->flows.on_close_userdata = &dp;
+  struct sockaddr_storage client = {0};
+  struct sockaddr_in *c = (struct sockaddr_in *)&client;
+  c->sin_family = AF_INET;
+  c->sin_port = htons(41000);
+  ASSERT_TRUE(inet_pton(AF_INET, "10.202.0.2", &c->sin_addr) == 1);
+  struct sockaddr_storage backend = {0};
+  struct sockaddr_in *b = (struct sockaddr_in *)&backend;
+  b->sin_family = AF_INET;
+  b->sin_port = htons(18443);
+  ASSERT_TRUE(inet_pton(AF_INET, "10.201.0.2", &b->sin_addr) == 1);
+  dp.main_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(dp.main_fd >= 0);
+  struct sockaddr_in listener = {.sin_family = AF_INET, .sin_port = htons(18444)};
+  ASSERT_TRUE(inet_pton(AF_INET, "10.202.0.1", &listener.sin_addr) == 1);
+  ASSERT_TRUE(bind(dp.main_fd, (struct sockaddr *)&listener, sizeof(listener)) == 0);
+  memcpy(&dp.local_addr, &listener, sizeof(listener));
+  qsr_flow_t *flow = flow_acquire(&dp, &client, sizeof(*c), &backend, sizeof(*b), 1, "transparent.example", nullptr, 0);
+  ASSERT_TRUE(flow != nullptr);
+  ASSERT_TRUE(send(flow->fd, "request", 7, 0) == 7);
+  /* Upstream sockets are nonblocking: wait explicitly, otherwise recv() returns
+   * EAGAIN at once and the negative probe would pass without proving anything. */
+  struct pollfd wait_reply = {.fd = flow->fd, .events = POLLIN};
+  const int ready = poll(&wait_reply, 1, 2000);
+  char buf[32] = {0};
+  const ssize_t received = ready == 1 ? recv(flow->fd, buf, sizeof(buf), 0) : -1;
+  if (ready == 0) {
+    errno = EAGAIN;
+  }
+  if (expect_reply) {
+    ASSERT_TRUE(received == 5 && memcmp(buf, "reply", 5) == 0);
+    handle_backend_packet(&dp, flow, (const uint8_t *)buf, (size_t)received, &backend, sizeof(*b), 2);
+    sender_flush(&dp.sender);
+    ASSERT_TRUE(dp.metrics.send_drops == 0);
+  } else {
+    ASSERT_TRUE(received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    ASSERT_TRUE(dp.metrics.transparent_open_failures == 0);
+  }
+  qsr_flow_table_free(&runtime->flows);
+  close(dp.main_fd);
+  close(dp.epoll_fd);
+  free(runtime);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--transparent-e2e-positive") == 0) {
+    return run_transparent_integration(true);
+  }
+  if (argc == 2 && strcmp(argv[1], "--transparent-e2e-negative") == 0) {
+    return run_transparent_integration(false);
+  }
   seed_directory = argc == 2 ? argv[1] : nullptr;
   test_socket_marks();
+  test_transparent_client_address();
+  test_transparent_fail_closed();
+  test_transparent_startup_probe();
   test_flow_lifetimes_and_sources();
   test_pressure_eviction();
   test_gro_and_gso();
@@ -833,6 +1070,7 @@ int main(int argc, char **argv) {
   test_shared_socket_cross_backend();
   test_logging_backpressure();
   test_logging_upstream_addr();
+  test_transparent_via_and_reroute();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
   test_quic_lb_routing();

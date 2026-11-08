@@ -17,6 +17,9 @@ typedef struct qsr_metrics {
   uint64_t receive_truncations;
   uint64_t kernel_drops;
   uint64_t flow_open_failures;
+  uint64_t transparent_open_failures;
+  uint64_t transparent_bind_conflicts;
+  uint64_t transparent_family_mismatches;
   uint64_t flow_evictions;
   uint64_t send_drops;
   uint64_t send_errors[256]; /* Linux errno values; final slot includes larger values. */

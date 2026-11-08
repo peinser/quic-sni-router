@@ -74,6 +74,9 @@ void qsr_runtime_poll(qsr_runtime_t *runtime);
  */
 void qsr_runtime_log_routes(const char *prefix, const qsr_route_table_t *routes);
 
+/* Validate transparent socket privileges once at startup against resolved backend families. */
+[[nodiscard]] qsr_status_t qsr_runtime_check_transparent(const qsr_config_t *config);
+
 /*
  * Keep-alive predicate for the session expiry sweep (qsr_session_keep_fn).
  * A session whose idle timeout elapsed is kept (refreshed) while the client's

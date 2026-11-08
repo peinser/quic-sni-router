@@ -163,6 +163,61 @@ a warning on hot reload, including for subsequently created upstream sockets.
 For Kubernetes configuration and capability settings, see the
 [Helm chart policy-routing example](charts/quic-sni-router/README.md#policy-routing-linux).
 
+### Transparent client source (Linux)
+
+By default a backend sees the router as the peer of every flow, and
+`via=` in the connection log is the only way back to the client. With
+`listen.transparent: true`, each per-flow upstream socket is bound to the
+client's own address and port (`IP_TRANSPARENT`/`IPV6_TRANSPARENT`) before it
+connects, so the backend sees the real client tuple: its logs, rate limits and
+access lists work unchanged, and `via=` equals `src`.
+
+```yaml
+listen:
+  udp: ":443"
+  transparent: true
+```
+
+Two things must be in place, and QSR provides neither:
+
+1. **Privilege.** Setting the option needs `CAP_NET_RAW` or `CAP_NET_ADMIN` in
+   the user namespace governing the network namespace, for the whole process
+   lifetime. Startup probes it and refuses to run without it.
+2. **A return path.** Backend replies are addressed to the client. They must be
+   delivered locally to the router's flow socket instead of being routed toward
+   the client. Route them to `lo` by source, one rule per backend:
+
+   ```sh
+   ip -4 route add local 0.0.0.0/0 dev lo table 100
+   ip -4 rule add pref 90 from 10.0.4.12 ipproto udp sport 8443 lookup 100
+   ```
+
+   This also covers backends on the router host itself, including `127.0.0.1`.
+   For packets arriving on an interface, matching the socket instead of the
+   source works too:
+
+   ```sh
+   nft add table inet qsr
+   nft add chain inet qsr prerouting '{ type filter hook prerouting priority mangle; }'
+   nft add rule inet qsr prerouting udp sport 8443 socket transparent 1 meta mark set 0x100
+   ip -4 rule add pref 90 fwmark 0x100 lookup 100
+   ```
+
+   Use `ip -6` and `local ::/0` for IPv6 backends. A backend on another host
+   must route client addresses back through the router host (default route or
+   a policy rule on the backend); otherwise its replies bypass the router and
+   the client drops them.
+
+A transparent tuple keeps its family: IPv4 clients (including v4-mapped clients
+on a dual-stack listener) reach IPv4 backends, IPv6 clients IPv6 backends.
+Startup and reload log the excluded family per route. Failures are fail-closed:
+a flow whose bind fails is dropped and never retried from the router address.
+`SIGUSR1` and shutdown metrics count `transparent_open_failures`,
+`transparent_bind_conflicts` (another socket owns the client tuple) and
+`transparent_family_mismatches`; stderr gets one line per class per minute.
+Rejected on non-Linux platforms. Changes require a process restart and are
+ignored with a warning on hot reload.
+
 ### Hot reload
 
 The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp`, `listen.fwmark`, and `sessions.maxSessions` require restart.
@@ -311,6 +366,7 @@ and if it does, bake it in with `make docker-build QSR_CPU_TARGET=native QSR_ENA
 | `make test-e2e-idle` | backend idle timeout handling |
 | `make test-e2e-reverse` | reverse-tuple routing of stale resets |
 | `make test-e2e-reload` | inotify hot reload picks up a new route |
+| `make test-e2e-transparent` | transparent mode in isolated network namespaces: real client tuple at the backend, reply delivery, and no reply without the return path (needs root or unprivileged user namespaces; skips otherwise) |
 | `make test-loadtest` | 10 backends under sustained concurrent handshakes, asserting zero misroutes |
 
 `make test-loadtest` takes `QSR_LOADTEST_DIRECT=1` to bypass the router for a baseline, and `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.

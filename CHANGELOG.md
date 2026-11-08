@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format foll
 
 - `conn: open` and `conn: close` records now carry `via=<ip:port>`, the source address and port of the flow's upstream socket, which is the peer the backend sees. Backends only observe the router, so this is the value that joins a backend log line to the client tuple in `src`. Read with `getsockname(2)` per logged event; forwarding paths are unchanged.
 
+### Transparent client source
+
+- Added optional Linux `listen.transparent` (`false` by default): every upstream socket binds the client's address and port with `IP_TRANSPARENT`, so backends see the real client tuple and `via=` equals `src`. Startup probes the capability; a failed bind drops the flow instead of falling back to the router address. Return-path routing stays with the administrator. Changes require restart.
+- Added counters for open failures, tuple conflicts and family mismatches, a rate-limited error line per class, unit tests, and an optional network-namespace end-to-end test.
+
 ### Policy routing
 
 - Added optional Linux `listen.fwmark` (`0` by default) on the UDP listener and every upstream socket before bind/connect. Marking failures report an explicit error and never fall back to unmarked traffic. Changes require restart.
