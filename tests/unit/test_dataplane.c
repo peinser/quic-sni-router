@@ -565,8 +565,8 @@ static void test_logging_backpressure(void) {
   close(fds[1]);
 }
 
-static void test_logging_upstream_port(void) {
-  /* via= must be the source port the backend actually observes, on both the
+static void test_logging_upstream_addr(void) {
+  /* via= must be the source tuple the backend actually observes, on both the
    * open and the close record, so backend logs can be joined to clients. */
   qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
   ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
@@ -586,11 +586,13 @@ static void test_logging_upstream_port(void) {
   const uint8_t packet[] = {0x40, 1, 2, 3};
   ASSERT_TRUE(send(flow->fd, packet, sizeof(packet), 0) == (ssize_t)sizeof(packet));
   uint8_t buffer[16];
-  struct sockaddr_in peer = {0};
+  struct sockaddr_storage peer = {0};
   socklen_t peer_len = sizeof(peer);
   ASSERT_TRUE(recvfrom(receiver, buffer, sizeof(buffer), 0, (struct sockaddr *)&peer, &peer_len) == sizeof(packet));
-  char expect[32];
-  (void)snprintf(expect, sizeof(expect), " via=%u", (unsigned)ntohs(peer.sin_port));
+  char peer_text[INET6_ADDRSTRLEN + 16];
+  format_addr(&peer, peer_len, peer_text, sizeof(peer_text));
+  char expect[INET6_ADDRSTRLEN + 32];
+  (void)snprintf(expect, sizeof(expect), " via=%s", peer_text);
   const size_t expect_len = strlen(expect);
   qsr_flow_table_remove(&runtime->flows, flow);
   char log[2048] = {0};
@@ -602,11 +604,6 @@ static void test_logging_upstream_port(void) {
   const char *close_via = strstr(close_line, expect);
   ASSERT_TRUE(open_via != nullptr && open_via < close_line && open_via[expect_len] == '\n');
   ASSERT_TRUE(close_via != nullptr && close_via[expect_len] == ' ');
-  /* No socket, no port: the record says "-" instead of a misleading 0. */
-  char none[8];
-  const qsr_flow_t closed = {.fd = -1};
-  format_local_port(&closed, none, sizeof(none));
-  ASSERT_TRUE(strcmp(none, "-") == 0);
   qsr_flow_table_free(&runtime->flows);
   close(dp.epoll_fd);
   close(receiver);
@@ -835,7 +832,7 @@ int main(int argc, char **argv) {
   test_coalesced_initials();
   test_shared_socket_cross_backend();
   test_logging_backpressure();
-  test_logging_upstream_port();
+  test_logging_upstream_addr();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
   test_quic_lb_routing();

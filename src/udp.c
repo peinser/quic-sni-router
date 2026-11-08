@@ -583,37 +583,19 @@ static void format_cid(const uint8_t *cid, size_t cid_len, char *out, size_t out
 }
 
 /*
- * Ephemeral source port of this flow's upstream socket -- what the BACKEND sees
- * as the peer port. The client's own port is already in the log; without this one
- * the two sides share no key, so a backend access log cannot be traced back to a
- * client address. One getsockname(2) per logged event, never on the hot path.
- * Returns 0 when unavailable; the caller prints "-" then.
+ * Local address of the flow's connected upstream socket: the peer tuple the
+ * backend sees, and the only key joining a backend log line back to `src`.
+ * connect(2) fixes both the source address and the port, so getsockname(2)
+ * reports the exact tuple. The close hook runs before close(2), so the fd is
+ * valid at both log points. One syscall per logged event, off the packet path.
  */
-static uint16_t flow_local_port(const qsr_flow_t *flow) {
-  if (flow == nullptr || flow->fd < 0) {
-    return 0U;
+static void format_upstream_addr(const qsr_flow_t *flow, char *out, size_t out_len) {
+  struct sockaddr_storage local = {0};
+  socklen_t local_len = sizeof(local);
+  if (getsockname(flow->fd, (struct sockaddr *)&local, &local_len) != 0) {
+    local_len = 0U; /* format_addr prints "?", like src/backend */
   }
-  struct sockaddr_storage ss = {0};
-  socklen_t len = sizeof(ss);
-  if (getsockname(flow->fd, (struct sockaddr *)&ss, &len) != 0) {
-    return 0U;
-  }
-  if (ss.ss_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
-    return ntohs(((const struct sockaddr_in *)&ss)->sin_port);
-  }
-  if (ss.ss_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
-    return ntohs(((const struct sockaddr_in6 *)&ss)->sin6_port);
-  }
-  return 0U;
-}
-
-static void format_local_port(const qsr_flow_t *flow, char *out, size_t out_len) {
-  const uint16_t port = flow_local_port(flow);
-  if (port == 0U) {
-    (void)snprintf(out, out_len, "-");
-    return;
-  }
-  (void)snprintf(out, out_len, "%u", port);
+  format_addr(&local, local_len, out, out_len);
 }
 
 static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
@@ -623,8 +605,8 @@ static void conn_log_open(qsr_dataplane_t *dp, const qsr_flow_t *flow) {
   format_addr(&flow->client_addr, flow->client_addr_len, src, sizeof(src));
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
-  char via[8];
-  format_local_port(flow, via, sizeof(via));
+  char via[INET6_ADDRSTRLEN + 16];
+  format_upstream_addr(flow, via, sizeof(via));
   char line[1024];
   (void)snprintf(line, sizeof(line), "conn: open src=%s sni=%s scid=%s backend=%s via=%s\n", src,
                  flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via);
@@ -639,8 +621,8 @@ static void conn_log_close(qsr_dataplane_t *dp, const qsr_flow_t *flow, const ch
   format_addr(&flow->backend_addr, flow->backend_addr_len, backend, sizeof(backend));
   format_cid(flow->scid, flow->scid_len, scid, sizeof(scid));
   const long long duration = flow->opened_at > 0 && now >= flow->opened_at ? (long long)(now - flow->opened_at) : 0;
-  char via[8];
-  format_local_port(flow, via, sizeof(via));
+  char via[INET6_ADDRSTRLEN + 16];
+  format_upstream_addr(flow, via, sizeof(via));
   char line[1024];
   (void)snprintf(line, sizeof(line), "conn: close src=%s sni=%s scid=%s backend=%s via=%s reason=%s duration=%llds\n",
                  src, flow->sni[0] != '\0' ? flow->sni : "?", scid, backend, via, reason, duration);

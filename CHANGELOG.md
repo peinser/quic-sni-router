@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Connection logging
 
-- `conn: open` and `conn: close` records now carry `via=<port>`, the source port of the flow's upstream socket as the backend sees it. Backends only observe the router's address, so this is the one value that joins a backend log line to the client tuple in `src`. Read once per logged event with `getsockname(2)`; forwarding paths are unchanged, and `-` is logged if the port is unavailable.
+- `conn: open` and `conn: close` records now carry `via=<ip:port>`, the source address and port of the flow's upstream socket, which is the peer the backend sees. Backends only observe the router, so this is the value that joins a backend log line to the client tuple in `src`. Read with `getsockname(2)` per logged event; forwarding paths are unchanged.
 
 ### Policy routing
 

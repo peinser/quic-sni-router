@@ -123,11 +123,11 @@ Parsing is done by [libyaml](https://github.com/yaml/libyaml), so the whole YAML
 With `logging.connections: true` you get one line when a flow opens and one when it closes:
 
 ```text
-conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443 via=36015
-conn: close src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443 via=36015 reason=idle duration=63s
+conn: open src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443 via=10.0.4.1:36015
+conn: close src=203.0.113.7:51820 sni=rvr-a.example scid=8f2c01ab backend=10.0.4.12:8443 via=10.0.4.1:36015 reason=idle duration=63s
 ```
 
-`via` is the local source port of the router's upstream socket for that flow, i.e. the peer port the backend sees. It is the key that joins a backend access log line (`<router-ip>:36015`) back to the client in `src`; it is `-` if the port cannot be determined.
+`via` is the router's source address and port toward the backend for that flow, i.e. the peer the backend logs. It joins a backend access log line (`10.0.4.1:36015`) back to the client in `src`. Ephemeral ports are reused, so match within the window between a flow's `open` and `close`. A client that migrates or NAT-rebinds gets a new flow, so it logs a new `open` with a new `via`; the backend sees the same change as a path migration.
 
 Close reasons are `idle`, `evicted`, `reload`, `shutdown`, and `error` (including backend rerouting). Lifecycle records pass through a bounded nonblocking pipe to a logging thread; a slow collector drops records rather than blocking forwarding. `log_drops` reports queue losses. Shutdown may discard queued records. Logging is hot-reloadable.
 
