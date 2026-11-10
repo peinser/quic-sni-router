@@ -8,7 +8,7 @@
       "version": "latest",
       "moby": true,
       "installDockerBuildx": true,
-      "dockerDashComposeVersion": "v2"
+      "dockerDashComposeVersion": "none"
     }
   },
   "mounts": [
