@@ -133,6 +133,8 @@ typedef struct qsr_dataplane {
   pthread_t log_thread;
   bool log_started;
   uint64_t log_drops;
+  time_t transparent_last_error_log[3];
+  uint64_t transparent_suppressed[3];
 } qsr_dataplane_t;
 
 /* Bounded kernel pipe: slow stderr drops lifecycle logs instead of blocking
@@ -1136,12 +1138,66 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
 }
 
 /*
+ * Bind a per-flow upstream socket to the exact remote client tuple. A dual-stack
+ * listener delivers IPv4 as v4-mapped IPv6, which needs normalizing when the
+ * chosen backend is IPv4. Never use address/port reuse: that could silently
+ * misdeliver backend replies to a different client's flow.
+ */
+[[nodiscard]] static int transparent_client_addr(const struct sockaddr_storage *client, socklen_t client_len,
+                                                 sa_family_t family, struct sockaddr_storage *local,
+                                                 socklen_t *local_len) {
+  memset(local, 0, sizeof(*local));
+  if (family == AF_INET && client->ss_family == AF_INET && client_len >= sizeof(struct sockaddr_in)) {
+    memcpy(local, client, sizeof(struct sockaddr_in));
+    *local_len = sizeof(struct sockaddr_in);
+    return 0;
+  }
+  if (family == AF_INET && client->ss_family == AF_INET6 && client_len >= sizeof(struct sockaddr_in6)) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)client;
+    if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)local;
+      sin->sin_family = AF_INET;
+      sin->sin_port = sin6->sin6_port;
+      memcpy(&sin->sin_addr, &sin6->sin6_addr.s6_addr[12], sizeof(sin->sin_addr));
+      *local_len = sizeof(*sin);
+      return 0;
+    }
+  }
+  if (family == AF_INET6 && client->ss_family == AF_INET6 && client_len >= sizeof(struct sockaddr_in6) &&
+      !IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *)client)->sin6_addr)) {
+    memcpy(local, client, sizeof(struct sockaddr_in6));
+    *local_len = sizeof(struct sockaddr_in6);
+    return 0;
+  }
+  errno = EAFNOSUPPORT;
+  return -1;
+}
+
+[[nodiscard]] static int set_socket_transparent(int fd, sa_family_t family) {
+#ifdef __linux__
+  const int one = 1;
+  const int level = family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+  const int option = family == AF_INET ? IP_TRANSPARENT : IPV6_TRANSPARENT;
+  if (setsockopt(fd, level, option, &one, sizeof(one)) == 0) {
+    return 0;
+  }
+  /* Startup probes capabilities; a runtime failure is counted and rate-limited by the dataplane. */
+#else
+  (void)fd;
+  (void)family;
+  errno = ENOTSUP;
+#endif
+  return -1;
+}
+
+/*
  * Open the upstream socket for one flow. On fd exhaustion the oldest flow is
  * evicted (closing its fd) and the open is retried once, so a flood of new
  * connections degrades to LRU flow recycling instead of hard failure.
  */
 [[nodiscard]] static int flow_socket_open(qsr_flow_table_t *flows, const struct sockaddr_storage *backend,
-                                          socklen_t backend_len, uint32_t fwmark) {
+                                          socklen_t backend_len, uint32_t fwmark, bool transparent,
+                                          const struct sockaddr_storage *client, socklen_t client_len) {
   const sa_family_t family = backend->ss_family;
   for (int attempt = 0; attempt < 2; attempt++) {
 #ifdef __linux__
@@ -1163,17 +1219,25 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
       }
       (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
 #endif
-      /* Bind before publishing the flow: implicit-bind port exhaustion must
-       * not masquerade as transient send EAGAIN. No REUSEADDR: unique ports
-       * are essential to exact return-path demultiplexing. */
+      /* No REUSEADDR: each upstream socket must own its reply tuple. */
       struct sockaddr_storage local = {0};
-      local.ss_family = family;
-      const socklen_t local_len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      socklen_t local_len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      if (transparent) {
+        if (transparent_client_addr(client, client_len, family, &local, &local_len) != 0 ||
+            set_socket_transparent(fd, family) != 0) {
+          const int saved = errno;
+          (void)close(fd);
+          errno = saved;
+          return -1;
+        }
+      } else {
+        local.ss_family = family;
+      }
       if (bind(fd, (const struct sockaddr *)&local, local_len) < 0 ||
           connect(fd, (const struct sockaddr *)backend, backend_len) < 0) {
         const int saved = errno;
         (void)close(fd);
-        if ((saved == EADDRINUSE || saved == EADDRNOTAVAIL) && attempt == 0 &&
+        if (!transparent && (saved == EADDRINUSE || saved == EADDRNOTAVAIL) && attempt == 0 &&
             qsr_flow_table_evict_oldest(flows) == 1U) {
           continue;
         }
@@ -1198,6 +1262,34 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
 }
 
 /*
+ * Transparent flow-open failures are per packet under load: one stderr line per
+ * class per minute, with the full count in the SIGUSR1/shutdown metrics.
+ */
+static void transparent_report_failure(qsr_dataplane_t *dp, int error, time_t now) {
+  enum { QSR_TRANSPARENT_LOG_INTERVAL = 60 };
+  static const char *const labels[] = {"socket open failed", "bind conflict", "address family mismatch"};
+  unsigned category = 0U;
+  if (error == EADDRINUSE) {
+    category = 1U;
+    dp->metrics.transparent_bind_conflicts++;
+  } else if (error == EAFNOSUPPORT || error == EINVAL) {
+    category = 2U;
+    dp->metrics.transparent_family_mismatches++;
+  } else {
+    dp->metrics.transparent_open_failures++;
+  }
+  if (dp->transparent_last_error_log[category] == 0 ||
+      now - dp->transparent_last_error_log[category] >= QSR_TRANSPARENT_LOG_INTERVAL) {
+    (void)fprintf(stderr, "transparent: %s: %s (suppressed=%llu)\n", labels[category], strerror(error),
+                  (unsigned long long)dp->transparent_suppressed[category]);
+    dp->transparent_last_error_log[category] = now;
+    dp->transparent_suppressed[category] = 0U;
+  } else {
+    dp->transparent_suppressed[category]++;
+  }
+}
+
+/*
  * Find or create the upstream flow for a client tuple. The flow's connected
  * socket gives this client a router source port of its own toward the backend,
  * which is what makes concurrent QUIC connections to one backend demux exactly
@@ -1205,6 +1297,7 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
  * Ponytail: one backend per client tuple; cross-backend shared sockets replace
  * this flow. Supporting them requires connection-aware flow keys and demux.
  */
+
 [[nodiscard]] static qsr_flow_t *flow_acquire(qsr_dataplane_t *dp, const struct sockaddr_storage *client,
                                               socklen_t client_len, const struct sockaddr_storage *backend,
                                               socklen_t backend_len, time_t now, const char *sni, const uint8_t *scid,
@@ -1216,7 +1309,8 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
     if (flow->backend_addr_len != backend_len || memcmp(&flow->backend_addr, backend, backend_len) != 0) {
       /* A fresh backend requires a fresh connected socket and generation,
        * including when its address family differs. The close hook flushes
-       * borrowed sends before the old descriptor can be reused. */
+       * borrowed sends before the old descriptor can be reused. Removing it
+       * first also frees the client tuple a transparent socket binds to. */
       qsr_flow_table_remove(flows, flow);
       flow = nullptr;
     }
@@ -1227,9 +1321,15 @@ static qsr_status_t set_socket_mark(int fd, uint32_t mark, const char *role) {
       return flow;
     }
   }
-  const int fd = flow_socket_open(flows, backend, backend_len, dp->runtime->config.fwmark);
+  const int fd = flow_socket_open(flows, backend, backend_len, dp->runtime->config.fwmark,
+                                  dp->runtime->config.transparent, client, client_len);
   if (fd < 0) {
+    const int saved = errno;
     dp->metrics.flow_open_failures++;
+    if (dp->runtime->config.transparent) {
+      transparent_report_failure(dp, saved, now);
+      /* Fail closed: never retry with the router IP when transparent bind fails. */
+    }
     return nullptr;
   }
   flow = qsr_flow_table_put(flows, client, client_len, backend, backend_len, fd, now);
@@ -1521,12 +1621,17 @@ static void report_live_metrics(qsr_dataplane_t *dp) {
   char line[1024];
   (void)snprintf(line, sizeof(line),
                  "metrics: received=%llu sent=%llu flows=%zu sessions=%zu kernel_drops=%llu truncated=%llu "
-                 "send_drops=%llu flow_open_failures=%llu flow_evictions=%llu session_evictions=%llu "
+                 "send_drops=%llu flow_open_failures=%llu transparent_open_failures=%llu "
+                 "transparent_bind_conflicts=%llu transparent_family_mismatches=%llu "
+                 "flow_evictions=%llu session_evictions=%llu "
                  "parse_failures=%llu unknown_sni=%llu gso_batches=%llu log_drops=%llu draining=%d\n",
                  (unsigned long long)dp->metrics.datagrams_in, (unsigned long long)dp->metrics.datagrams_out,
-                 dp->runtime->flows.count, dp->runtime->sessions.count,
-                 (unsigned long long)dp->metrics.kernel_drops, (unsigned long long)dp->metrics.receive_truncations,
-                 (unsigned long long)dp->metrics.send_drops, (unsigned long long)dp->metrics.flow_open_failures,
+                 dp->runtime->flows.count, dp->runtime->sessions.count, (unsigned long long)dp->metrics.kernel_drops,
+                 (unsigned long long)dp->metrics.receive_truncations, (unsigned long long)dp->metrics.send_drops,
+                 (unsigned long long)dp->metrics.flow_open_failures,
+                 (unsigned long long)dp->metrics.transparent_open_failures,
+                 (unsigned long long)dp->metrics.transparent_bind_conflicts,
+                 (unsigned long long)dp->metrics.transparent_family_mismatches,
                  (unsigned long long)dp->metrics.flow_evictions, (unsigned long long)dp->runtime->sessions.evictions,
                  (unsigned long long)dp->metrics.parse_failures, (unsigned long long)dp->metrics.unknown_sni,
                  (unsigned long long)dp->metrics.gso_batches, (unsigned long long)dp->log_drops, (int)g_drain);
@@ -1757,6 +1862,11 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   status = qsr_route_table_resolve(&runtime.config.routes);
   if (status != QSR_OK) {
     fprintf(stderr, "failed to resolve configured route backend\n");
+    qsr_runtime_free(&runtime);
+    return status;
+  }
+  status = qsr_runtime_check_transparent(&runtime.config);
+  if (status != QSR_OK) {
     qsr_runtime_free(&runtime);
     return status;
   }
@@ -2093,11 +2203,15 @@ qsr_status_t qsr_udp_run(const qsr_config_t *config, const char *config_path) {
   fprintf(stderr, "quic-sni-router: shutting down\n");
   (void)fprintf(stderr,
                 "metrics: received=%llu sent=%llu kernel_drops=%llu truncated=%llu send_drops=%llu "
-                "flow_open_failures=%llu flow_evictions=%llu session_evictions=%llu parse_failures=%llu "
+                "flow_open_failures=%llu transparent_open_failures=%llu transparent_bind_conflicts=%llu "
+                "transparent_family_mismatches=%llu flow_evictions=%llu session_evictions=%llu parse_failures=%llu "
                 "unknown_sni=%llu gso_batches=%llu log_drops=%llu\n",
                 (unsigned long long)dp.metrics.datagrams_in, (unsigned long long)dp.metrics.datagrams_out,
                 (unsigned long long)dp.metrics.kernel_drops, (unsigned long long)dp.metrics.receive_truncations,
                 (unsigned long long)dp.metrics.send_drops, (unsigned long long)dp.metrics.flow_open_failures,
+                (unsigned long long)dp.metrics.transparent_open_failures,
+                (unsigned long long)dp.metrics.transparent_bind_conflicts,
+                (unsigned long long)dp.metrics.transparent_family_mismatches,
                 (unsigned long long)dp.metrics.flow_evictions, (unsigned long long)runtime.sessions.evictions,
                 (unsigned long long)dp.metrics.parse_failures, (unsigned long long)dp.metrics.unknown_sni,
                 (unsigned long long)dp.metrics.gso_batches, (unsigned long long)dp.log_drops);

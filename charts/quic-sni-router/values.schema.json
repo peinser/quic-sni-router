@@ -28,7 +28,8 @@
           "required": ["udp"],
           "properties": {
             "udp": { "type": "string", "pattern": "^(\\[[0-9a-fA-F:.%a-zA-Z0-9_-]+\\]|[^:]*):[0-9]+$" },
-            "fwmark": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+            "fwmark": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "transparent": { "type": "boolean" }
           }
         },
         "sessions": {

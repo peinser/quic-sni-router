@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format foll
 
 - `conn: open` and `conn: close` records now carry `via=<ip:port>`, the source address and port of the flow's upstream socket, which is the peer the backend sees. Backends only observe the router, so this is the value that joins a backend log line to the client tuple in `src`. Read with `getsockname(2)` per logged event; forwarding paths are unchanged.
 
+### Transparent client source
+
+- Added optional Linux `listen.transparent` (`false` by default): every upstream socket binds the client's address and port with `IP_TRANSPARENT`, so backends see the real client tuple and `via=` equals `src`. Startup probes the capability; a failed bind drops the flow instead of falling back to the router address. Return-path routing stays with the administrator. Changes require restart.
+- Added counters for open failures, tuple conflicts and family mismatches, and a rate-limited error line per class. Per-route family warnings on reload follow the running mode, not the ignored value in the new file.
+- Added the Helm value `config.listen.transparent` with boolean schema validation and ConfigMap rendering. Setting it to `true` sets the Service's `externalTrafficPolicy` to `Local` (for `LoadBalancer` and `NodePort`), overriding `service.externalTrafficPolicy`, and `helm install`/`helm upgrade` print a warning saying so. Documented the remaining Kubernetes conditions: the capability, and a return path the chart does not install.
+- Corrected the Helm notes and Service template comment that called `externalTrafficPolicy: Local` the chart default; the default is `Cluster`.
+- Documented, per load balancer (MetalLB L2 and BGP, Cilium BGP, Cilium L2 announcements, cloud, `ClusterIP`) and per backend placement, what to do in Kubernetes, including a Cilium L2 announcement setup that runs a router on every lease candidate and why Cilium's per-pod source check rules out backends in other pods.
+
+### End-to-end tests
+
+- The hot-reload test no longer fails at random after a successful reload: it piped `docker logs` into `grep -q` under `pipefail`, so `docker logs` could die of SIGPIPE after the match was found.
+- Failure dumps in the Docker end-to-end tests now include the containers' stderr, where the router logs; they printed nothing before.
+- Documented why source addresses need ingress anti-spoofing once backends see them, in the README and the threat model.
+- Added unit tests, including IPv6 and v4-mapped clients through real sockets, and an optional end-to-end test in user namespaces that installs the README return-path recipes (IPv4, IPv6, same-host, nftables) and checks the negative cases.
+
 ### Policy routing
 
 - Added optional Linux `listen.fwmark` (`0` by default) on the UDP listener and every upstream socket before bind/connect. Marking failures report an explicit error and never fall back to unmarked traffic. Changes require restart.

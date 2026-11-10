@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -80,6 +81,68 @@ void qsr_runtime_log_routes(const char *prefix, const qsr_route_table_t *routes)
     }
     (void)fprintf(stderr, "%s route %s -> %s\n", prefix, routes->routes[i].sni, addr);
   }
+}
+
+#ifdef __linux__
+/* Transparent tuples keep their family: say which client family each backend excludes. */
+static void warn_transparent_routes(const qsr_route_table_t *routes, const char *prefix) {
+  for (size_t i = 0U; i < routes->count; i++) {
+    const qsr_route_t *route = &routes->routes[i];
+    if (route->backend_resolved) {
+      (void)fprintf(stderr,
+                    "%s transparent route %s: IPv%d backend; IPv%d clients are incompatible "
+                    "(including v4-mapped IPv6 clients for IPv6 backends)\n",
+                    prefix, route->sni, route->backend_addr.ss_family == AF_INET ? 4 : 6,
+                    route->backend_addr.ss_family == AF_INET ? 6 : 4);
+    }
+  }
+}
+#endif
+
+qsr_status_t qsr_runtime_check_transparent(const qsr_config_t *config) {
+  if (!config->transparent) {
+    return QSR_OK;
+  }
+#ifndef __linux__
+  (void)fprintf(stderr, "transparent: Linux IP_TRANSPARENT is required\n");
+  return QSR_ERR_INVALID;
+#else
+  /* The listener is usually dual-stack. Probe IPv4 even without configured routes;
+   * probe IPv6 whenever an IPv6 backend is configured. */
+  bool check_ipv6 = false;
+  for (size_t i = 0U; i < config->routes.count; i++) {
+    if (config->routes.routes[i].backend_resolved && config->routes.routes[i].backend_addr.ss_family == AF_INET6) {
+      check_ipv6 = true;
+    }
+  }
+  const int families[] = {AF_INET, AF_INET6};
+  for (size_t i = 0U; i < sizeof(families) / sizeof(families[0]); i++) {
+    if (families[i] == AF_INET6 && !check_ipv6) {
+      continue;
+    }
+    const int fd = socket(families[i], SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      (void)fprintf(stderr, "transparent: startup socket probe for IPv%d failed: %s\n", families[i] == AF_INET ? 4 : 6,
+                    strerror(errno));
+      return QSR_ERR_INVALID;
+    }
+    const int enabled = 1;
+    const int option = families[i] == AF_INET ? IP_TRANSPARENT : IPV6_TRANSPARENT;
+    const int level = families[i] == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+    const int result = setsockopt(fd, level, option, &enabled, sizeof(enabled));
+    const int saved = errno;
+    (void)close(fd);
+    if (result < 0) {
+      (void)fprintf(stderr,
+                    "transparent: startup IPv%d IP_TRANSPARENT probe failed: %s "
+                    "(CAP_NET_RAW or CAP_NET_ADMIN required)\n",
+                    families[i] == AF_INET ? 4 : 6, strerror(saved));
+      return QSR_ERR_INVALID;
+    }
+  }
+  warn_transparent_routes(&config->routes, "startup:");
+  return QSR_OK;
+#endif
 }
 
 static void log_route_diff(const qsr_route_table_t *old_routes, const qsr_route_table_t *new_routes) {
@@ -231,6 +294,10 @@ static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) 
     (void)fprintf(stderr, "reload: sessions.maxSessions change ignored (requires restart): %zu -> %zu\n",
                   runtime->config.max_sessions, new_config.max_sessions);
   }
+  if (new_config.transparent != runtime->config.transparent) {
+    (void)fprintf(stderr, "reload: listen.transparent change ignored (requires restart): %s -> %s\n",
+                  runtime->config.transparent ? "true" : "false", new_config.transparent ? "true" : "false");
+  }
   if (new_config.fwmark != runtime->config.fwmark) {
     (void)fprintf(stderr, "reload: listen.fwmark change ignored (requires restart): %lu -> %lu\n",
                   (unsigned long)runtime->config.fwmark, (unsigned long)new_config.fwmark);
@@ -243,6 +310,10 @@ static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) 
   /* Per-route diff lines are emitted before the atomic swap so the log
    * narrative reads "here's what's about to change, then ok". */
   log_route_diff(&runtime->config.routes, &new_config.routes);
+  /* listen.transparent is restart-only: warn against the mode that is running, not the file's. */
+  if (runtime->config.transparent) {
+    warn_transparent_routes(&new_config.routes, "reload:");
+  }
   if (evicted > 0U || flows_evicted > 0U) {
     (void)fprintf(stderr, "reload: %zu sessions and %zu flows evicted (backends removed)\n", evicted, flows_evicted);
   }

@@ -14,6 +14,7 @@
 typedef struct qsr_config {
   char listen_udp[QSR_MAX_LISTEN_ADDR_LEN];
   uint32_t fwmark; /* Linux SO_MARK on listener and upstream sockets; 0 disables. */
+  bool transparent; /* Linux: preserve client IP and port on upstream UDP sockets. */
   uint32_t idle_timeout_seconds;
   size_t max_sessions;
   bool log_connections; /* logging.connections: one stderr line per flow open/close */

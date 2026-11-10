@@ -61,7 +61,7 @@ cleanup() {
 }
 dump_logs() {
   echo "--- router logs ---" >&2
-  docker logs "${project}-router" >&2 2>/dev/null || true
+  docker logs "${project}-router" >&2 2>&1 || true
   for i in $(seq 1 "${n_backends}"); do
     echo "--- rvr-${i} logs (tail) ---" >&2
     docker logs "${project}-rvr-${i}" 2>&1 | tail -10 >&2 || true

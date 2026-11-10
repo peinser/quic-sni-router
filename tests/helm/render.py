@@ -2,7 +2,9 @@
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 
 import yaml
 
@@ -37,6 +39,59 @@ for config in cases:
     for field in ("routes", "cidEncoding", "quicLb"):
         assert router.get(field) == config.get(field), (field, router, config)
     assert router["listen"]["udp"] and router["sessions"]["maxSessions"] > 0
+
+for listen, expected in ((None, False), ({"transparent": True}, True), ({"transparent": False}, False)):
+    config = {"routes": {"example.test": route}}
+    if listen is not None:
+        config["listen"] = {"udp": ":8443", **listen}
+    result = render(config)
+    assert result.returncode == 0, result.stderr
+    manifest = next(doc for doc in yaml.safe_load_all(result.stdout) if doc["kind"] == "ConfigMap")
+    router = yaml.safe_load(manifest["data"]["router.yaml"])
+    assert router["listen"]["transparent"] is expected, (listen, router)
+    assert router["listen"]["fwmark"] == 0, router
+
+result = render({"listen": {"udp": ":8443", "transparent": "yes"}, "routes": {"example.test": route}})
+assert result.returncode != 0 and "schema" in result.stderr, result.stderr
+
+
+def service_spec(config, **values):
+    result = render(config, **values)
+    assert result.returncode == 0, result.stderr
+    return next(doc for doc in yaml.safe_load_all(result.stdout) if doc["kind"] == "Service")["spec"]
+
+
+def notes(config, **values):
+    """helm template skips NOTES.txt and install --dry-run needs a cluster, so render it through tpl in a copy."""
+    with tempfile.TemporaryDirectory() as directory:
+        chart = Path(directory) / "chart"
+        shutil.copytree(CHART, chart)
+        (chart / "templates/NOTES.txt").rename(chart / "notes.txt")
+        (chart / "templates/notes.yaml").write_text('notes: {{ tpl (.Files.Get "notes.txt") . | toJson }}\n')
+        result = subprocess.run(
+            ["helm", "template", "test", str(chart), "--show-only", "templates/notes.yaml", "--values", "-"],
+            input=json.dumps({"config": config, **values}), text=True, capture_output=True,
+        )
+    assert result.returncode == 0, result.stderr
+    return yaml.safe_load(result.stdout)["notes"]
+
+
+transparent = {"listen": {"udp": ":8443", "transparent": True}, "routes": {"example.test": route}}
+plain = {"routes": {"example.test": route}}
+# Transparent mode needs real client addresses, so it overrides the Cluster default.
+assert service_spec(transparent)["externalTrafficPolicy"] == "Local"
+assert service_spec(transparent, service={"type": "NodePort"})["externalTrafficPolicy"] == "Local"
+assert service_spec(transparent, existingSecret="router-secret")["externalTrafficPolicy"] == "Local"
+assert "externalTrafficPolicy" not in service_spec(transparent, service={"type": "ClusterIP"})
+assert service_spec(plain)["externalTrafficPolicy"] == "Cluster"
+text = notes(transparent)
+assert "WARNING: config.listen.transparent=true." in text, text
+assert "externalTrafficPolicy to Local, overriding\nservice.externalTrafficPolicy=Cluster." in text, text
+text = notes(transparent, service={"externalTrafficPolicy": "Local"})
+assert "externalTrafficPolicy to Local." in text and "overriding" not in text, text
+text = notes(transparent, service={"type": "ClusterIP"})
+assert "WARNING: config.listen.transparent=true." in text and "externalTrafficPolicy to Local" not in text, text
+assert "WARNING: config.listen.transparent" not in notes(plain)
 
 result = render({**cases[1], "cidEncoding": {"key": key}})
 assert result.returncode != 0 and "schema" in result.stderr, result.stderr

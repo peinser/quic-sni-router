@@ -14,9 +14,9 @@ cleanup() {
 }
 
 dump_logs() {
-  docker logs "${project}-router" >&2 2>/dev/null || true
-  docker logs "${project}-backend" >&2 2>/dev/null || true
-  docker logs "${project}-client" >&2 2>/dev/null || true
+  docker logs "${project}-router" >&2 2>&1 || true
+  docker logs "${project}-backend" >&2 2>&1 || true
+  docker logs "${project}-client" >&2 2>&1 || true
 }
 trap 'rc=$?; if [ ${rc} -ne 0 ]; then dump_logs; fi; cleanup' EXIT
 

@@ -29,12 +29,32 @@ static void test_defaults(void) {
   ASSERT_TRUE(config.max_sessions == QSR_MAX_SESSIONS_DEFAULT);
   ASSERT_TRUE(strcmp(config.listen_udp, ":443") == 0);
   ASSERT_TRUE(config.fwmark == 0);
+  ASSERT_TRUE(!config.transparent);
+}
+
+static void test_transparent_config(void) {
+  qsr_config_t config;
+  load_and_unlink("listen: {transparent: false}\n", &config, QSR_OK);
+  ASSERT_TRUE(!config.transparent);
+#ifdef __linux__
+  load_and_unlink("listen: {transparent: true}\n", &config, QSR_OK);
+  ASSERT_TRUE(config.transparent);
+#else
+  load_and_unlink("listen: {transparent: true}\n", &config, QSR_ERR_INVALID);
+#endif
+  const char *invalid[] = {"yes", "1", "null", "[]", "{}", "TRUE", "none"};
+  for (size_t i = 0U; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+    char yaml[96];
+    (void)snprintf(yaml, sizeof(yaml), "listen: {transparent: %s}\n", invalid[i]);
+    load_and_unlink(yaml, &config, QSR_ERR_INVALID);
+  }
 }
 
 static void test_fwmark(void) {
   qsr_config_t config;
   load_and_unlink("listen: {fwmark: 0}\n", &config, QSR_OK);
   ASSERT_TRUE(config.fwmark == 0);
+  ASSERT_TRUE(!config.transparent);
 #ifdef __linux__
   load_and_unlink("listen: {udp: ':8443', fwmark: 12345}\n", &config, QSR_OK);
   ASSERT_TRUE(config.fwmark == 12345 && strcmp(config.listen_udp, ":8443") == 0);
@@ -213,6 +233,7 @@ static void test_quic_lb_config(void) {
 void test_config(void) {
   test_defaults();
   test_fwmark();
+  test_transparent_config();
   test_loads_full_config();
   test_empty_file_yields_defaults();
   test_rejects_bad_integer();

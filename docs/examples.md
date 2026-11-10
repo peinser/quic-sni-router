@@ -87,6 +87,7 @@ What happens on reload:
 | `sessions.idleTimeout` | Updated; takes effect on the next expiry sweep (within 1s). |
 | `listen.udp` | Logged + ignored. Requires process restart. |
 | `listen.fwmark` | Logged + ignored. Requires process restart; retained for new upstream sockets too. |
+| `listen.transparent` | Logged + ignored. Requires process restart. |
 | `sessions.maxSessions` | Logged + ignored. Requires process restart. |
 
 Validation is fail-closed: if the new file fails to parse, or any backend hostname fails to resolve, the previous config keeps serving traffic and the reason is logged to stderr.
