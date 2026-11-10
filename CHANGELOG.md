@@ -11,7 +11,11 @@ All notable changes to this project are documented in this file. The format foll
 ### Transparent client source
 
 - Added optional Linux `listen.transparent` (`false` by default): every upstream socket binds the client's address and port with `IP_TRANSPARENT`, so backends see the real client tuple and `via=` equals `src`. Startup probes the capability; a failed bind drops the flow instead of falling back to the router address. Return-path routing stays with the administrator. Changes require restart.
-- Added counters for open failures, tuple conflicts and family mismatches, a rate-limited error line per class, unit tests, and an optional network-namespace end-to-end test.
+- Added counters for open failures, tuple conflicts and family mismatches, and a rate-limited error line per class. Per-route family warnings on reload follow the running mode, not the ignored value in the new file.
+- Added the Helm value `config.listen.transparent` with boolean schema validation and ConfigMap rendering. Setting it to `true` sets the Service's `externalTrafficPolicy` to `Local` (for `LoadBalancer` and `NodePort`), overriding `service.externalTrafficPolicy`, and `helm install`/`helm upgrade` print a warning saying so. Documented the remaining Kubernetes conditions: the capability, and a return path the chart does not install.
+- Corrected the Helm notes and Service template comment that called `externalTrafficPolicy: Local` the chart default; the default is `Cluster`.
+- Documented why source addresses need ingress anti-spoofing once backends see them, in the README and the threat model.
+- Added unit tests, including IPv6 and v4-mapped clients through real sockets, and an optional end-to-end test in user namespaces that installs the README return-path recipes (IPv4, IPv6, same-host, nftables) and checks the negative cases.
 
 ### Policy routing
 

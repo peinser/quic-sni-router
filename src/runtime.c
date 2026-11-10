@@ -83,13 +83,11 @@ void qsr_runtime_log_routes(const char *prefix, const qsr_route_table_t *routes)
   }
 }
 
+#ifdef __linux__
 /* Transparent tuples keep their family: say which client family each backend excludes. */
-static void warn_transparent_routes(const qsr_config_t *config, const char *prefix) {
-  if (!config->transparent) {
-    return;
-  }
-  for (size_t i = 0U; i < config->routes.count; i++) {
-    const qsr_route_t *route = &config->routes.routes[i];
+static void warn_transparent_routes(const qsr_route_table_t *routes, const char *prefix) {
+  for (size_t i = 0U; i < routes->count; i++) {
+    const qsr_route_t *route = &routes->routes[i];
     if (route->backend_resolved) {
       (void)fprintf(stderr,
                     "%s transparent route %s: IPv%d backend; IPv%d clients are incompatible "
@@ -99,6 +97,7 @@ static void warn_transparent_routes(const qsr_config_t *config, const char *pref
     }
   }
 }
+#endif
 
 qsr_status_t qsr_runtime_check_transparent(const qsr_config_t *config) {
   if (!config->transparent) {
@@ -141,7 +140,7 @@ qsr_status_t qsr_runtime_check_transparent(const qsr_config_t *config) {
       return QSR_ERR_INVALID;
     }
   }
-  warn_transparent_routes(config, "startup:");
+  warn_transparent_routes(&config->routes, "startup:");
   return QSR_OK;
 #endif
 }
@@ -311,7 +310,10 @@ static void apply_reload(qsr_runtime_t *runtime, const qsr_config_t *candidate) 
   /* Per-route diff lines are emitted before the atomic swap so the log
    * narrative reads "here's what's about to change, then ok". */
   log_route_diff(&runtime->config.routes, &new_config.routes);
-  warn_transparent_routes(&new_config, "reload:");
+  /* listen.transparent is restart-only: warn against the mode that is running, not the file's. */
+  if (runtime->config.transparent) {
+    warn_transparent_routes(&new_config.routes, "reload:");
+  }
   if (evicted > 0U || flows_evicted > 0U) {
     (void)fprintf(stderr, "reload: %zu sessions and %zu flows evicted (backends removed)\n", evicted, flows_evicted);
   }

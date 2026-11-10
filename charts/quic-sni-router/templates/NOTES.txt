@@ -40,5 +40,20 @@ WAN-FACING DEPLOYMENT CHECKLIST (see docs/threat-model.md):
 
   - Backends should be on a non-routable / cluster-internal network.
   - Add upstream BCP 38 / uRPF + per-source rate limiting at the LB.
-  - service.externalTrafficPolicy=Local (the chart default) preserves the
-    client source IP, which the router uses for session pinning.
+  - service.externalTrafficPolicy=Local preserves the client source IP. The
+    chart default, Cluster, shows node addresses to the router instead.
+{{- if .Values.config.listen.transparent }}
+
+WARNING: config.listen.transparent=true. Backends see client source addresses
+directly, so drop internal and bogon sources before they reach the router.
+{{- if or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort") }}
+This setting also sets the Service's externalTrafficPolicy to Local
+{{- if ne .Values.service.externalTrafficPolicy "Local" }}, overriding
+service.externalTrafficPolicy={{ .Values.service.externalTrafficPolicy }}
+{{- end }}.
+Only nodes running a router pod receive traffic.
+{{- end }}
+The router also needs NET_RAW or NET_ADMIN (it refuses to start without it) and
+a return path for backend replies, which this chart does not install. See the
+chart README section "Transparent client source (Linux)".
+{{- end }}

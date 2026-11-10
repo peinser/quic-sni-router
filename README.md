@@ -102,6 +102,7 @@ make docker-build
 listen:
   udp: ":443"
   fwmark: 0                # optional Linux SO_MARK; 0 disables, restart required
+  transparent: false       # optional Linux client source tuple toward backends; restart required
 sessions:
   idleTimeout: 60s         # 1..86400, measured on CLOCK_MONOTONIC
   maxSessions: 100000      # table entries, not connections; see the sizing note above
@@ -169,8 +170,10 @@ By default a backend sees the router as the peer of every flow, and
 `via=` in the connection log is the only way back to the client. With
 `listen.transparent: true`, each per-flow upstream socket is bound to the
 client's own address and port (`IP_TRANSPARENT`/`IPV6_TRANSPARENT`) before it
-connects, so the backend sees the real client tuple: its logs, rate limits and
-access lists work unchanged, and `via=` equals `src`.
+connects, so the backend sees the real client tuple in its own logs, rate limits
+and access lists, and `via=` equals `src`. Source addresses can be spoofed, so
+read [Spoofed client addresses](#spoofed-client-addresses) before relying on them
+for access control.
 
 ```yaml
 listen:
@@ -182,10 +185,12 @@ Two things must be in place, and QSR provides neither:
 
 1. **Privilege.** Setting the option needs `CAP_NET_RAW` or `CAP_NET_ADMIN` in
    the user namespace governing the network namespace, for the whole process
-   lifetime. Startup probes it and refuses to run without it.
+   lifetime. Unlike `SO_MARK`, `CAP_NET_RAW` is enough on every supported
+   kernel (since Linux 3.2). Startup probes it and refuses to run without it.
 2. **A return path.** Backend replies are addressed to the client. They must be
    delivered locally to the router's flow socket instead of being routed toward
-   the client. Route them to `lo` by source, one rule per backend:
+   the client. Route them to `lo` by source, one rule per backend (`ipproto`
+   and `sport` matches need Linux 4.17 or later):
 
    ```sh
    ip -4 route add local 0.0.0.0/0 dev lo table 100
@@ -194,23 +199,30 @@ Two things must be in place, and QSR provides neither:
 
    This also covers backends on the router host itself, including `127.0.0.1`.
    For packets arriving on an interface, matching the socket instead of the
-   source works too:
+   source works too (the nftables `socket` expression needs Linux 4.18 or later):
 
    ```sh
    nft add table inet qsr
    nft add chain inet qsr prerouting '{ type filter hook prerouting priority mangle; }'
-   nft add rule inet qsr prerouting udp sport 8443 socket transparent 1 meta mark set 0x100
+   nft add rule inet qsr prerouting ip saddr 10.0.4.12 udp sport 8443 socket transparent 1 meta mark set 0x100
    ip -4 rule add pref 90 fwmark 0x100 lookup 100
    ```
 
-   Use `ip -6` and `local ::/0` for IPv6 backends. A backend on another host
-   must route client addresses back through the router host (default route or
-   a policy rule on the backend); otherwise its replies bypass the router and
-   the client drops them.
+   For IPv6 backends use `ip -6`, `local ::/0`, and `ip6 saddr`. A backend on
+   another host must route client addresses back through the router host
+   (default route or a policy rule on the backend); otherwise its replies bypass
+   the router and the client drops them. Table `100` and mark `0x100` are
+   examples: choose values that collide with neither existing policy rules,
+   `listen.fwmark`, nor marks your CNI uses.
+
+`make test-e2e-transparent` installs these recipes exactly as shown (IPv4,
+IPv6, and a same-host `127.0.0.1` backend for the source rule; IPv4 for the
+nftables rule) in throwaway network namespaces, and checks the backend's view
+and the reply path, plus the same setups without a return path.
 
 A transparent tuple keeps its family: IPv4 clients (including v4-mapped clients
 on a dual-stack listener) reach IPv4 backends, IPv6 clients IPv6 backends.
-Startup and reload log the excluded family per route. Failures are fail-closed:
+While the mode is active, startup and reload log the excluded family per route. Failures are fail-closed:
 a flow whose bind fails is dropped and never retried from the router address.
 `SIGUSR1` and shutdown metrics count `transparent_open_failures`,
 `transparent_bind_conflicts` (another socket owns the client tuple) and
@@ -218,9 +230,35 @@ a flow whose bind fails is dropped and never retried from the router address.
 Rejected on non-Linux platforms. Changes require a process restart and are
 ignored with a warning on hot reload.
 
+For Kubernetes, see the
+[Helm chart transparent-source notes](charts/quic-sni-router/README.md#transparent-client-source-linux).
+Enabling it through the chart also sets the Service's `externalTrafficPolicy`
+to `Local`, overriding `service.externalTrafficPolicy`.
+
+#### Spoofed client addresses
+
+Without this option backends only ever see the router's address. With it they
+see whatever source address reached the router, and UDP source addresses can
+be forged:
+
+- A backend access list that trusts internal ranges accepts an internet packet
+  claiming an internal source, unless the router's ingress drops it. Without
+  the real owner of that address the QUIC handshake cannot complete, but the
+  backend still processes the forged Initial packets.
+- The backend replies to the claimed address. When that address is on the
+  backend's own network, the reply goes there directly instead of through the
+  router, so a forged Initial makes the backend send handshake packets (up to
+  QUIC's threefold anti-amplification limit) at an internal host. Backends that
+  send QUIC Retry validate the address first.
+
+Before enabling transparent mode, drop internal, loopback and other bogon
+sources on the router's public interface: BCP 38 upstream, strict `rp_filter`,
+or an nftables `fib saddr . iif oif missing drop` rule. See the
+[threat model](docs/threat-model.md).
+
 ### Hot reload
 
-The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp`, `listen.fwmark`, and `sessions.maxSessions` require restart.
+The directory holding `config.yaml` is watched with `inotify`. Completed writes, atomic file replacement, and Kubernetes `..data` swaps trigger a background parse and DNS resolution. Intermediate modifications and unrelated filenames are ignored. One worker builds a candidate at a time; updates arriving during resolution schedule another candidate before publication. The dataplane atomically publishes valid candidates and evicts sessions whose backend disappeared. This deliberately terminates those sessions, and is not a lossless reload guarantee. Changes to `listen.udp`, `listen.fwmark`, `listen.transparent`, and `sessions.maxSessions` require restart.
 
 DNS timeouts no longer stall packet forwarding; failed candidates retain the previous configuration. Startup still resolves synchronously, and process shutdown waits for an outstanding resolver worker. Prefer atomic rename for config updates: completed-write notifications cannot make arbitrary concurrent in-place writers transactional.
 
@@ -366,7 +404,7 @@ and if it does, bake it in with `make docker-build QSR_CPU_TARGET=native QSR_ENA
 | `make test-e2e-idle` | backend idle timeout handling |
 | `make test-e2e-reverse` | reverse-tuple routing of stale resets |
 | `make test-e2e-reload` | inotify hot reload picks up a new route |
-| `make test-e2e-transparent` | transparent mode in isolated network namespaces: real client tuple at the backend, reply delivery, and no reply without the return path (needs root or unprivileged user namespaces; skips otherwise) |
+| `make test-e2e-transparent` | transparent mode in throwaway network namespaces, using the README return-path recipes: real client tuple at the backend and reply delivery for IPv4, IPv6 and same-host backends, and no reply without a return path (needs unprivileged user namespaces, `iproute2` and `nsenter`, and skips otherwise; the nftables case also needs `nft` and the kernel's `nft_socket` module, and skips alone without them) |
 | `make test-loadtest` | 10 backends under sustained concurrent handshakes, asserting zero misroutes |
 
 `make test-loadtest` takes `QSR_LOADTEST_DIRECT=1` to bypass the router for a baseline, and `QSR_LOADTEST_PERSISTENT=1` to reuse one HTTP/3 session per worker.

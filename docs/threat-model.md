@@ -35,6 +35,8 @@ WAN  --(UDP/443)-->  quic-sni-router  --(UDP/private)-->  backend pods
 | Flow-socket exhaustion | One upstream socket per concurrent client flow; a flood of new client tuples can hit `RLIMIT_NOFILE`. | Flow table is bounded (`maxSessions / 4`) with LRU eviction; on `EMFILE`/`ENFILE` the oldest flow is recycled and the open retried. `RLIMIT_NOFILE` is raised to the hard limit at startup with a warning when it cannot cover the flow table. Combine with upstream per-source rate limits |
 | Reload-time disruption | Operator pushes a broken config | Reload is fail-closed: parse + DNS-resolve must both succeed before the new routes are swapped in. On any failure the previous config keeps serving and the failure is logged |
 | Backend-spoofing return traffic | Attacker targets a live upstream ephemeral port | Explicitly bound, connected UDP sockets filter unrelated source endpoints in the kernel. Source spoofing still requires upstream controls and QUIC authentication. Return traffic must use the configured backend endpoint (including normal reverse NAT). |
+| Spoofed sources reach backends (`listen.transparent`) | With transparent mode the backend sees the client's claimed address instead of the router's. A forged internal source passes backend allowlists that trust internal ranges. | Off by default. The router must drop internal and bogon sources at ingress (BCP 38, strict `rp_filter`, nftables `fib`). The QUIC handshake still cannot complete without the address owner. |
+| Reflection at backend-adjacent hosts (`listen.transparent`) | The backend replies to the claimed client address. An address on the backend's own network receives those replies directly, bypassing the router. | Same ingress filtering. Backend QUIC anti-amplification caps the reply volume; backends that send Retry validate the address first. |
 | Encoded-CID forgery | Attacker modifies a known CID's server ID | Version 0x50 authenticates all routing fields with an 88-bit HMAC-SHA256 tag. The malleable CTR format is rejected. Replay is possible and does not authenticate a client. |
 | Route confusion | Ambiguous / malformed SNI | SNI is normalized to lowercase ASCII DNS, label-validated (no leading hyphen, no empty labels), max 255 chars; unknown SNI is dropped |
 | Session hijack via guessed CID | Attacker injects short-header packet with known CID | CID lookup only happens when the source tuple does not match a session; QUIC AEAD on the client rejects the resulting garbage. Out-of-scope: forgery resistance requires QUIC retry tokens, which this router does not issue |
@@ -54,12 +56,13 @@ WAN  --(UDP/443)-->  quic-sni-router  --(UDP/private)-->  backend pods
 - SIGINT/SIGTERM flush and close immediately; SIGUSR2 stops new admission and waits for flow expiry. The LB must continue delivering established traffic during draining. SIGPIPE is ignored.
 - `SO_REUSEPORT` set so the operator can scale by launching multiple dataplane processes.
 - Backend return traffic is demuxed by per-client upstream flow sockets (the receiving fd identifies the client), eliminating shared-backend-tuple confusion under concurrency regardless of what CIDs the packets carry.
+- Transparent mode (`listen.transparent`) fails closed: startup refuses to run without the capability, and a flow whose client-tuple bind fails is dropped instead of being sent from the router's address. No `SO_REUSEADDR`, so two sockets never share a client tuple.
 
 ## Operational controls that are NOT in this binary
 
 These belong in the deployment, not the router process:
 
-- BCP 38 / uRPF on the upstream router to drop spoofed source IPs.
+- BCP 38 / uRPF on the upstream router to drop spoofed source IPs. With `listen.transparent`, also drop internal and bogon sources on the router's own public interface, because backends then see client source addresses directly.
 - Per-source rate limiting (eBPF / nftables / cloud LB).
 - Backend network isolation: backends should not be reachable from the WAN; the router should reach them via a private interface or cluster network.
 - Bind the listener with a Kubernetes NetworkPolicy that only allows ingress from the load balancer.

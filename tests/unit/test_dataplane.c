@@ -36,6 +36,16 @@ static int bound_socket(struct sockaddr_storage *addr) {
   return fd;
 }
 
+/* Real transparent binds need CAP_NET_RAW or CAP_NET_ADMIN; tests that bind skip without it. */
+static bool transparent_capable(void) {
+  const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(fd >= 0);
+  const int enabled = 1;
+  const bool capable = setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) == 0;
+  close(fd);
+  return capable;
+}
+
 static void test_transparent_client_address(void) {
   struct sockaddr_storage local = {0};
   socklen_t local_len = 0;
@@ -69,12 +79,7 @@ static void test_transparent_startup_probe(void) {
   qsr_config_default(&config);
   ASSERT_TRUE(qsr_runtime_check_transparent(&config) == QSR_OK);
   config.transparent = true;
-  const int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  ASSERT_TRUE(fd >= 0);
-  const int enabled = 1;
-  const bool capable = setsockopt(fd, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) == 0;
-  close(fd);
-  if (capable) {
+  if (transparent_capable()) {
     ASSERT_TRUE(qsr_runtime_check_transparent(&config) == QSR_OK);
   } else {
     ASSERT_TRUE(qsr_runtime_check_transparent(&config) != QSR_OK);
@@ -373,16 +378,37 @@ static void test_reply_source_address(void) {
   free(runtime);
 }
 
-static void finish_reload(qsr_runtime_t *runtime) {
+static bool reload_settled(qsr_runtime_t *runtime) {
   const struct timespec delay = {.tv_nsec = 10000000};
   for (unsigned i = 0; i < 200; i++) {
     qsr_runtime_poll(runtime);
     if (runtime->reload_job == nullptr && !runtime->reload_pending) {
-      return;
+      return true;
     }
     nanosleep(&delay, nullptr);
   }
-  ASSERT_TRUE(false);
+  return false;
+}
+
+static void finish_reload(qsr_runtime_t *runtime) { ASSERT_TRUE(reload_settled(runtime)); }
+
+/* Reload with stderr redirected into log. Assertions run only after stderr is restored. */
+static void finish_reload_logged(qsr_runtime_t *runtime, char *log, size_t size) {
+  int capture[2];
+  ASSERT_TRUE(pipe2(capture, O_CLOEXEC) == 0);
+  ASSERT_TRUE(fflush(stderr) == 0);
+  const int saved = dup(STDERR_FILENO);
+  ASSERT_TRUE(saved >= 0 && dup2(capture[1], STDERR_FILENO) == STDERR_FILENO);
+  const bool settled = reload_settled(runtime);
+  (void)fflush(stderr);
+  ASSERT_TRUE(dup2(saved, STDERR_FILENO) == STDERR_FILENO);
+  close(saved);
+  close(capture[1]);
+  ASSERT_TRUE(settled);
+  const ssize_t received = read(capture[0], log, size - 1U);
+  ASSERT_TRUE(received >= 0);
+  log[received] = '\0';
+  close(capture[0]);
 }
 
 static void test_completed_reload(void) {
@@ -424,10 +450,29 @@ static void test_completed_reload(void) {
                     file) >= 0);
   fclose(file);
   ASSERT_TRUE(rename(other, path) == 0);
-  finish_reload(runtime);
+  char log[4096];
+  finish_reload_logged(runtime, log, sizeof(log));
   ASSERT_TRUE(runtime->config.idle_timeout_seconds == 7 && runtime->config.routes.count == 1);
   ASSERT_TRUE(runtime->config.fwmark == 0);
   ASSERT_TRUE(!runtime->config.transparent);
+  ASSERT_TRUE(strstr(log, "reload: listen.transparent change ignored (requires restart): false -> true\n") != nullptr);
+  /* The file's value is ignored, so it must not trigger warnings for a mode that is not running. */
+  ASSERT_TRUE(strstr(log, "transparent route") == nullptr);
+  /* Conversely, a running transparent router keeps warning when the file turns the option off. */
+  runtime->config.transparent = true;
+  file = fopen(other, "w");
+  ASSERT_TRUE(file != nullptr);
+  ASSERT_TRUE(fputs("listen: {transparent: false}\nsessions: {idleTimeout: 7s}\n"
+                    "routes: {example.test: {host: 127.0.0.1, port: 8443}}\n",
+                    file) >= 0);
+  ASSERT_TRUE(fclose(file) == 0);
+  ASSERT_TRUE(rename(other, path) == 0);
+  finish_reload_logged(runtime, log, sizeof(log));
+  ASSERT_TRUE(runtime->config.transparent);
+  ASSERT_TRUE(strstr(log, "reload: listen.transparent change ignored (requires restart): true -> false\n") != nullptr);
+  ASSERT_TRUE(strstr(log, "reload: transparent route example.test: IPv4 backend; IPv6 clients are incompatible") !=
+              nullptr);
+  runtime->config.transparent = false;
   file = fopen(path, "w");
   ASSERT_TRUE(file != nullptr);
   ASSERT_TRUE(fputs("routes: [broken", file) >= 0);
@@ -710,15 +755,11 @@ static void test_logging_upstream_addr(void) {
 
 static void test_transparent_via_and_reroute(void) {
 #ifdef __linux__
-  const int probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  ASSERT_TRUE(probe >= 0);
-  const int enabled = 1;
-  if (setsockopt(probe, IPPROTO_IP, IP_TRANSPARENT, &enabled, sizeof(enabled)) < 0) {
+  if (!transparent_capable()) {
     (void)fprintf(stderr, "SKIP transparent via/reroute: IP_TRANSPARENT capability unavailable\n");
-    close(probe);
     return;
   }
-  close(probe);
+  const int enabled = 1;
   qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
   ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
   runtime->config.transparent = true;
@@ -780,6 +821,76 @@ static void test_transparent_via_and_reroute(void) {
   close(dp.epoll_fd);
   close(fds[0]);
   close(fds[1]);
+  free(runtime);
+#endif
+}
+
+/* IPV6_TRANSPARENT and v4-mapped dual-stack clients through real sockets; cross-family pairs fail closed. */
+static void test_transparent_families(void) {
+#ifdef __linux__
+  if (!transparent_capable()) {
+    (void)fprintf(stderr, "SKIP transparent families: IP_TRANSPARENT capability unavailable\n");
+    return;
+  }
+  qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
+  ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 8) == QSR_OK);
+  runtime->config.transparent = true;
+  qsr_dataplane_t dp = {.runtime = runtime, .epoll_fd = epoll_create1(EPOLL_CLOEXEC)};
+  ASSERT_TRUE(dp.epoll_fd >= 0);
+  char payload[4];
+
+  struct sockaddr_storage backend6 = {0};
+  struct sockaddr_in6 *b6 = (struct sockaddr_in6 *)&backend6;
+  b6->sin6_family = AF_INET6;
+  b6->sin6_addr = in6addr_loopback;
+  const int receiver6 = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  ASSERT_TRUE(receiver6 >= 0 && bind(receiver6, (struct sockaddr *)b6, sizeof(*b6)) == 0);
+  socklen_t len = sizeof(*b6);
+  ASSERT_TRUE(getsockname(receiver6, (struct sockaddr *)b6, &len) == 0);
+  struct sockaddr_storage client6 = {0};
+  struct sockaddr_in6 *c6 = (struct sockaddr_in6 *)&client6;
+  c6->sin6_family = AF_INET6;
+  c6->sin6_port = htons(41120);
+  ASSERT_TRUE(inet_pton(AF_INET6, "2001:db8::19", &c6->sin6_addr) == 1);
+  qsr_flow_t *flow = flow_acquire(&dp, &client6, sizeof(*c6), &backend6, sizeof(*b6), 1, nullptr, nullptr, 0);
+  ASSERT_TRUE(flow != nullptr && send(flow->fd, "6", 1, 0) == 1);
+  struct sockaddr_in6 peer6 = {0};
+  len = sizeof(peer6);
+  ASSERT_TRUE(recvfrom(receiver6, payload, sizeof(payload), 0, (struct sockaddr *)&peer6, &len) == 1);
+  ASSERT_TRUE(peer6.sin6_port == c6->sin6_port && IN6_ARE_ADDR_EQUAL(&peer6.sin6_addr, &c6->sin6_addr));
+
+  /* A dual-stack listener reports IPv4 clients as v4-mapped; the IPv4 backend sees the plain IPv4 tuple. */
+  struct sockaddr_storage backend4 = {0};
+  const int receiver4 = bound_socket(&backend4);
+  struct sockaddr_storage mapped = {0};
+  struct sockaddr_in6 *m6 = (struct sockaddr_in6 *)&mapped;
+  m6->sin6_family = AF_INET6;
+  m6->sin6_port = htons(41121);
+  ASSERT_TRUE(inet_pton(AF_INET6, "::ffff:198.51.100.20", &m6->sin6_addr) == 1);
+  flow = flow_acquire(&dp, &mapped, sizeof(*m6), &backend4, sizeof(struct sockaddr_in), 2, nullptr, nullptr, 0);
+  ASSERT_TRUE(flow != nullptr && send(flow->fd, "4", 1, 0) == 1);
+  struct sockaddr_in peer4 = {0};
+  len = sizeof(peer4);
+  ASSERT_TRUE(recvfrom(receiver4, payload, sizeof(payload), 0, (struct sockaddr *)&peer4, &len) == 1);
+  struct in_addr expected4;
+  ASSERT_TRUE(inet_pton(AF_INET, "198.51.100.20", &expected4) == 1);
+  ASSERT_TRUE(peer4.sin_port == m6->sin6_port && peer4.sin_addr.s_addr == expected4.s_addr);
+  ASSERT_TRUE(runtime->flows.count == 2 && dp.metrics.flow_open_failures == 0);
+
+  /* Native IPv6 client to an IPv4 backend, and v4-mapped client to an IPv6 backend. */
+  c6->sin6_port = htons(41122);
+  ASSERT_TRUE(flow_acquire(&dp, &client6, sizeof(*c6), &backend4, sizeof(struct sockaddr_in), 3, nullptr, nullptr, 0) ==
+              nullptr);
+  m6->sin6_port = htons(41123);
+  ASSERT_TRUE(flow_acquire(&dp, &mapped, sizeof(*m6), &backend6, sizeof(*b6), 4, nullptr, nullptr, 0) == nullptr);
+  ASSERT_TRUE(dp.metrics.transparent_family_mismatches == 2 && dp.metrics.flow_open_failures == 2);
+  ASSERT_TRUE(runtime->flows.count == 2);
+  ASSERT_TRUE(recv(receiver4, payload, sizeof(payload), 0) < 0 && recv(receiver6, payload, sizeof(payload), 0) < 0);
+
+  qsr_flow_table_free(&runtime->flows);
+  close(receiver4);
+  close(receiver6);
+  close(dp.epoll_fd);
   free(runtime);
 #endif
 }
@@ -992,10 +1103,22 @@ static void test_quic_lb_routing(void) {
   free(runtime);
 }
 
-/* Invoked by the optional isolated netns integration harness. The backend
- * and client run in separate network namespaces, while this process owns the
- * transparent router flow and listener. */
-static int run_transparent_integration(bool expect_reply) {
+static socklen_t numeric_address(const char *host, const char *port, struct sockaddr_storage *addr) {
+  const struct addrinfo hints = {.ai_socktype = SOCK_DGRAM, .ai_flags = AI_NUMERICHOST | AI_NUMERICSERV};
+  struct addrinfo *result = nullptr;
+  ASSERT_TRUE(getaddrinfo(host, port, &hints, &result) == 0);
+  memcpy(addr, result->ai_addr, result->ai_addrlen);
+  const socklen_t len = result->ai_addrlen;
+  freeaddrinfo(result);
+  return len;
+}
+
+/* Invoked by tests/e2e/transparent/netns.py with
+ *   reply|silent CLIENT_IP CLIENT_PORT BACKEND_IP BACKEND_PORT LISTENER_IP LISTENER_PORT
+ * The client and a remote backend run in other network namespaces; this
+ * process owns the listener and the transparent flow socket. */
+static int run_transparent_integration(char **args) {
+  const bool expect_reply = strcmp(args[0], "reply") == 0;
   qsr_runtime_t *runtime = calloc(1, sizeof(*runtime));
   ASSERT_TRUE(runtime != nullptr && qsr_flow_table_init(&runtime->flows, 4) == QSR_OK);
   runtime->config.transparent = true;
@@ -1004,22 +1127,17 @@ static int run_transparent_integration(bool expect_reply) {
   runtime->flows.on_close = conn_close_callback;
   runtime->flows.on_close_userdata = &dp;
   struct sockaddr_storage client = {0};
-  struct sockaddr_in *c = (struct sockaddr_in *)&client;
-  c->sin_family = AF_INET;
-  c->sin_port = htons(41000);
-  ASSERT_TRUE(inet_pton(AF_INET, "10.202.0.2", &c->sin_addr) == 1);
   struct sockaddr_storage backend = {0};
-  struct sockaddr_in *b = (struct sockaddr_in *)&backend;
-  b->sin_family = AF_INET;
-  b->sin_port = htons(18443);
-  ASSERT_TRUE(inet_pton(AF_INET, "10.201.0.2", &b->sin_addr) == 1);
-  dp.main_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_storage listener = {0};
+  const socklen_t client_len = numeric_address(args[1], args[2], &client);
+  const socklen_t backend_len = numeric_address(args[3], args[4], &backend);
+  const socklen_t listener_len = numeric_address(args[5], args[6], &listener);
+  dp.main_fd = socket(listener.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   ASSERT_TRUE(dp.main_fd >= 0);
-  struct sockaddr_in listener = {.sin_family = AF_INET, .sin_port = htons(18444)};
-  ASSERT_TRUE(inet_pton(AF_INET, "10.202.0.1", &listener.sin_addr) == 1);
-  ASSERT_TRUE(bind(dp.main_fd, (struct sockaddr *)&listener, sizeof(listener)) == 0);
-  memcpy(&dp.local_addr, &listener, sizeof(listener));
-  qsr_flow_t *flow = flow_acquire(&dp, &client, sizeof(*c), &backend, sizeof(*b), 1, "transparent.example", nullptr, 0);
+  ASSERT_TRUE(bind(dp.main_fd, (struct sockaddr *)&listener, listener_len) == 0);
+  dp.local_addr = listener;
+  qsr_flow_t *flow =
+      flow_acquire(&dp, &client, client_len, &backend, backend_len, 1, "transparent.example", nullptr, 0);
   ASSERT_TRUE(flow != nullptr);
   ASSERT_TRUE(send(flow->fd, "request", 7, 0) == 7);
   /* Upstream sockets are nonblocking: wait explicitly, otherwise recv() returns
@@ -1033,7 +1151,7 @@ static int run_transparent_integration(bool expect_reply) {
   }
   if (expect_reply) {
     ASSERT_TRUE(received == 5 && memcmp(buf, "reply", 5) == 0);
-    handle_backend_packet(&dp, flow, (const uint8_t *)buf, (size_t)received, &backend, sizeof(*b), 2);
+    handle_backend_packet(&dp, flow, (const uint8_t *)buf, (size_t)received, &backend, backend_len, 2);
     sender_flush(&dp.sender);
     ASSERT_TRUE(dp.metrics.send_drops == 0);
   } else {
@@ -1048,11 +1166,8 @@ static int run_transparent_integration(bool expect_reply) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 2 && strcmp(argv[1], "--transparent-e2e-positive") == 0) {
-    return run_transparent_integration(true);
-  }
-  if (argc == 2 && strcmp(argv[1], "--transparent-e2e-negative") == 0) {
-    return run_transparent_integration(false);
+  if (argc == 9 && strcmp(argv[1], "--transparent-e2e") == 0) {
+    return run_transparent_integration(&argv[2]);
   }
   seed_directory = argc == 2 ? argv[1] : nullptr;
   test_socket_marks();
@@ -1071,6 +1186,7 @@ int main(int argc, char **argv) {
   test_logging_backpressure();
   test_logging_upstream_addr();
   test_transparent_via_and_reroute();
+  test_transparent_families();
   test_descriptor_exhaustion();
   test_ipv6_listener_and_drain();
   test_quic_lb_routing();

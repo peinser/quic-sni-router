@@ -30,6 +30,14 @@ config:
     # Restart required. Nonzero needs NET_ADMIN (or NET_RAW on Linux >=5.17)
     # in containerSecurityContext.capabilities.add and matching policy rules.
     fwmark: 0
+    # Linux: upstream sockets carry the client's IP and port, so backends see
+    # the real client instead of the router. Restart required.
+    # WARNING: true also sets the Service's externalTrafficPolicy to Local,
+    # overriding service.externalTrafficPolicy below.
+    # Needs NET_RAW or NET_ADMIN in containerSecurityContext.capabilities.add
+    # and a return path the chart does not install. Read the chart README
+    # before enabling.
+    transparent: false
   sessions:
     idleTimeout: 60s         # 1..86400; CLOCK_MONOTONIC-based expiry.
     # Provision for: expected conn/s × idleTimeout × ~5 (each new connection
@@ -89,6 +97,7 @@ service:
   #   Cluster (default) — kube-proxy SNATs; router sees node IPs.
   #   Local             — preserves real client source IP; only nodes with a
   #                       router pod receive traffic (interacts with PDB).
+  # Ignored, and Local used, while config.listen.transparent is true.
   externalTrafficPolicy: Cluster
   # nodePort: required when service.type=NodePort and you want a fixed port.
   # Leave null to let kube-controller-manager assign one from the NodePort range.

@@ -120,6 +120,62 @@ Changing the mark requires a pod restart. With the default
 for the Deployment after updating the configuration, or enable checksum-based
 rollouts below.
 
+## Transparent client source (Linux)
+
+`config.listen.transparent: true` binds every upstream socket to the client's
+IP address and port, so backends see real clients instead of the router. The
+[router README](../../README.md#transparent-client-source-linux) describes the
+semantics and return-path recipes, and why source addresses then need
+[ingress anti-spoofing](../../README.md#spoofed-client-addresses). Three
+conditions decide whether it can work in a cluster; the chart takes care of the
+first and leaves the other two to you:
+
+```yaml
+config:
+  listen:
+    transparent: true
+containerSecurityContext:
+  capabilities:
+    drop: [ALL]
+    add: [NET_RAW] # or NET_ADMIN
+```
+
+1. **Real client addresses at the pod.** With `externalTrafficPolicy: Cluster`
+   (the chart default), kube-proxy rewrites client sources to node addresses.
+   The router would then bind node addresses, and backend replies would go to
+   those nodes instead of back to the router.
+
+   > [!WARNING]
+   > **`config.listen.transparent: true` sets the Service's
+   > `externalTrafficPolicy` to `Local`**, for `LoadBalancer` and `NodePort`
+   > Services, overriding `service.externalTrafficPolicy`. `helm install` and
+   > `helm upgrade` print a warning saying so. Only nodes running a router pod
+   > then receive traffic, which interacts with the PodDisruptionBudget during
+   > rollouts; turning transparent mode off restores your
+   > `service.externalTrafficPolicy`.
+
+   A `ClusterIP` Service has no such policy. A load balancer or CNI that itself
+   rewrites client sources still hides them from the router. With
+   `existingSecret`, the chart cannot read the file: set
+   `config.listen.transparent` to the file's value, as with `config.listen.udp`,
+   so the Service policy and the warning match.
+2. **The capability.** The router needs `NET_RAW` or `NET_ADMIN` and refuses to
+   start without it (`IP_TRANSPARENT probe failed` in the log). The chart runs
+   as UID 10001 and the image sets no file capabilities; some container
+   runtimes add requested capabilities only to the bounding set of a non-root
+   process, so confirm the router starts.
+3. **A return path in the router pod's network namespace.** Backend replies
+   are addressed to the client. A backend pod elsewhere in the cluster sends
+   them through its own node toward the client, never through the router pod,
+   so the README recipes do not help there. Transparent mode fits a backend
+   that shares the router pod's network namespace (a sidecar reached on
+   `127.0.0.1`, covered by the README source rule installed in that namespace),
+   or a router on host networking with host routes. The chart installs no
+   routes or rules and has no init-container or host-networking values, so
+   either setup needs a post-renderer or your own manifests.
+
+Changing the setting requires a pod restart, as with `fwmark`.
+
 ## Hot reload
 
 This chart's `ConfigMap` is rendered from `.Values.config`. A `helm upgrade` that changes routes writes a new `ConfigMap` revision. kubelet propagates it into each pod (typically <60s) and the router's `inotify` watch atomically swaps in the new routes:
@@ -136,7 +192,7 @@ configMap:
   checksumAnnotation: true
 ```
 
-The following fields require a process restart and are ignored on reload with a logged warning: `config.listen.udp`, `config.listen.fwmark`, `config.sessions.maxSessions`.
+The following fields require a process restart and are ignored on reload with a logged warning: `config.listen.udp`, `config.listen.fwmark`, `config.listen.transparent`, `config.sessions.maxSessions`.
 
 ## Values
 
@@ -152,10 +208,11 @@ Highlights:
 | `config.routes` | `{}` | Map of SNI to `{host, port}`. Empty is valid but causes every Initial to be dropped. |
 | `existingSecret` | `""` | Existing Secret containing complete `router.yaml`; overrides ConfigMap settings. Required for confidential CID configuration. |
 | `config.listen.fwmark` | `0` | Linux socket mark on all QSR UDP sockets; nonzero requires a capability and matching policy rules. Restart required. |
+| `config.listen.transparent` | `false` | Linux: backends see the client's IP and port. **Sets the Service's `externalTrafficPolicy` to `Local`**, overriding `service.externalTrafficPolicy`. Requires a capability and a return path the chart does not install; see [Transparent client source](#transparent-client-source-linux). Restart required. |
 | `service.type` | `LoadBalancer` | Use `NodePort` for bare-metal without an LB. |
-| `service.externalTrafficPolicy` | `Cluster` | Standard kube-proxy behaviour. Set to `Local` to preserve the real client source IP (and skip nodes without a router pod). |
+| `service.externalTrafficPolicy` | `Cluster` | Standard kube-proxy behaviour. Set to `Local` to preserve the real client source IP (and skip nodes without a router pod). Ignored, and `Local` used, while `config.listen.transparent` is true. |
 | `podSecurityContext` | runAsNonRoot, uid 10001, RuntimeDefault seccomp | Hardened defaults; override only with reason. |
-| `containerSecurityContext` | `cap drop ALL`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` | Default settings need no additional capabilities. Nonzero `fwmark` requires `NET_ADMIN` or, on Linux 5.17+, `NET_RAW`. |
+| `containerSecurityContext` | `cap drop ALL`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false` | Default settings need no additional capabilities. Nonzero `fwmark` requires `NET_ADMIN` or, on Linux 5.17+, `NET_RAW`. `transparent: true` requires `NET_RAW` or `NET_ADMIN`. |
 | `resources.limits` | memory only | No CPU limit — CFS throttling causes p99 spikes on UDP. |
 | `podDisruptionBudget.enabled` | `true` | Only rendered when `replicaCount > 1`. |
 | `networkPolicy.enabled` | `false` | Cluster-CNI- and namespace-specific; opt in per environment. |
@@ -169,7 +226,7 @@ Kubelet has no native readiness/liveness probe for UDP services. The defaults ar
 See [SECURITY.md](../../SECURITY.md) and [docs/threat-model.md](../../docs/threat-model.md). Quick checklist before WAN exposure:
 
 - Backends on a non-routable / cluster-internal network (the chart `Service` is `ClusterIP`-friendly out of the box for backends).
-- Upstream BCP 38 / uRPF + per-source rate limit at the LB.
+- Upstream BCP 38 / uRPF + per-source rate limit at the LB. With `config.listen.transparent`, backends see client addresses directly, so drop internal and bogon sources before they reach the router.
 - Consider `service.externalTrafficPolicy: Local` if you need real client IPs and accept that LB traffic to nodes without a router pod is dropped.
 - Set `networkPolicy.enabled: true` with namespace-restricted ingress.
 - `serviceAccount.automount: false` (chart default) — the router needs no Kubernetes API access. With `serviceAccount.create: false` (chart default) the pod uses the namespace's `default` ServiceAccount; combined with `automount: false` no API token is mounted regardless.

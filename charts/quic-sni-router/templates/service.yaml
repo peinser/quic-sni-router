@@ -22,9 +22,10 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- if or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort") }}
-  # Local preserves the client source IP; kube-proxy will not SNAT. The router
-  # uses the client tuple for session pinning, so this is the right default.
-  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  # Cluster lets kube-proxy SNAT clients to node addresses; Local preserves the
+  # client source IP. Transparent mode is useless and breaks replies without
+  # real client addresses, so config.listen.transparent forces Local.
+  externalTrafficPolicy: {{ .Values.config.listen.transparent | ternary "Local" .Values.service.externalTrafficPolicy }}
   {{- end }}
   ports:
     - name: quic

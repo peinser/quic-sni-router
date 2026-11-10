@@ -23,6 +23,7 @@ data:
     listen:
       udp: {{ .Values.config.listen.udp | quote }}
       fwmark: {{ .Values.config.listen.fwmark | default 0 | int64 }}
+      transparent: {{ .Values.config.listen.transparent | default false }}
     sessions:
       idleTimeout: {{ .Values.config.sessions.idleTimeout | quote }}
       maxSessions: {{ .Values.config.sessions.maxSessions }}
