@@ -40,11 +40,11 @@ cleanup() {
 }
 dump_logs() {
   echo "--- router logs ---" >&2
-  docker logs "${project}-router" >&2 2>/dev/null || true
+  docker logs "${project}-router" >&2 2>&1 || true
   echo "--- rvr-a logs ---" >&2
-  docker logs "${project}-rvr-a" >&2 2>/dev/null || true
+  docker logs "${project}-rvr-a" >&2 2>&1 || true
   echo "--- rvr-b logs ---" >&2
-  docker logs "${project}-rvr-b" >&2 2>/dev/null || true
+  docker logs "${project}-rvr-b" >&2 2>&1 || true
 }
 trap 'rc=$?; if [ ${rc} -ne 0 ]; then dump_logs; fi; cleanup' EXIT
 
@@ -117,7 +117,11 @@ run_client rvr-b.flightdeck.test --expected "hello from rvr-b"$'\n'
 run_client rvr-a.flightdeck.test --expected "hello from rvr-a"$'\n'
 
 echo "[phase 4] verify router logged the reload"
-if ! docker logs "${project}-router" 2>&1 | grep -q "^reload: ok"; then
+# Read the logs before searching: piping docker logs into grep, which stops at
+# the first match, kills docker logs with SIGPIPE, and pipefail then reports a
+# failure although the line was found.
+router_log="$(docker logs "${project}-router" 2>&1)"
+if ! grep -q "^reload: ok" <<<"${router_log}"; then
   echo "router did not log 'reload: ok' — inotify path may not have fired" >&2
   exit 1
 fi

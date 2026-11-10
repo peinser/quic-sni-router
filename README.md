@@ -233,7 +233,9 @@ ignored with a warning on hot reload.
 For Kubernetes, see the
 [Helm chart transparent-source notes](charts/quic-sni-router/README.md#transparent-client-source-linux).
 Enabling it through the chart also sets the Service's `externalTrafficPolicy`
-to `Local`, overriding `service.externalTrafficPolicy`.
+to `Local`, overriding `service.externalTrafficPolicy`. The chart README says
+what to do for each load balancer (MetalLB, Cilium BGP and L2 announcements,
+cloud) and each backend placement, including Cilium's per-pod source check.
 
 #### Spoofed client addresses
 

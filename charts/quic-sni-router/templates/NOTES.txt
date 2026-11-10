@@ -51,7 +51,8 @@ This setting also sets the Service's externalTrafficPolicy to Local
 {{- if ne .Values.service.externalTrafficPolicy "Local" }}, overriding
 service.externalTrafficPolicy={{ .Values.service.externalTrafficPolicy }}
 {{- end }}.
-Only nodes running a router pod receive traffic.
+Only nodes running a router pod receive traffic. Cilium L2 announcements ignore
+this policy and can drop all traffic; see "Load balancers: what to do".
 {{- end }}
 The router also needs NET_RAW or NET_ADMIN (it refuses to start without it) and
 a return path for backend replies, which this chart does not install. See the
